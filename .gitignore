@@ -8,6 +8,14 @@ __pycache__/
 /libbpf-bootstrap/examples/c/filemon
 /libbpf-bootstrap/examples/c/hostmon
 
+# bf-p4c output directories, wherever a program is compiled
+*.tofino/
+
+# Hardware benchmark runs: per-command logs, P4 builds, pcaps, register dumps
+# and captures. They stay on disk; p4_perf.md is the summary.
+/perf/results/
+/perf/plots/
+
 # Generated host monitoring outputs
 /benign_ls_clean.csv
 /process_summary.csv

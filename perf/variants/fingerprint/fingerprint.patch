@@ -1,0 +1,183 @@
+--- a/headers.p4
++++ b/headers.p4
+@@ -51,6 +51,11 @@
+  * reads it from the report instead of recomputing the hash. */
+ const bit<16> CPU_REPORT_MAGIC = 0xBEF1;
+ 
++/* cpu_report_t.reason: first packet of a bucket, or first packet of another
++ * flow in a bucket that already has one (flow fingerprint mismatch). */
++const bit<8> REPORT_REASON_NEW_FLOW  = 1;
++const bit<8> REPORT_REASON_COLLISION = 2;
++
+ header cpu_report_t {
+     bit<16> magic;
+     bit<32> src_ip;
+@@ -72,6 +77,9 @@
+ struct my_ingress_metadata_t {
+     bit<16> flow_index;
+ 
++    bit<16> fp_fwd;
++    bit<16> fp_rev;
++
+     bit<16> l4_sport;
+     bit<16> l4_dport;
+ 
+--- a/ingress.p4
++++ b/ingress.p4
+@@ -10,6 +10,14 @@
+ #error CPU reports require feature collection
+ #endif
+ 
++#ifndef P4_ENABLE_FINGERPRINT
++#define P4_ENABLE_FINGERPRINT 1
++#endif
++
++#if P4_ENABLE_FINGERPRINT && !P4_ENABLE_CPU_REPORTS
++#error The flow fingerprint reports collisions and needs CPU reports
++#endif
++
+ #if P4_ENABLE_FEATURES
+ const bit<32> FLOW_BUCKETS = 65536;
+ #endif
+@@ -40,6 +48,24 @@
+     @symmetric("meta.l4_sport", "meta.l4_dport")
+     Hash<bit<16>>(HashAlgorithm_t.CRC16) crc16_report_hasher;
+ 
++#if P4_ENABLE_FINGERPRINT
++    /* Flow fingerprint: tells the bucket's first flow from another flow that
++     * lands in the same bucket. It must not be symmetric: every Tofino hash is
++     * an XOR matrix, and a symmetric one depends only on sip^dip and sp^dp, so
++     * flows with equal XORs would match. The bucket keeps the forward
++     * fingerprint of its first packet; a later packet belongs to that flow if
++     * its forward or its reverse fingerprint equals it. The polynomial (0x8BB7,
++     * reflected) differs from the index's, so the two hashes are independent. */
++    CRCPolynomial<bit<16>>(16w0x8BB7, true, false, false, 16w0x0000, 16w0x0000) fp_poly;
++    Hash<bit<16>>(HashAlgorithm_t.CUSTOM, fp_poly) fp_fwd_hasher;
++    Hash<bit<16>>(HashAlgorithm_t.CUSTOM, fp_poly) fp_rev_hasher;
++
++    /* The flow index for collision reports (one hash instance per call site) */
++    @symmetric("hdr.ipv4.srcAddr", "hdr.ipv4.dstAddr")
++    @symmetric("meta.l4_sport", "meta.l4_dport")
++    Hash<bit<16>>(HashAlgorithm_t.CRC16) crc16_collision_hasher;
++#endif
++
+     /* -------- Core per-flow primitives kept in data plane -------- */
+     Register<bit<32>, bit<16>>(FLOW_BUCKETS) reg_pkts;
+     Register<bit<32>, bit<16>>(FLOW_BUCKETS) reg_bytes;
+@@ -61,6 +87,11 @@
+     Register<bit<32>, bit<16>>(FLOW_BUCKETS) reg_ack;
+     Register<bit<32>, bit<16>>(FLOW_BUCKETS) reg_rst;
+ 
++#if P4_ENABLE_FINGERPRINT
++    Register<bit<16>, bit<16>>(FLOW_BUCKETS) reg_fp;
++    Register<bit<8>,  bit<16>>(FLOW_BUCKETS) reg_shared;
++#endif
++
+     /* -------- Counter updates -------- */
+     RegisterAction<bit<32>, bit<16>, bit<32>>(reg_pkts) pkts_rw = {
+         void apply(inout bit<32> v, out bit<32> old) {
+@@ -184,6 +215,39 @@
+             v = v + 32w1;
+         }
+     };
++
++#if P4_ENABLE_FINGERPRINT
++    /* -------- Collision detection -------- */
++    RegisterAction<bit<16>, bit<16>, bit<16>>(reg_fp) fp_claim = {
++        void apply(inout bit<16> v) {
++            v = meta.fp_fwd;
++        }
++    };
++
++    /* 1 if the packet belongs to the bucket's first flow, in either direction */
++    RegisterAction<bit<16>, bit<16>, bit<16>>(reg_fp) fp_check = {
++        void apply(inout bit<16> v, out bit<16> owner) {
++            if (v == meta.fp_fwd || v == meta.fp_rev) {
++                owner = 16w1;
++            } else {
++                owner = 16w0;
++            }
++        }
++    };
++
++    /* Marks the bucket as shared. Returns FLOW_REPORT_MIRROR only for the
++     * first packet of another flow, so each bucket reports one collision. */
++    RegisterAction<bit<8>, bit<16>, bit<8>>(reg_shared) shared_mark = {
++        void apply(inout bit<8> v, out bit<8> mirror) {
++            if (v == 8w0) {
++                mirror = (bit<8>) FLOW_REPORT_MIRROR;
++            } else {
++                mirror = 8w0;
++            }
++            v = 8w1;
++        }
++    };
++#endif
+ #endif
+ 
+     /* -------- Forwarding -------- */
+@@ -241,6 +305,15 @@
+                                              hdr.ipv4.protocol });
+             meta.flow_index = idx;
+ 
++#if P4_ENABLE_FINGERPRINT
++            meta.fp_fwd = fp_fwd_hasher.get({ hdr.ipv4.srcAddr, hdr.ipv4.dstAddr,
++                                              meta.l4_sport, meta.l4_dport,
++                                              hdr.ipv4.protocol });
++            meta.fp_rev = fp_rev_hasher.get({ hdr.ipv4.dstAddr, hdr.ipv4.srcAddr,
++                                              meta.l4_dport, meta.l4_sport,
++                                              hdr.ipv4.protocol });
++#endif
++
+             bit<8>  dir_old_valid = dir_valid_rw.execute(idx);
+             bit<16> ref_sp = 16w0;
+             bit<16> ref_dp = 16w0;
+@@ -249,6 +322,9 @@
+                 ref_src_set.execute(idx);
+                 ref_dst_set.execute(idx);
+                 meta.dir_ab = 1w1;
++#if P4_ENABLE_FINGERPRINT
++                fp_claim.execute(idx);
++#endif
+ 
+                 /* First-seen flow report to CPU */
+ #if P4_ENABLE_CPU_REPORTS
+@@ -279,6 +355,26 @@
+                     /* Collision / ambiguity fallback */
+                     meta.dir_ab = 1w1;
+                 }
++
++#if P4_ENABLE_FINGERPRINT
++                if (fp_check.execute(idx) == 16w0) {
++                    /* Another flow shares this bucket: report its first packet */
++                    meta.cpu_report.setValid();
++                    meta.cpu_report.magic     = CPU_REPORT_MAGIC;
++                    meta.cpu_report.src_ip    = sip;
++                    meta.cpu_report.dst_ip    = dip;
++                    meta.cpu_report.src_port  = sp;
++                    meta.cpu_report.dst_port  = dp;
++                    meta.cpu_report.proto     = pr;
++                    meta.cpu_report.reason    = REPORT_REASON_COLLISION;
++                    meta.cpu_report.flow_index = crc16_collision_hasher.get({ hdr.ipv4.srcAddr, hdr.ipv4.dstAddr,
++                                                                              meta.l4_sport, meta.l4_dport,
++                                                                              hdr.ipv4.protocol });
++
++                    meta.cpu_mirror_sid       = 1;
++                    ig_dprsr_md.mirror_type   = (MirrorType_t) shared_mark.execute(idx);
++                }
++#endif
+             }
+ 
+             /* Core counters */
+--- a/ingress_parser.p4
++++ b/ingress_parser.p4
+@@ -10,6 +10,9 @@
+ 
+         meta.flow_index = 16w0;
+ 
++        meta.fp_fwd     = 16w0;
++        meta.fp_rev     = 16w0;
++
+         meta.l4_sport   = 16w0;
+         meta.l4_dport   = 16w0;
+ 
