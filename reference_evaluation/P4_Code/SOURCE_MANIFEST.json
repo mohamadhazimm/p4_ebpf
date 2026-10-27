@@ -1,0 +1,28 @@
+{
+  "program": "basic",
+  "project": "P4_Code",
+  "source_version": "Fixed instrumented detector used in physical NETLAB tests, repackaged with original program name",
+  "original_source_archive_sha256": "01730d500e67b53f1916edf86dd9fb63cdaaa56d78ea156f28a1124b731fc854",
+  "repackaging_changes": "Top-level filename dns_latency.p4 -> basic.p4; build and BFRT references -> basic; loader/project port environment names and root path; collection script filename -> collect_reports.py. P4 source bytes and probe/decoder behavior unchanged. Code comments and Python docstrings removed; P4 tokens and Python executable AST preserved.",
+  "compiled_artifact_status": "Recompile as basic; no renamed binaries included",
+  "boundary": "ingress-parser arrival to egress-parser arrival",
+  "file_sha256": {
+    "README.md": "2e0acd3faacc9d865ade59649f0988c031bf9269b9a13d1e0fc79da499faba14",
+    "bfrt_python/score_entries_ratio.py": "72e400984bf2f58c36d96f82fcc98d4ea0c4c1881bd151c4a2128cdcd084b052",
+    "bfrt_python/setup.py": "bfc190e2197f68d03604362624068eda8ce803275bea3a86ef921fd7b492e127",
+    "p4src/basic.p4": "a1c1ba5feb2741e301f23679e251f0122717ee5f28e2693715ff4277b9327d5c",
+    "p4src/egress.p4": "7183eccd3701da6208cff3901af7de07f57d3fcbb8d70a858b6139f385e5e950",
+    "p4src/egress_deparser.p4": "76abf96ba9eeda2986e811f5a8256006aaba3d467f987ccd1d0db2fe65f347bd",
+    "p4src/egress_parser.p4": "374358ef0e86b81038f3e595b145838c4076233e0fa88bea1963a6345dc400d9",
+    "p4src/headers.p4": "c781b52d14536a1949b1b8a5c79dd41f913be4cafe53eafa609659b1dbd158f0",
+    "p4src/ingress.p4": "b5211450e69e280a0d8c0c69ed4b846d8412fdc38c55badfc1a2a0d062bfc264",
+    "p4src/ingress_deparser.p4": "0c2a9d9760f70646301abd65cb12c217909b51da6794e9d587b9faf824d95276",
+    "p4src/ingress_parser.p4": "90df834b0b734a229ea1fa92654118d42b422a57739c0409cdd8e4a0d7ea78e1",
+    "p4src/monitor.p4": "670fc54bdb2e52aead375d8638824d9435a230b5abc558e451a8036defb4319b",
+    "scripts/build.sh": "bed9e0c905e6419cbcc37ffa491f7640bff3f1e9faee622247cec35efee9ece8",
+    "scripts/collect_reports.py": "ccaabce8e874f20bbadd4943cc9e6db793573b3efa940f728099e48202beb56c",
+    "scripts/probe_format.py": "8ca68fa48249f6ce3c0e020991fb7323408a2d91056ba261a694a9c1e908566e",
+    "scripts/send_probes.py": "58b251e8f9b7ba58663d333ad4084246e17a67737e306d5405aee294701bab1a"
+  },
+  "local_checks": "P4 executable token comparison, Python AST comparison excluding docstrings, Python3.4 syntax, retained timestamp capture/report/delta checks and ZIP integrity passed. No local P4 compiler."
+}
