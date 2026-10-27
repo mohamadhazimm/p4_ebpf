@@ -46,8 +46,12 @@ header udp_t {
     bit<16> checksum;
 }
 
-/* Report payload mirrored to CPU/host */
-struct cpu_report_t {
+/* Report payload mirrored to CPU/host (18 bytes, magic CPU_REPORT_MAGIC).
+ * flow_index is the register bucket the data plane chose, so the collector
+ * reads it from the report instead of recomputing the hash. */
+const bit<16> CPU_REPORT_MAGIC = 0xBEF1;
+
+header cpu_report_t {
     bit<16> magic;
     bit<32> src_ip;
     bit<32> dst_ip;
@@ -55,6 +59,7 @@ struct cpu_report_t {
     bit<16> dst_port;
     bit<8>  proto;
     bit<8>  reason;
+    bit<16> flow_index;
 }
 
 struct my_headers_t {

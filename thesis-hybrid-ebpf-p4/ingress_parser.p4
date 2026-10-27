@@ -35,6 +35,7 @@ parser IngressParser(
         meta.from_internal = 1w0;
 
         meta.cpu_mirror_sid       = 0;
+        meta.cpu_report.setInvalid();
         meta.cpu_report.magic     = 16w0;
         meta.cpu_report.src_ip    = 32w0;
         meta.cpu_report.dst_ip    = 32w0;
@@ -42,6 +43,7 @@ parser IngressParser(
         meta.cpu_report.dst_port  = 16w0;
         meta.cpu_report.proto     = 8w0;
         meta.cpu_report.reason    = 8w0;
+        meta.cpu_report.flow_index = 16w0;
 
         transition parse_ethernet;
     }
