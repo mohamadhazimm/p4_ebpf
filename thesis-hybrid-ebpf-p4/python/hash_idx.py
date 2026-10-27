@@ -1,33 +1,10 @@
-import struct
+"""Print the register bucket the data plane uses for a 5-tuple.
 
-# CRC16-CCITT (poly 0x1021, init 0xFFFF, no reflection)
-def crc16_tofino(data: bytes) -> int:
-    crc = 0xFFFF
-    for b in data:
-        crc ^= (b << 8)
-        for _ in range(8):
-            if crc & 0x8000:
-                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
-            else:
-                crc = (crc << 1) & 0xFFFF
-    return crc
-
-
-def ip_to_bytes(ip: str) -> bytes:
-    return bytes(map(int, ip.split(".")))
-
-
-def compute_flow_index(src_ip, dst_ip, src_port, dst_port, proto):
-    data = b"".join([
-        ip_to_bytes(src_ip),          # 4 bytes
-        ip_to_bytes(dst_ip),          # 4 bytes
-        struct.pack("!H", src_port),  # 2 bytes big endian
-        struct.pack("!H", dst_port),  # 2 bytes big endian
-        struct.pack("!B", proto),     # 1 byte
-    ])
-
-    return crc16_tofino(data)
-
+This used CRC16-CCITT over the raw 5-tuple, which never matched the switch. The
+index now comes from flow_index.py (CRC-16/ARC over the @symmetric input), the
+function the data plane computes; reports also carry it as flow_index.
+"""
+from flow_index import compute_flow_index
 
 # ===== Example =====
 src_ip  = "10.0.0.1"

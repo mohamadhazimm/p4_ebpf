@@ -1,4 +1,18 @@
+#ifndef P4_ENABLE_FEATURES
+#define P4_ENABLE_FEATURES 1
+#endif
+
+#ifndef P4_ENABLE_CPU_REPORTS
+#define P4_ENABLE_CPU_REPORTS 1
+#endif
+
+#if P4_ENABLE_CPU_REPORTS && !P4_ENABLE_FEATURES
+#error CPU reports require feature collection
+#endif
+
+#if P4_ENABLE_FEATURES
 const bit<32> FLOW_BUCKETS = 65536;
+#endif
 
 control Ingress(
     inout my_headers_t hdr,
@@ -8,7 +22,23 @@ control Ingress(
     inout ingress_intrinsic_metadata_for_deparser_t  ig_dprsr_md,
     inout ingress_intrinsic_metadata_for_tm_t        ig_tm_md)
 {
+#if P4_ENABLE_FEATURES
+    /* Symmetric flow index: both directions of a connection share a bucket.
+     * bf-p4c 9.6.0 drops arithmetic inside a Hash field list (the former
+     * {sip^dip, sip+dip, sp^dp, sp+dp, pr} input compiled to a plain CRC of
+     * the raw 5-tuple), so the symmetry comes from @symmetric instead. The
+     * compiled function is CRC-16/ARC over (0, sip^dip, 0, sp^dp, proto);
+     * python/flow_index.py computes the same value. */
+    @symmetric("hdr.ipv4.srcAddr", "hdr.ipv4.dstAddr")
+    @symmetric("meta.l4_sport", "meta.l4_dport")
     Hash<bit<16>>(HashAlgorithm_t.CRC16) crc16_hasher;
+
+    /* The same index again, for the CPU report. The register addresses take
+     * idx straight from the hash unit, and bf-p4c 9.6.0 then never writes idx
+     * into a PHV field: copying it into the report would always send 0. */
+    @symmetric("hdr.ipv4.srcAddr", "hdr.ipv4.dstAddr")
+    @symmetric("meta.l4_sport", "meta.l4_dport")
+    Hash<bit<16>>(HashAlgorithm_t.CRC16) crc16_report_hasher;
 
     /* -------- Core per-flow primitives kept in data plane -------- */
     Register<bit<32>, bit<16>>(FLOW_BUCKETS) reg_pkts;
@@ -154,6 +184,7 @@ control Ingress(
             v = v + 32w1;
         }
     };
+#endif
 
     /* -------- Forwarding -------- */
     action send_using_port(PortId_t port) {
@@ -179,8 +210,11 @@ control Ingress(
     }
 
     apply {
+#if P4_ENABLE_FEATURES
         meta.dir_ab = 1w1;
+#endif
 
+#if P4_ENABLE_CPU_REPORTS
         ig_dprsr_md.mirror_type = 0;
 
         meta.cpu_mirror_sid       = 0;
@@ -191,7 +225,10 @@ control Ingress(
         meta.cpu_report.dst_port  = 16w0;
         meta.cpu_report.proto     = 8w0;
         meta.cpu_report.reason    = 8w0;
+        meta.cpu_report.flow_index = 16w0;
+#endif
 
+#if P4_ENABLE_FEATURES
         if (hdr.ipv4.isValid() && (hdr.tcp.isValid() || hdr.udp.isValid())) {
             bit<32> sip = hdr.ipv4.srcAddr;
             bit<32> dip = hdr.ipv4.dstAddr;
@@ -199,12 +236,9 @@ control Ingress(
             bit<16> dp  = meta.l4_dport;
             bit<8>  pr  = hdr.ipv4.protocol;
 
-            bit<32> ip_x = sip ^ dip;
-            bit<32> ip_s = sip + dip;
-            bit<16> p_x  = sp ^ dp;
-            bit<16> p_s  = sp + dp;
-
-            bit<16> idx = crc16_hasher.get({ ip_x, ip_s, p_x, p_s, pr });
+            bit<16> idx = crc16_hasher.get({ hdr.ipv4.srcAddr, hdr.ipv4.dstAddr,
+                                             meta.l4_sport, meta.l4_dport,
+                                             hdr.ipv4.protocol });
             meta.flow_index = idx;
 
             bit<8>  dir_old_valid = dir_valid_rw.execute(idx);
@@ -217,16 +251,22 @@ control Ingress(
                 meta.dir_ab = 1w1;
 
                 /* First-seen flow report to CPU */
-                meta.cpu_report.magic     = 16w0xBEEF;
+#if P4_ENABLE_CPU_REPORTS
+                meta.cpu_report.setValid();
+                meta.cpu_report.magic     = CPU_REPORT_MAGIC;
                 meta.cpu_report.src_ip    = sip;
                 meta.cpu_report.dst_ip    = dip;
                 meta.cpu_report.src_port  = sp;
                 meta.cpu_report.dst_port  = dp;
                 meta.cpu_report.proto     = pr;
                 meta.cpu_report.reason    = 8w1;
+                meta.cpu_report.flow_index = crc16_report_hasher.get({ hdr.ipv4.srcAddr, hdr.ipv4.dstAddr,
+                                                                       meta.l4_sport, meta.l4_dport,
+                                                                       hdr.ipv4.protocol });
 
                 meta.cpu_mirror_sid       = 1;
                 ig_dprsr_md.mirror_type   = FLOW_REPORT_MIRROR;
+#endif
             } else {
                 ref_sp = ref_src_read.execute(idx);
                 ref_dp = ref_dst_read.execute(idx);
@@ -269,6 +309,7 @@ control Ingress(
                 }
             }
         }
+#endif
 
         forwarding.apply();
     }

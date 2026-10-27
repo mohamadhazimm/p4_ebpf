@@ -1,15 +1,40 @@
 #!/usr/bin/env python3
-import os
-import re
-import sys
+"""Read the detector's flow registers at given bucket indexes through bfrt_python.
+
+The indexes normally come from the CPU reports (cpu_report_t.flow_index). The
+script runs bfshell on this host, or with --ssh on a switch (bfshell_run.py).
+
+All 14 registers of ingress.p4 are read. Values that the data plane does not
+keep are derived: pkts_ba = pkts - pkts_ab, bytes_ba = bytes - bytes_ab,
+duration_ns = last_ts - first_ts (mod 2^32; the timestamps are the low 32 bits
+of a nanosecond clock and wrap every 4.295 s).
+
+Every register exists once per pipe, and a packet updates the copy of the pipe
+its ingress port belongs to. Rows combine the pipes: counters are summed,
+min_len/first_ts take the smallest non-zero value, max_len/last_ts the
+largest; "pipes" lists the pipes that hold data. A flow seen in more than one
+pipe (its directions enter on ports of different pipes) has its direction
+split per pipe, so pkts_ab is not meaningful for it; "multi_pipe" flags that.
+
+--snapshot sync (default) first copies all 14 registers from the hardware
+(operation_register_sync, a few ms each) and then reads that copy, so the
+values of one flow are taken at the same moment. --snapshot hw reads every
+cell from the hardware directly.
+
+--clear-if-unchanged IDX:PKTS,... clears, after the read and in the same
+session, the 14 registers of every listed bucket whose pkts still equals PKTS
+(no traffic since the caller's previous read). A cleared bucket is empty
+again, so the next packet that lands in it sends a new first-seen CPU report.
+The payload lists the cleared buckets under "cleared".
+"""
+import argparse
 import json
 import socket
-import tempfile
-import subprocess
-import argparse
+import sys
 from pathlib import Path
 
-BFSHELL = "/home/ubuntu/open-p4studio/install/bin/bfshell"
+from bfshell_run import DEFAULT_REMOTE_SDE_INSTALL, default_bfshell, run_bfshell_script
+
 BF_PORT = 9999
 INDEX_FILE = "/home/ubuntu/Desktop/p4_ebpf/thesis-hybrid-ebpf-p4/python/indexes_unique.txt"
 FLOW_BUCKETS = 65536
@@ -23,6 +48,238 @@ def port_open(host: str, port: int, timeout=1.0) -> bool:
         return False
 
 
+def load_indices_from_file(path: str) -> list:
+    idxs = []
+    for line in Path(path).read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        for p in line.replace(",", " ").split():
+            if p.isdigit():
+                idxs.append(int(p))
+    return idxs
+
+
+# Runs inside bfrt_python. SDE 9.6 embeds Python 3.4 (no f-strings) and runs a
+# script with separate globals and locals, so top-level functions cannot call
+# each other: everything lives in one function and its closures.
+INNER_TEMPLATE = r'''
+def _read_registers_main():
+    import json
+    import time
+    from collections import OrderedDict
+
+    PARAMS = json.loads(__PARAMS__)
+    REG_NAMES = ["reg_pkts", "reg_bytes", "reg_pkts_ab", "reg_bytes_ab",
+                 "reg_ref_src_port", "reg_ref_dst_port", "reg_dir_valid",
+                 "reg_min_len", "reg_max_len", "reg_first_ts", "reg_last_ts",
+                 "reg_syn", "reg_ack", "reg_rst"]
+    REQUIRED = ["reg_pkts", "reg_bytes", "reg_pkts_ab", "reg_bytes_ab"]
+    SUMMED = ["reg_pkts", "reg_bytes", "reg_pkts_ab", "reg_bytes_ab", "reg_syn", "reg_ack", "reg_rst"]
+
+    ing = bfrt.basic.pipe.Ingress
+    regs = {}
+    for name in REG_NAMES:
+        try:
+            regs[name] = getattr(ing, name)
+        except AttributeError:
+            if PARAMS["strict"] and name in REQUIRED:
+                raise RuntimeError("Required register is missing from pipeline: " + name)
+
+    def as_list(r):
+        if r is None:
+            return []
+        if isinstance(r, (list, tuple)):
+            return list(r)
+        return [r]
+
+    def f1_values(entry):
+        for k, v in entry.data.items():
+            k = k.decode() if isinstance(k, bytes) else k
+            if k.endswith(".f1"):
+                return [int(x) for x in as_list(v)]
+        raise RuntimeError("no .f1 field in register entry")
+
+    def read_cell(reg, idx, from_hw):
+        ents = as_list(reg.get(REGISTER_INDEX=idx, from_hw=from_hw, print_ents=False))
+        if not ents:
+            raise RuntimeError("empty read")
+        return f1_values(ents[0])
+
+    def sync_all(timeout_s):
+        for name, reg in regs.items():
+            done = []
+            def cb(dev_id, pipe_id, direction, parser_id, done=done):
+                done.append(1)
+            t0 = time.time()
+            reg.operation_register_sync(cb)
+            while not done:
+                if time.time() - t0 > timeout_s:
+                    return False
+                time.sleep(0.0005)
+        return True
+
+    snapshot = PARAMS["snapshot"]
+    t_start = time.time()
+    sync_s = None
+    if snapshot == "sync":
+        try:
+            ok = sync_all(10.0)
+        except Exception:
+            ok = False
+        sync_s = round(time.time() - t_start, 4)
+        if not ok:
+            snapshot = "hw"
+    from_hw = snapshot == "hw"
+
+    def combine(per_pipe):
+        pipes = [p for p in range(len(per_pipe["reg_pkts"]))
+                 if per_pipe["reg_pkts"][p] or per_pipe["reg_dir_valid"][p]]
+        row = {}
+        for name in SUMMED:
+            row[name] = sum(per_pipe[name][p] for p in pipes)
+        nz = lambda name: [per_pipe[name][p] for p in pipes if per_pipe[name][p]]
+        row["reg_min_len"] = min(nz("reg_min_len")) if nz("reg_min_len") else 0
+        row["reg_max_len"] = max(nz("reg_max_len")) if nz("reg_max_len") else 0
+        row["reg_first_ts"] = min(nz("reg_first_ts")) if nz("reg_first_ts") else 0
+        row["reg_last_ts"] = max(nz("reg_last_ts")) if nz("reg_last_ts") else 0
+        ref = [p for p in pipes if per_pipe["reg_dir_valid"][p]]
+        row["reg_dir_valid"] = 1 if ref else 0
+        row["reg_ref_src_port"] = per_pipe["reg_ref_src_port"][ref[0]] if ref else 0
+        row["reg_ref_dst_port"] = per_pipe["reg_ref_dst_port"][ref[0]] if ref else 0
+        return row, pipes
+
+    rows = []
+    errors = []
+    for idx in PARAMS["indexes"]:
+        per_pipe = {}
+        for name in REG_NAMES:
+            reg = regs.get(name)
+            if reg is None:
+                per_pipe[name] = [0]
+                continue
+            try:
+                per_pipe[name] = read_cell(reg, idx, from_hw)
+            except Exception as error:
+                if PARAMS["strict"] and name in REQUIRED:
+                    raise RuntimeError("Could not read required register %s at index %d: %s"
+                                       % (name, idx, error))
+                errors.append("%s[%d]: %s" % (name, idx, error))
+                per_pipe[name] = [0]
+        n = max(len(v) for v in per_pipe.values())
+        for name in per_pipe:
+            per_pipe[name] = (per_pipe[name] + [0] * n)[:n]
+        r, pipes = combine(per_pipe)
+        pkts, byt = r["reg_pkts"], r["reg_bytes"]
+        first_ts, last_ts = r["reg_first_ts"], r["reg_last_ts"]
+        rows.append({
+            "idx": idx,
+            "pkts": pkts,
+            "bytes": byt,
+            "bpp": (float(byt) / pkts) if pkts else 0.0,
+            "pkts_ab": r["reg_pkts_ab"],
+            "pkts_ba": max(0, pkts - r["reg_pkts_ab"]),
+            "bytes_ab": r["reg_bytes_ab"],
+            "bytes_ba": max(0, byt - r["reg_bytes_ab"]),
+            "ref_src_port": r["reg_ref_src_port"],
+            "ref_dst_port": r["reg_ref_dst_port"],
+            "dir_valid": r["reg_dir_valid"],
+            "min_len": r["reg_min_len"],
+            "max_len": r["reg_max_len"],
+            "first_ts": first_ts,
+            "last_ts": last_ts,
+            "duration_ns": ((last_ts - first_ts) % (1 << 32)) if (first_ts and last_ts) else 0,
+            "syn": r["reg_syn"],
+            "ack": r["reg_ack"],
+            "rst": r["reg_rst"],
+            "pipes": pipes,
+            "multi_pipe": len(pipes) > 1,
+        })
+
+    read_s = round(time.time() - t_start, 4)
+
+    # Clear idle buckets so that the next flow landing in them reports again.
+    cleared = []
+    pkts_now = dict((r["idx"], r["pkts"]) for r in rows)
+    for key, prev_pkts in sorted(PARAMS["clear_if_unchanged"].items()):
+        idx = int(key)
+        if pkts_now.get(idx) != prev_pkts:
+            continue
+        try:
+            for name, reg in regs.items():
+                reg.mod(REGISTER_INDEX=idx, f1=0)
+            cleared.append(idx)
+        except Exception as error:
+            errors.append("clear %d: %s" % (idx, error))
+    if cleared:
+        try:
+            bfrt.complete_operations()
+        except Exception as error:
+            errors.append("complete_operations: %s" % error)
+
+    # Python 3.4 dicts are unordered; keep "source" first and "rows" last.
+    payload = OrderedDict([
+        ("source", PARAMS["source"]),
+        ("flow_count", len(rows)),
+        ("snapshot", snapshot),
+        ("sync_s", sync_s),
+        ("read_s", read_s),
+        ("clear_s", round(time.time() - t_start - read_s, 4)),
+        ("t_switch", t_start),
+        ("errors", errors),
+        ("cleared", cleared),
+        ("rows", rows),
+    ])
+    if PARAMS["format"] == "json":
+        print(json.dumps(payload))
+        return
+
+    tot_pkts = sum(r["pkts"] for r in rows)
+    tot_bytes = sum(r["bytes"] for r in rows)
+    print("")
+    print("=== OVERALL (%s, snapshot %s) ===" % (PARAMS["source"], snapshot))
+    print("Flows: %d" % len(rows))
+    print("Total pkts: %d" % tot_pkts)
+    print("Total bytes: %d" % tot_bytes)
+    print("Avg B/packet: %.2f" % ((float(tot_bytes) / tot_pkts) if tot_pkts else 0.0))
+    print("Flows with any AB traffic: %d / %d" % (sum(1 for r in rows if r["pkts_ab"] > 0), len(rows)))
+    print("Flows with any BA traffic: %d / %d" % (sum(1 for r in rows if r["pkts_ba"] > 0), len(rows)))
+    print("Flows with direction reference initialized: %d / %d"
+          % (sum(1 for r in rows if r["dir_valid"]), len(rows)))
+    print("Flows seen in more than one pipe: %d" % sum(1 for r in rows if r["multi_pipe"]))
+    print("")
+    print("=== TCP flags totals ===")
+    print("SYN: %d" % sum(r["syn"] for r in rows))
+    print("ACK: %d" % sum(r["ack"] for r in rows))
+    print("RST: %d" % sum(r["rst"] for r in rows))
+    if errors:
+        print("")
+        print("=== Read errors (%d) ===" % len(errors))
+        for e in errors[:20]:
+            print(e)
+
+_read_registers_main()
+'''
+
+
+def build_inner_script(indexes, source: str, out_format: str, strict: bool, snapshot: str,
+                       clear_if_unchanged=None) -> str:
+    params = {"indexes": [int(i) for i in indexes], "source": source, "format": out_format,
+              "strict": bool(strict), "snapshot": snapshot,
+              "clear_if_unchanged": {str(int(k)): int(v) for k, v in (clear_if_unchanged or {}).items()}}
+    return INNER_TEMPLATE.replace("__PARAMS__", repr(json.dumps(params)))
+
+
+def parse_clear_arg(text: str) -> dict:
+    out = {}
+    for item in text.split(","):
+        item = item.strip()
+        if item:
+            idx, pkts = item.split(":")
+            out[int(idx)] = int(pkts)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--indexes", default="", help="comma-separated indexes, e.g. 1,2,3")
@@ -30,283 +287,77 @@ def main():
     ap.add_argument("--index-mode", choices=["cli", "file"], default="cli")
     ap.add_argument("--flow-buckets", type=int, default=FLOW_BUCKETS)
     ap.add_argument("--format", choices=["summary", "json"], default="summary")
+    ap.add_argument("--bfshell", default=default_bfshell(),
+                    help="local bfshell (default: $SDE_INSTALL/bin/bfshell)")
+    ap.add_argument("--bf-port", type=int, default=BF_PORT)
+    ap.add_argument("--ssh", help="run bfshell on this switch, e.g. root@172.168.1.2")
+    ap.add_argument("--remote-sde-install", default=DEFAULT_REMOTE_SDE_INSTALL)
+    ap.add_argument("--snapshot", choices=["sync", "hw"], default="sync")
+    ap.add_argument("--clear-if-unchanged", default="",
+                    help="IDX:PKTS,... clear these buckets after the read if pkts is still PKTS")
+    ap.add_argument("--timeout", type=float, default=600)
+    ap.add_argument(
+        "--strict-core-registers",
+        action="store_true",
+        help="Fail if a required packet/byte register cannot be read or parsed",
+    )
     args = ap.parse_args()
 
-    if not Path(BFSHELL).exists():
-        print(f"[ERROR] bfshell not found at: {BFSHELL}", file=sys.stderr)
-        sys.exit(1)
+    if not args.ssh:
+        if not Path(args.bfshell).exists():
+            print(f"[ERROR] bfshell not found at: {args.bfshell}", file=sys.stderr)
+            sys.exit(1)
+        if not port_open("127.0.0.1", args.bf_port):
+            print(f"[ERROR] Connection refused on 127.0.0.1:{args.bf_port}", file=sys.stderr)
+            print("Start bf_switchd first, then re-run.", file=sys.stderr)
+            print(f"Check: sudo ss -lntp | grep :{args.bf_port}", file=sys.stderr)
+            sys.exit(1)
 
-    if not port_open("127.0.0.1", BF_PORT):
-        print(f"[ERROR] Connection refused on 127.0.0.1:{BF_PORT}", file=sys.stderr)
-        print("Start bf_switchd first, then re-run.", file=sys.stderr)
-        print(f"Check: sudo ss -lntp | grep :{BF_PORT}", file=sys.stderr)
-        sys.exit(1)
-
-    cli_indexes = []
-    if args.indexes.strip():
-        for x in args.indexes.split(","):
-            x = x.strip()
-            if x:
-                cli_indexes.append(int(x))
-
-    inner_template = r'''
-import re
-import json
-
-INDEX_FILE = r"__INDEX_FILE__"
-INDEX_MODE = r"__INDEX_MODE__"
-FLOW_BUCKETS = __FLOW_BUCKETS__
-CLI_INDEXES = [__CLI_INDEXES__]
-OUT_FORMAT = r"__OUT_FORMAT__"
-
-ING = bfrt.basic.pipe.Ingress
-
-
-def dedup_keep_order(vals):
-    out, seen = [], set()
-    for x in vals:
-        if x not in seen:
-            out.append(x)
-            seen.add(x)
-    return out
-
-
-def load_indices_from_file(path):
+    if args.index_mode == "cli":
+        raw = [int(x) for x in args.indexes.split(",") if x.strip()]
+        source = "indices from CLI"
+    else:
+        raw = load_indices_from_file(args.index_file)
+        source = "indices from file"
     idxs = []
-    with open(path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
+    for i in raw:
+        if not 0 <= i < args.flow_buckets:
+            print(f"[ERROR] index {i} outside [0, {args.flow_buckets})", file=sys.stderr)
+            sys.exit(1)
+        if i not in idxs:
+            idxs.append(i)
+
+    clear = parse_clear_arg(args.clear_if_unchanged)
+    unread = sorted(set(clear) - set(idxs))
+    if unread:
+        print(f"[ERROR] --clear-if-unchanged lists buckets that are not read: {unread}", file=sys.stderr)
+        sys.exit(1)
+    script = build_inner_script(idxs, source, args.format, args.strict_core_registers, args.snapshot,
+                                clear_if_unchanged=clear)
+    out = run_bfshell_script(script, bfshell=args.bfshell, port=args.bf_port, ssh_host=args.ssh,
+                             remote_sde_install=args.remote_sde_install, timeout=args.timeout)
+    if args.format != "json":
+        print(out)
+        return
+    # bfshell's output also holds banners and the echoed commands: print only the payload.
+    payload = extract_payload(out)
+    if payload is None:
+        print("[ERROR] no register payload in the bfshell output:", file=sys.stderr)
+        print(out[-3000:], file=sys.stderr)
+        sys.exit(1)
+    print(payload)
+
+
+def extract_payload(out: str):
+    for line in reversed(out.splitlines()):
+        line = line.strip()
+        if line.startswith("{") and '"rows"' in line:
+            try:
+                json.loads(line)
+                return line
+            except ValueError:
                 continue
-            parts = re.split(r"[,\s]+", line)
-            for p in parts:
-                if p:
-                    idxs.append(int(p))
-    return dedup_keep_order(idxs)
-
-
-def get_f1(reg, idx):
-    e = reg.get(idx, from_hw=True)
-    s = str(e)
-
-    m = re.search(r"\.f1\s*:\s*\[(\d+),", s)
-    if m:
-        return int(m.group(1))
-
-    m = re.search(r":\s*0x([0-9a-fA-F]+)", s)
-    if m:
-        return int(m.group(1), 16)
-
-    m = re.search(r":\s*(\d+)", s)
-    if m:
-        return int(m.group(1))
-
-    raise RuntimeError("Couldn't parse value from entry:\n" + s)
-
-
-def get_reg(name):
-    try:
-        return getattr(ING, name)
-    except AttributeError:
-        return None
-
-
-REG_NAMES = [
-    "reg_pkts", "reg_bytes",
-    "reg_pkts_ab", "reg_pkts_ba", "reg_bytes_ab", "reg_bytes_ba",
-    "reg_ref_src_port", "reg_ref_dst_port", "reg_dir_valid",
-    "reg_min_len", "reg_max_len",
-    "reg_first_ts", "reg_last_ts",
-    "reg_iat_sum", "reg_iat_cnt", "reg_iat_min", "reg_iat_max", "reg_iat_last",
-    "reg_syn", "reg_ack", "reg_fin", "reg_rst",
-]
-
-REGS = {}
-for n in REG_NAMES:
-    REGS[n] = get_reg(n)
-
-
-def read_reg(name, idx, default=0):
-    r = REGS.get(name)
-    if r is None:
-        return default
-    try:
-        return get_f1(r, idx)
-    except Exception:
-        return default
-
-
-def print_table(rows, cols, title=None):
-    data = []
-    for r in rows:
-        data.append([fmt(r.get(key)) for header, key, fmt, align in cols])
-
-    headers = [h for h, _, _, _ in cols]
-    widths = [len(h) for h in headers]
-    for row in data:
-        for j, cell in enumerate(row):
-            widths[j] = max(widths[j], len(cell))
-
-    def line(ch="-"):
-        return "+" + "+".join(ch * (w + 2) for w in widths) + "+"
-
-    def fmt_cell(text, w, align):
-        return text.rjust(w) if align == "r" else text.ljust(w)
-
-    if title:
-        print("\\n" + title)
-
-    print(line("-"))
-    print("| " + " | ".join(headers[j].ljust(widths[j]) for j in range(len(headers))) + " |")
-    print(line("="))
-
-    for row in data:
-        out = []
-        for j, cell in enumerate(row):
-            out.append(fmt_cell(cell, widths[j], cols[j][3]))
-        print("| " + " | ".join(out) + " |")
-
-    print(line("-"))
-
-
-if INDEX_MODE == "cli":
-    idxs = dedup_keep_order(CLI_INDEXES)
-    source_title = "indices from CLI"
-else:
-    idxs = load_indices_from_file(INDEX_FILE)
-    source_title = "indices from file"
-
-
-rows = []
-for i in idxs:
-    pkts  = read_reg("reg_pkts", i, 0)
-    byt   = read_reg("reg_bytes", i, 0)
-    bpp   = (byt / pkts) if pkts else 0.0
-
-    pkts_ab  = read_reg("reg_pkts_ab",  i, 0)
-    pkts_ba  = read_reg("reg_pkts_ba",  i, 0)
-    bytes_ab = read_reg("reg_bytes_ab", i, 0)
-    bytes_ba = read_reg("reg_bytes_ba", i, 0)
-
-    ref_src_port = read_reg("reg_ref_src_port", i, 0)
-    ref_dst_port = read_reg("reg_ref_dst_port", i, 0)
-    dir_valid    = read_reg("reg_dir_valid", i, 0)
-
-    min_len = read_reg("reg_min_len", i, 0)
-    max_len = read_reg("reg_max_len", i, 0)
-
-    first_ts = read_reg("reg_first_ts", i, 0)
-    last_ts  = read_reg("reg_last_ts",  i, 0)
-
-    iat_sum  = read_reg("reg_iat_sum",  i, 0)
-    iat_cnt  = read_reg("reg_iat_cnt",  i, 0)
-    iat_min  = read_reg("reg_iat_min",  i, 0)
-    iat_max  = read_reg("reg_iat_max",  i, 0)
-    iat_last = read_reg("reg_iat_last", i, 0)
-    iat_avg = (iat_sum / iat_cnt) if iat_cnt else 0.0
-
-    syn = read_reg("reg_syn", i, 0)
-    ack = read_reg("reg_ack", i, 0)
-    fin = read_reg("reg_fin", i, 0)
-    rst = read_reg("reg_rst", i, 0)
-
-    rows.append({
-        "idx": i,
-        "pkts": pkts,
-        "bytes": byt,
-        "bpp": bpp,
-        "pkts_ab": pkts_ab,
-        "pkts_ba": pkts_ba,
-        "bytes_ab": bytes_ab,
-        "bytes_ba": bytes_ba,
-        "ref_src_port": ref_src_port,
-        "ref_dst_port": ref_dst_port,
-        "dir_valid": dir_valid,
-        "min_len": min_len,
-        "max_len": max_len,
-        "first_ts": first_ts,
-        "last_ts": last_ts,
-        "iat_cnt": iat_cnt,
-        "iat_sum": iat_sum,
-        "iat_avg": iat_avg,
-        "iat_min": iat_min,
-        "iat_max": iat_max,
-        "iat_last": iat_last,
-        "syn": syn,
-        "ack": ack,
-        "fin": fin,
-        "rst": rst,
-    })
-
-if OUT_FORMAT == "json":
-    payload = {
-        "source": source_title,
-        "flow_count": len(rows),
-        "rows": rows,
-    }
-    print(json.dumps(payload))
-else:
-    tot_pkts  = sum(r["pkts"] for r in rows)
-    tot_bytes = sum(r["bytes"] for r in rows)
-    avg_bpp   = (tot_bytes / tot_pkts) if tot_pkts else 0.0
-
-    nonzero_ab = sum(1 for r in rows if r["pkts_ab"] > 0 or r["bytes_ab"] > 0)
-    nonzero_ba = sum(1 for r in rows if r["pkts_ba"] > 0 or r["bytes_ba"] > 0)
-    dir_valid_cnt = sum(1 for r in rows if r["dir_valid"] != 0)
-
-    print(f"\\n=== OVERALL ({source_title}) ===")
-    print(f"Flows: {len(rows)}")
-    print(f"Total pkts: {tot_pkts}")
-    print(f"Total bytes: {tot_bytes}")
-    print(f"Avg B/packet: {avg_bpp:.2f}")
-    print(f"Flows with any AB traffic: {nonzero_ab} / {len(rows)}")
-    print(f"Flows with any BA traffic: {nonzero_ba} / {len(rows)}")
-    print(f"Flows with direction reference initialized: {dir_valid_cnt} / {len(rows)}")
-
-    tot_syn = sum(r["syn"] for r in rows)
-    tot_ack = sum(r["ack"] for r in rows)
-    tot_fin = sum(r["fin"] for r in rows)
-    tot_rst = sum(r["rst"] for r in rows)
-
-    tot_iat_cnt = sum(r["iat_cnt"] for r in rows)
-    tot_iat_sum = sum(r["iat_sum"] for r in rows)
-    overall_iat_avg = (tot_iat_sum / tot_iat_cnt) if tot_iat_cnt else 0.0
-
-    print("\\n=== TCP flags totals ===")
-    print(f"SYN: {tot_syn}")
-    print(f"ACK: {tot_ack}")
-    print(f"FIN: {tot_fin}")
-    print(f"RST: {tot_rst}")
-
-    print("\\n=== IAT totals ===")
-    print(f"IAT cnt: {tot_iat_cnt}")
-    print(f"IAT sum: {tot_iat_sum}")
-    print(f"Overall IAT avg: {overall_iat_avg:.2f}")
-'''
-
-    cli_indexes_str = ",".join(str(x) for x in cli_indexes)
-
-    inner_py = (
-        inner_template
-        .replace("__INDEX_FILE__", args.index_file)
-        .replace("__INDEX_MODE__", args.index_mode)
-        .replace("__FLOW_BUCKETS__", str(args.flow_buckets))
-        .replace("__CLI_INDEXES__", cli_indexes_str)
-        .replace("__OUT_FORMAT__", args.format)
-    )
-
-    with tempfile.NamedTemporaryFile("w", delete=False, suffix=".py") as f:
-        f.write(inner_py)
-        inner_path = f.name
-
-    try:
-        cmd = [BFSHELL, "-p", str(BF_PORT), "-b", inner_path]
-        subprocess.run(cmd, check=True)
-    finally:
-        try:
-            os.unlink(inner_path)
-        except OSError:
-            pass
+    return None
 
 
 if __name__ == "__main__":
