@@ -1,66 +1,11 @@
 #!/usr/bin/env python3
 import argparse
-import struct
 import time
-import socket
 import ipaddress
 from scapy.all import rdpcap, sendp, Ether, IP, TCP, UDP
 
-
-def reflect_bits(val: int, width: int) -> int:
-    res = 0
-    for _ in range(width):
-        res = (res << 1) | (val & 1)
-        val >>= 1
-    return res
-
-
-def crc16_tofino(data: bytes) -> int:
-    POLY = 0x8005
-    crc = 0x0000
-    for b in data:
-        b = reflect_bits(b, 8)
-        crc ^= (b << 8)
-        for _ in range(8):
-            if crc & 0x8000:
-                crc = ((crc << 1) ^ POLY) & 0xFFFF
-            else:
-                crc = (crc << 1) & 0xFFFF
-    return reflect_bits(crc, 16)
-
-
-def ip_to_u32(ip: str) -> int:
-    return struct.unpack("!I", socket.inet_aton(ip))[0]
-
-
-def u32_to_bytes(x: int) -> bytes:
-    return struct.pack("!I", x & 0xFFFFFFFF)
-
-
-def u16_to_bytes(x: int) -> bytes:
-    return struct.pack("!H", x & 0xFFFF)
-
-
-def compute_flow_index_symmetric(src_ip: str, dst_ip: str, sport: int, dport: int, proto: int) -> int:
-    sip = ip_to_u32(src_ip)
-    dip = ip_to_u32(dst_ip)
-
-    ip_x = (sip ^ dip) & 0xFFFFFFFF
-    ip_s = (sip + dip) & 0xFFFFFFFF
-
-    sp = sport & 0xFFFF
-    dp = dport & 0xFFFF
-    p_x = (sp ^ dp) & 0xFFFF
-    p_s = (sp + dp) & 0xFFFF
-
-    blob = b"".join([
-        u32_to_bytes(ip_x),
-        u32_to_bytes(ip_s),
-        u16_to_bytes(p_x),
-        u16_to_bytes(p_s),
-        struct.pack("!B", proto & 0xFF),
-    ])
-    return crc16_tofino(blob)
+# The bucket index as the data plane computes it (see flow_index.py).
+from flow_index import compute_flow_index as compute_flow_index_symmetric
 
 
 def extract_5tuple(pkt):

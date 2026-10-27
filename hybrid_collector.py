@@ -16,8 +16,9 @@ from typing import Dict, List, Optional, Any
 # IMPORT CPU REPORT LISTENER
 # ============================================================
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "thesis-hybrid-ebpf-p4" / "python"))
 sys.path.append("/home/ubuntu/Desktop/p4_ebpf/thesis-hybrid-ebpf-p4/python")
-from listen_cpu_reports import collect_indexes_on_iface
+from listen_cpu_reports import ReportCollector
 
 
 # ============================================================
@@ -372,20 +373,33 @@ def run_scenario_command(cmd: str, shell: str = "/bin/bash") -> subprocess.Popen
 # P4 HELPERS
 # ============================================================
 
-def run_p4_reader_json(reader_path: str, indexes: List[int]) -> Dict[str, Any]:
+def run_p4_reader_json(
+    reader_path: str,
+    indexes: List[int],
+    switch_ssh: Optional[str] = None,
+    snapshot: str = "sync",
+    clear_if_unchanged: Optional[Dict[int, int]] = None,
+) -> Dict[str, Any]:
     if not indexes:
-        return {"source": "empty", "flow_count": 0, "rows": []}
+        return {"source": "empty", "flow_count": 0, "cleared": [], "rows": []}
 
     index_arg = ",".join(str(x) for x in indexes)
 
+    cmd = [
+        sys.executable,
+        reader_path,
+        "--index-mode", "cli",
+        "--indexes", index_arg,
+        "--format", "json",
+        "--snapshot", snapshot,
+    ]
+    if switch_ssh:
+        cmd += ["--ssh", switch_ssh]
+    if clear_if_unchanged:
+        cmd += ["--clear-if-unchanged", ",".join(f"{i}:{p}" for i, p in sorted(clear_if_unchanged.items()))]
+
     result = subprocess.run(
-        [
-            sys.executable,
-            reader_path,
-            "--index-mode", "cli",
-            "--indexes", index_arg,
-            "--format", "json",
-        ],
+        cmd,
         check=True,
         capture_output=True,
         text=True,
@@ -411,27 +425,57 @@ def run_p4_reader_json(reader_path: str, indexes: List[int]) -> Dict[str, Any]:
     )
 
 
-def run_p4_forwarder(forwarder_path: str, int_port: int, ext_port: int) -> None:
-    subprocess.run(
-        [
-            sys.executable,
-            forwarder_path,
-            "--int-port", str(int_port),
-            "--ext-port", str(ext_port),
-        ],
-        check=True,
-    )
+def run_p4_forwarder(
+    forwarder_path: str,
+    int_port: int,
+    ext_port: int,
+    report_port: int,
+    mirror_sid: int,
+    switch_ssh: Optional[str] = None,
+) -> None:
+    cmd = [
+        sys.executable,
+        forwarder_path,
+        "--int-port", str(int_port),
+        "--ext-port", str(ext_port),
+        "--report-port", str(report_port),
+        "--mirror-sid", str(mirror_sid),
+    ]
+    if switch_ssh:
+        cmd += ["--ssh", switch_ssh]
+    subprocess.run(cmd, check=True)
 
 
-def collect_windowed_indexes_for_proc(
-    cpu_iface: str,
+def collect_windows_live(
+    collector: ReportCollector,
     proc: subprocess.Popen,
     window_sec: float,
     drain_seconds: float,
     global_t0: float,
+    reader_path: str,
+    active_ttl_windows: int,
+    switch_ssh: Optional[str] = None,
+    snapshot: str = "sync",
+    clear_idle_windows: int = 3,
 ) -> List[Dict[str, object]]:
+    """Per window: the CPU-reported bucket indexes, and the P4 registers of all
+    active indexes read at the end of that window.
 
+    The collector keeps capturing reports in the background while the
+    registers are read, so a read does not open a gap in the report capture.
+    A bucket reports only once, when it is first used, so an index stays
+    active while its packet counter keeps changing, and for active_ttl_windows
+    windows after its last report or change.
+
+    With clear_idle_windows > 0, a bucket whose counter has not changed for
+    that many consecutive reads is cleared right after the read (only if it is
+    still unchanged then). It is empty again, so the next flow that lands in it
+    sends a new report instead of being merged silently into the old counters.
+    """
     windows: List[Dict[str, object]] = []
+    active_idx_last_seen: Dict[int, int] = {}
+    last_pkts: Dict[int, int] = {}
+    idle_reads: Dict[int, int] = {}
 
     w = 0
     proc_done = False
@@ -445,13 +489,55 @@ def collect_windowed_indexes_for_proc(
         win_end_abs = global_t0 + win_end_rel
 
         now = time.time()
+        if now < win_end_abs:
+            time.sleep(win_end_abs - now)
+        elif now > win_end_abs + 1.0:
+            print(f"[WARN] window {w}: register read of the previous window overran by "
+                  f"{now - win_end_abs:.1f} s")
 
-        if now < win_start_abs:
-            time.sleep(win_start_abs - now)
+        reports = collector.take(win_start_abs, win_end_abs)
+        idxs = sorted({safe_int(r["idx"]) for r in reports})
+        mismatches = sum(1 for r in reports if r["idx_source"] == "report" and r["idx"] != r["idx_computed"])
+        if mismatches:
+            print(f"[WARN] window {w}: {mismatches} report(s) carry an index that flow_index.py "
+                  f"does not reproduce; the data plane and flow_index.py disagree")
 
-        timeout = max(0.0, win_end_abs - time.time())
+        for idx in idxs:
+            active_idx_last_seen[idx] = w
+        active_idxs = sorted(
+            idx for idx, last_seen in active_idx_last_seen.items()
+            if (w - last_seen) <= active_ttl_windows
+        )
+        active_idx_last_seen = {idx: active_idx_last_seen[idx] for idx in active_idxs}
 
-        idxs = sorted(set(collect_indexes_on_iface(cpu_iface, timeout=timeout)))
+        # Buckets that would complete clear_idle_windows idle reads with this read.
+        clear_candidates = {}
+        if clear_idle_windows > 0:
+            clear_candidates = {
+                idx: last_pkts[idx] for idx in active_idxs
+                if idx in last_pkts and idle_reads.get(idx, 0) + 1 >= clear_idle_windows
+            }
+
+        read_start = time.time()
+        payload = run_p4_reader_json(reader_path, active_idxs, switch_ssh=switch_ssh, snapshot=snapshot,
+                                     clear_if_unchanged=clear_candidates)
+        read_end = time.time()
+
+        for row in payload.get("rows", []):
+            idx = safe_int(row.get("idx"))
+            pkts = safe_int(row.get("pkts"))
+            if last_pkts.get(idx) != pkts:
+                active_idx_last_seen[idx] = w
+                idle_reads[idx] = 0
+            else:
+                idle_reads[idx] = idle_reads.get(idx, 0) + 1
+            last_pkts[idx] = pkts
+
+        cleared = sorted(safe_int(x) for x in payload.get("cleared", []))
+        for idx in cleared:
+            active_idx_last_seen.pop(idx, None)
+            last_pkts.pop(idx, None)
+            idle_reads.pop(idx, None)
 
         windows.append({
             "net_window_id": w,
@@ -459,6 +545,14 @@ def collect_windowed_indexes_for_proc(
             "net_window_end_sec": round(win_end_rel, 3),
             "net_window_duration_sec": round(window_sec, 3),
             "indexes": idxs,
+            "active_indexes": active_idxs,
+            "report_count": len(reports),
+            "index_mismatches": mismatches,
+            "rows": payload.get("rows", []),
+            "cleared_indexes": cleared,
+            "p4_snapshot": payload.get("snapshot"),
+            "p4_read_start_sec": round(read_start - global_t0, 3),
+            "p4_read_sec": round(read_end - read_start, 3),
         })
 
         if not proc_done and proc.poll() is not None:
@@ -479,35 +573,25 @@ def collect_windowed_indexes_for_proc(
 # ============================================================
 
 def build_net_summaries(
-    reader_path: str,
     net_windows: List[Dict[str, object]],
     window_sec: float,
-    active_ttl_windows: int = 3,
 ) -> List[Dict[str, object]]:
+    """Window features from the register snapshots taken at each window end
+    (collect_windows_live): deltas against the previous snapshot of the same
+    bucket index."""
 
     out: List[Dict[str, object]] = []
 
     prev_by_idx: Dict[int, Dict[str, Any]] = {}
-    active_idx_last_seen: Dict[int, int] = {}
 
-    for win_i, win in enumerate(net_windows):
-        current_idxs = [safe_int(x) for x in win["indexes"]]
-        current_idxs = [x for x in current_idxs if x > 0]
+    for win in net_windows:
+        rows = win.get("rows", [])
 
-        for idx in current_idxs:
-            active_idx_last_seen[idx] = win_i
-
-        active_idxs = sorted(
-            idx for idx, last_seen in active_idx_last_seen.items()
-            if (win_i - last_seen) <= active_ttl_windows
-        )
-
-        if not active_idxs:
+        if not rows:
             out.append(dict(NET_ZERO))
             continue
 
-        payload = run_p4_reader_json(reader_path, active_idxs)
-        rows = payload.get("rows", [])
+        cleared_after_read = [safe_int(x) for x in win.get("cleared_indexes", [])]
 
         summary = dict(NET_ZERO)
         summary["net_flow_count_seen"] = len(rows)
@@ -589,8 +673,9 @@ def build_net_summaries(
             if max_len > 0:
                 max_lens.append(max_len)
 
-            if first_ts > 0 and last_ts >= first_ts:
-                durations.append(last_ts - first_ts)
+            # first_ts/last_ts are the low 32 bits of a ns clock (wrap every 4.295 s).
+            if first_ts > 0 and last_ts > 0:
+                durations.append(float((int(last_ts) - int(first_ts)) % (1 << 32)))
 
             if dir_valid != 0:
                 summary["net_dir_valid_count"] += 1
@@ -603,12 +688,9 @@ def build_net_summaries(
 
             prev_by_idx[idx] = row
 
-        # Expire old inactive indexes
-        active_idx_last_seen = {
-            idx: last_seen
-            for idx, last_seen in active_idx_last_seen.items()
-            if (win_i - last_seen) <= active_ttl_windows
-        }
+        # Buckets cleared after this read restart from zero.
+        for idx in cleared_after_read:
+            prev_by_idx.pop(idx, None)
 
         pkts_delta = summary["net_pkts_total_delta"]
         bytes_delta = summary["net_bytes_total_delta"]
@@ -743,6 +825,18 @@ def main() -> None:
     ap.add_argument("--skip-p4-forwarding", action="store_true")
     ap.add_argument("--forward-int-port", type=int, default=0)
     ap.add_argument("--forward-ext-port", type=int, default=1)
+    ap.add_argument("--forward-report-port", type=int, default=2,
+                    help="mirror destination for CPU reports (2 on the model, 192 = PCIe CPU port on the switch)")
+    ap.add_argument("--mirror-sid", type=int, default=1)
+    ap.add_argument("--switch-ssh",
+                    help="run BFRT and the CPU-report capture on this switch over SSH, e.g. root@172.168.1.2")
+    ap.add_argument("--p4-snapshot", choices=["sync", "hw"], default="sync",
+                    help="register snapshot method of the P4 reader")
+    ap.add_argument("--active-ttl-windows", type=int, default=5,
+                    help="windows an index stays active after its last CPU report or counter change")
+    ap.add_argument("--clear-idle-windows", type=int, default=3,
+                    help="clear a bucket after this many reads without new packets, so that the next "
+                         "flow in it reports again (0 = never clear)")
 
     ap.add_argument("--command")
     ap.add_argument("--shell", default="/bin/bash")
@@ -776,13 +870,25 @@ def main() -> None:
 
     host_proc = None
     workload_proc = None
+    report_collector = None
 
     run_id = f"{args.scenario_name}_{int(time.time())}"
 
     try:
         if not args.skip_p4_forwarding:
             print(f"[INFO] Programming forwarding via: {args.p4_forwarder}")
-            run_p4_forwarder(args.p4_forwarder, args.forward_int_port, args.forward_ext_port)
+            run_p4_forwarder(
+                args.p4_forwarder,
+                args.forward_int_port,
+                args.forward_ext_port,
+                args.forward_report_port,
+                args.mirror_sid,
+                switch_ssh=args.switch_ssh,
+            )
+
+        where = f"{args.switch_ssh}:{args.cpu_iface}" if args.switch_ssh else args.cpu_iface
+        print(f"[INFO] Collecting CPU reports on {where}")
+        report_collector = ReportCollector(args.cpu_iface, ssh_host=args.switch_ssh).start()
 
         print(f"[INFO] Starting HostMon with window_sec={args.window_sec}")
         host_proc = start_hostmon(args.hostmon, args.hostmon_log, args.window_sec)
@@ -812,14 +918,24 @@ def main() -> None:
             global_t0 = time.time()
             workload_proc = run_scenario_command(args.command, shell=args.shell)
 
-        print(f"[INFO] Collecting CPU reports on {args.cpu_iface}")
-        net_windows = collect_windowed_indexes_for_proc(
-            cpu_iface=args.cpu_iface,
+        print("[INFO] Reading P4 registers at the end of every window")
+        net_windows = collect_windows_live(
+            collector=report_collector,
             proc=workload_proc,
             window_sec=args.window_sec,
             drain_seconds=args.drain_seconds if args.mode == "pcap" else 0.0,
             global_t0=global_t0,
+            reader_path=args.p4_reader,
+            active_ttl_windows=args.active_ttl_windows,
+            switch_ssh=args.switch_ssh,
+            snapshot=args.p4_snapshot,
+            clear_idle_windows=args.clear_idle_windows,
         )
+        report_collector.stop()
+        print(f"[INFO] CPU reports: {sum(w['report_count'] for w in net_windows)} in "
+              f"{len(net_windows)} windows; index mismatches: "
+              f"{sum(w['index_mismatches'] for w in net_windows)}; idle buckets cleared: "
+              f"{sum(len(w['cleared_indexes']) for w in net_windows)}")
 
         workload_proc.wait()
 
@@ -850,10 +966,8 @@ def main() -> None:
 
         print("[INFO] Building P4 window summaries")
         net_summaries = build_net_summaries(
-            reader_path=args.p4_reader,
             net_windows=net_windows,
             window_sec=args.window_sec,
-            active_ttl_windows=5,
         )
 
         rows = build_rows(
@@ -882,6 +996,9 @@ def main() -> None:
 
         if host_proc is not None:
             stop_hostmon(host_proc)
+
+        if report_collector is not None:
+            report_collector.stop()
 
 
 if __name__ == "__main__":

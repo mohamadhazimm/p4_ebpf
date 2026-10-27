@@ -58,82 +58,15 @@ python3 /home/ubuntu/Desktop/p4_ebpf/thesis-hybrid-ebpf-p4/python/program_forwar
   
 
 *open bf-shell: /home/ubuntu/open-p4studio/install/bin/bfshell -p 9999
-*clear registers => 
+*clear registers (all 14 in ingress.p4; there is no reg_fin) =>
 ing = bfrt.basic.pipe.Ingress
-ing.reg_ack.clear()
-ing.reg_bytes.clear()
-ing.reg_bytes.clear()
-ing.reg_fin.clear()
-ing.reg_pkts.clear()
-ing.reg_rst.clear()
-ing.reg_syn.clear()
+for r in ["reg_pkts", "reg_bytes", "reg_pkts_ab", "reg_bytes_ab", "reg_ref_src_port", "reg_ref_dst_port", "reg_dir_valid", "reg_min_len", "reg_max_len", "reg_first_ts", "reg_last_ts", "reg_syn", "reg_ack", "reg_rst"]: getattr(ing, r).clear()
 
-*script to get hash_idx:
-python3 - <<'PY'
-import struct
+bfrt.complete_operations()
 
-def crc16_ibm_reflected(data: bytes):
-    crc = 0xFFFF
-    for b in data:
-        crc ^= b
-        for _ in range(8):
-            if crc & 1:
-                crc = (crc >> 1) ^ 0xA001
-            else:
-                crc >>= 1
-    return crc & 0xFFFF
-
-def ip_to_bytes(ip):
-    return bytes(map(int, ip.split(".")))
-
-src_ip = "10.0.0.1"
-dst_ip = "10.0.0.2"
-src_port = 12345
-dst_port = 443
-protocol = 6  # TCP
-
-data = b""
-data += ip_to_bytes(src_ip)
-data += ip_to_bytes(dst_ip)
-data += struct.pack("!H", src_port)
-data += struct.pack("!H", dst_port)
-data += struct.pack("!B", protocol)
-
-index = crc16_ibm_reflected(data)
-print("flow_index =", index)
-PYpython3 - <<'PY'
-import struct
-
-def crc16_ibm_reflected(data: bytes):
-    crc = 0xFFFF
-    for b in data:
-        crc ^= b
-        for _ in range(8):
-            if crc & 1:
-                crc = (crc >> 1) ^ 0xA001
-            else:
-                crc >>= 1
-    return crc & 0xFFFF
-
-def ip_to_bytes(ip):
-    return bytes(map(int, ip.split(".")))
-
-src_ip = "10.0.0.1"
-dst_ip = "10.0.0.2"
-src_port = 12345
-dst_port = 443
-protocol = 6  # TCP
-
-data = b""
-data += ip_to_bytes(src_ip)
-data += ip_to_bytes(dst_ip)
-data += struct.pack("!H", src_port)
-data += struct.pack("!H", dst_port)
-data += struct.pack("!B", protocol)
-
-index = crc16_ibm_reflected(data)
-print("flow_index =", index)
-PY
+*script to get the bucket index of a 5-tuple (the function the data plane computes;
+ CPU reports also carry it as flow_index) =>
+cd /home/ubuntu/Desktop/p4_ebpf/thesis-hybrid-ebpf-p4/python && python3 -c 'from flow_index import compute_flow_index; print("flow_index =", compute_flow_index("10.0.0.1", "10.0.0.2", 12345, 443, 6))'
 
 *script to send SYN packets =>
 sudo python3 - <<'PY'

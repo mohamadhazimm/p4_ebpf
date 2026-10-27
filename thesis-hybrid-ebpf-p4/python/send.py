@@ -6,48 +6,11 @@ Usage:
   sudo python3 send_packets.py --iface veth0 --mode tcp --src-ip 10.0.0.1 --dst-ip 10.0.0.2 --sport 12345 --dport 443 --flags S --count 5
 """
 import argparse
-import struct
 from scapy.all import Ether, IP, TCP, UDP, sendp
 
-
-# ── CRC-16/ARC: poly=0x8005, init=0x0000, refin=True, refout=True, xorout=0x0000
-# This matches Tofino's HashAlgorithm_t.CRC16 / CRC_16.
-def reflect_bits(val: int, width: int) -> int:
-    result = 0
-    for _ in range(width):
-        result = (result << 1) | (val & 1)
-        val >>= 1
-    return result
-
-
-def crc16_tofino(data: bytes) -> int:
-    POLY = 0x8005
-    crc = 0x0000          # init
-    for b in data:
-        b = reflect_bits(b, 8)          # refin
-        crc ^= (b << 8)
-        for _ in range(8):
-            if crc & 0x8000:
-                crc = ((crc << 1) ^ POLY) & 0xFFFF
-            else:
-                crc = (crc << 1) & 0xFFFF
-    crc = reflect_bits(crc, 16)         # refout
-    return crc ^ 0x0000                 # xorout
-
-
-def ip_to_bytes(ip: str) -> bytes:
-    return bytes(map(int, ip.split(".")))
-
-
-def compute_flow_index(src_ip: str, dst_ip: str, sport: int, dport: int, proto: int) -> int:
-    blob = b"".join([
-        ip_to_bytes(src_ip),
-        ip_to_bytes(dst_ip),
-        struct.pack("!H", sport),
-        struct.pack("!H", dport),
-        struct.pack("!B", proto),
-    ])
-    return crc16_tofino(blob)
+# The bucket index as the data plane computes it: CRC-16/ARC over the
+# @symmetric input (see flow_index.py), the same for both directions.
+from flow_index import compute_flow_index
 
 
 def main():
