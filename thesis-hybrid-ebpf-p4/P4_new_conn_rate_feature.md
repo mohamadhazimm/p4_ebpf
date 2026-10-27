@@ -77,6 +77,23 @@ Measured headroom is ample (5/12 ingress stages, 20.5% SRAM, 14/48 stateful ALUs
 aliasing is identical to the existing 65,536-bucket design: two keys in one bucket only ever *over*-count
 toward "attack," never hide one, which is harmless for a flood detector.
 
+**Note on the bucket count (measured 2026-10-27; 65,536 kept for now).** The register costs two ingress
+stages, not one. At 32 bits, 65,536 entries need 17 map RAMs, and none of stages 0–4 has that many free,
+so the compiler moves 8 flow registers one or two stages later. 16,384 buckets (a 14-bit index: the low
+14 bits of the same CRC) need 5 map RAMs and fit into stage 0 without moving anything:
+
+| Destination buckets | Ingress stages | Map RAM | Latency estimate (ingress) |
+|---|---|---|---|
+| none (deployed `basic_fix`) | 5 | 196 | 131 cycles |
+| 65,536 (this spec, kept) | 7 | 213 | 158 cycles |
+| 16,384 | 5 | 201 | 131 cycles |
+
+The cost of 16,384 is aliasing: of K active keys, a key shares its bucket with probability about
+K/16,384 instead of K/65,536 (about 1–2% at a few hundred keys), and a shared bucket only adds counts.
+Both sizes passed 12/12 checks on the switch (`p4_perf.md` §5.4). To switch: `DST_BUCKETS = 16384` and
+`bit<14>` for the four index types in `ingress.p4` (hash, register, register action, `ndx`), the low 14
+bits in `flow_index.compute_newconn_dst_index()`, and `DST_BUCKETS` in `read_registers_with_index.py`.
+
 ## 6. Compile + validate
 - `bf-p4c` compile; confirm it fits (expect +1 stage, no table/SRAM pressure).
 - Sanity on the model/hardware or against the offline reconstruction over the existing flood captures:

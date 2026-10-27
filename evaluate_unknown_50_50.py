@@ -151,7 +151,7 @@ def main() -> int:
     network_matrix = numeric_matrix(rows, network_features)
     host_matrix = numeric_matrix(rows, host_features)
     if len(feature_family_indices(network_features)) != len(P4_FEATURES):
-        parser.error("P4 network feature pool must contain all 29 signal families")
+        parser.error(f"P4 network feature pool must contain all {len(P4_FEATURES)} signal families")
     host_families = feature_family_indices(host_features)
     expected_summaries = len(P4_WINDOW_STATS)
     if any(len(indices) != expected_summaries for indices in host_families.values()):
@@ -243,7 +243,7 @@ def main() -> int:
             "target_benign_alert_rate": args.benign_alert_rate,
             "source": "separate benign calibration package groups",
         },
-        "host_family_selector": "top 29 mean log(1 + variance) families on benign fit rows",
+        "host_family_selector": f"top {len(P4_FEATURES)} mean log(1 + variance) families on benign fit rows",
         "models": {},
     }
     novelty_feature_rows = []
@@ -325,7 +325,7 @@ def main() -> int:
         "heldout_benign_evaluation_samples": len(benign_evaluation),
         "benign_package_groups_disjoint": group_audit["package_groups_disjoint"],
         "threshold": 0.5,
-        "host_family_selector": "top 29 mean summary mutual-information families on training rows only",
+        "host_family_selector": f"top {len(P4_FEATURES)} mean summary mutual-information families on training rows only",
         "models": {},
     }
     supervised_feature_rows = [

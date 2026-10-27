@@ -163,6 +163,27 @@ control Ingress(
         }
     };
 
+    /* -------- New connections per destination -------- */
+    /* reg_syn counts per flow, so a connection flood (thousands of 5-tuples
+     * from one client to one service) puts about one SYN in each bucket. This
+     * counter has its own index: a directional hash over (client, server,
+     * server port, protocol) without the source port, so all connections a
+     * client opens to one service share a bucket. Not @symmetric, and plain
+     * fields only (bf-p4c 9.6.0 drops arithmetic inside a Hash field list).
+     * python/flow_index.py computes the same index. */
+    const bit<32> DST_BUCKETS = 65536;
+
+    Hash<bit<16>>(HashAlgorithm_t.CRC16) crc16_dsthash;
+
+    Register<bit<32>, bit<16>>(DST_BUCKETS) reg_newconn_dst;
+
+    RegisterAction<bit<32>, bit<16>, bit<32>>(reg_newconn_dst) newconn_dst_inc = {
+        void apply(inout bit<32> v, out bit<32> old) {
+            old = v;
+            v = v + 32w1;
+        }
+    };
+
     /* -------- TCP flag counters -------- */
     RegisterAction<bit<32>, bit<16>, bit<32>>(reg_syn) syn_inc = {
         void apply(inout bit<32> v, out bit<32> old) {
@@ -307,6 +328,14 @@ control Ingress(
                 if ((f & 9w0x010) != 0) {
                     ack_inc.execute(idx);
                 }
+
+                /* New-connection attempt: SYN set and ACK clear (reg_syn
+                 * also counts SYN+ACK) */
+                if ((f & 9w0x012) == 9w0x002) {
+                    bit<16> ndx = crc16_dsthash.get({ hdr.ipv4.srcAddr, hdr.ipv4.dstAddr,
+                                                      meta.l4_dport, hdr.ipv4.protocol });
+                    newconn_dst_inc.execute(ndx);
+                }
             }
         }
 #endif
@@ -331,6 +360,9 @@ Raw primitives exported / readable per flow bucket:
 - ack_count         = reg_ack
 - rst_count         = reg_rst
 
+Per destination bucket (crc16_dsthash over srcAddr, dstAddr, l4_dport, protocol):
+- new_conn_dst      = reg_newconn_dst   (TCP segments with SYN set and ACK clear)
+
 Derived off-switch features:
 - pkts_ba           = pkts_total - pkts_ab
 - bytes_ba          = bytes_total - bytes_ab
@@ -341,10 +373,12 @@ Derived off-switch features:
 - avg_pkt_size_ba   = bytes_ba / pkts_ba               (guard divide-by-zero)
 - bytes_per_sec     = bytes_total / flow_duration      (guard divide-by-zero)
 - pkts_per_sec      = pkts_total / flow_duration       (guard divide-by-zero)
+- new_conn_dst_max  = largest new_conn_dst increase of one destination bucket
+                      in the window
 
 Recommended final hybrid-network feature families:
 - volume            : pkts_total, bytes_total, pkts_ab, bytes_ab, pkts_ba, bytes_ba
 - size              : min_len, max_len, avg_pkt_size
 - timing            : flow_duration, bytes_per_sec, pkts_per_sec
-- tcp_behavior      : syn_count, ack_count, rst_count
+- tcp_behavior      : syn_count, ack_count, rst_count, new_conn_dst_max
 */

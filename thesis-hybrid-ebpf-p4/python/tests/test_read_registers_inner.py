@@ -39,7 +39,8 @@ class FakeRegister:
 
 class FakeBfrt:
     def __init__(self, cells, sync=True):
-        regs = {n: FakeRegister(n, {i: list(v) for i, v in cells.get(n, {}).items()}, sync) for n in REGS}
+        names = REGS + [n for n in cells if n not in REGS]
+        regs = {n: FakeRegister(n, {i: list(v) for i, v in cells.get(n, {}).items()}, sync) for n in names}
         self.regs = regs
         ingress = type("Ingress", (), dict(regs))
         pipe = type("Pipe", (), {"Ingress": ingress})
@@ -129,6 +130,24 @@ class InnerScriptTests(unittest.TestCase):
             self.assertEqual(reg.mods, [(5, 0)])
             self.assertEqual(reg.cells[5], [0, 0])
         self.assertEqual(list(payload)[-2:], ["cleared", "rows"])
+
+    def test_destination_buckets_are_read_and_never_cleared(self):
+        bfrt = FakeBfrt(dict(CELLS, reg_newconn_dst={3: [0, 700], 4: [2, 5]}))
+        payload = run_inner(build_inner_script([5], "t", "json", True, "sync", clear_if_unchanged={5: 10},
+                                               dst_indexes=[3, 4, 8]), bfrt)
+        self.assertEqual([(r["idx"], r["new_conn"], r["pipes"]) for r in payload["dst_rows"]],
+                         [(3, 700, [1]), (4, 7, [0, 1]), (8, 0, [])])
+        dst = bfrt.regs["reg_newconn_dst"]
+        self.assertTrue(dst.synced and all(not from_hw for from_hw in dst.reads))
+        self.assertEqual(payload["cleared"], [5])
+        self.assertFalse(hasattr(dst, "mods"))  # clearing flow bucket 5 leaves it alone
+        self.assertEqual(list(payload)[-2:], ["cleared", "rows"])
+
+    def test_missing_destination_register_is_reported_not_fatal(self):
+        payload = run_inner(build_inner_script([5], "t", "json", True, "sync", dst_indexes=[3]), FakeBfrt(CELLS))
+        self.assertEqual(payload["dst_rows"], [])
+        self.assertEqual(payload["errors"], ["Register is missing from pipeline: reg_newconn_dst"])
+        self.assertEqual(payload["rows"][0]["pkts"], 10)
 
     def test_summary_format_runs(self):
         out = io.StringIO()

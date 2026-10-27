@@ -4,8 +4,11 @@
 The indexes normally come from the CPU reports (cpu_report_t.flow_index). The
 script runs bfshell on this host, or with --ssh on a switch (bfshell_run.py).
 
-All 14 registers of ingress.p4 are read. Values that the data plane does not
-keep are derived: pkts_ba = pkts - pkts_ab, bytes_ba = bytes - bytes_ab,
+The 14 flow registers of ingress.p4 are read at these indexes. --dst-indexes
+also reads reg_newconn_dst (new connections per destination), which has its own
+index: flow_index.compute_newconn_dst_index() of a report's src, dst, dport and
+protocol. Values that the data plane does not keep are derived:
+pkts_ba = pkts - pkts_ab, bytes_ba = bytes - bytes_ab,
 duration_ns = last_ts - first_ts (mod 2^32; the timestamps are the low 32 bits
 of a nanosecond clock and wrap every 4.295 s).
 
@@ -16,7 +19,7 @@ largest; "pipes" lists the pipes that hold data. A flow seen in more than one
 pipe (its directions enter on ports of different pipes) has its direction
 split per pipe, so pkts_ab is not meaningful for it; "multi_pipe" flags that.
 
---snapshot sync (default) first copies all 14 registers from the hardware
+--snapshot sync (default) first copies all registers read from the hardware
 (operation_register_sync, a few ms each) and then reads that copy, so the
 values of one flow are taken at the same moment. --snapshot hw reads every
 cell from the hardware directly.
@@ -25,7 +28,8 @@ cell from the hardware directly.
 session, the 14 registers of every listed bucket whose pkts still equals PKTS
 (no traffic since the caller's previous read). A cleared bucket is empty
 again, so the next packet that lands in it sends a new first-seen CPU report.
-The payload lists the cleared buckets under "cleared".
+The payload lists the cleared buckets under "cleared". reg_newconn_dst is never
+cleared; its rows ("dst_rows") are cumulative counts.
 """
 import argparse
 import json
@@ -38,6 +42,7 @@ from bfshell_run import DEFAULT_REMOTE_SDE_INSTALL, default_bfshell, run_bfshell
 BF_PORT = 9999
 INDEX_FILE = "/home/ubuntu/Desktop/p4_ebpf/thesis-hybrid-ebpf-p4/python/indexes_unique.txt"
 FLOW_BUCKETS = 65536
+DST_BUCKETS = 65536
 
 
 def port_open(host: str, port: int, timeout=1.0) -> bool:
@@ -76,6 +81,7 @@ def _read_registers_main():
                  "reg_syn", "reg_ack", "reg_rst"]
     REQUIRED = ["reg_pkts", "reg_bytes", "reg_pkts_ab", "reg_bytes_ab"]
     SUMMED = ["reg_pkts", "reg_bytes", "reg_pkts_ab", "reg_bytes_ab", "reg_syn", "reg_ack", "reg_rst"]
+    DST_REG_NAME = "reg_newconn_dst"
 
     ing = bfrt.basic.pipe.Ingress
     regs = {}
@@ -85,6 +91,15 @@ def _read_registers_main():
         except AttributeError:
             if PARAMS["strict"] and name in REQUIRED:
                 raise RuntimeError("Required register is missing from pipeline: " + name)
+    dst_reg = None
+    if PARAMS["dst_indexes"]:
+        try:
+            dst_reg = getattr(ing, DST_REG_NAME)
+        except AttributeError:
+            pass
+    sync_regs = dict(regs)
+    if dst_reg is not None:
+        sync_regs[DST_REG_NAME] = dst_reg
 
     def as_list(r):
         if r is None:
@@ -107,7 +122,7 @@ def _read_registers_main():
         return f1_values(ents[0])
 
     def sync_all(timeout_s):
-        for name, reg in regs.items():
+        for name, reg in sync_regs.items():
             done = []
             def cb(dev_id, pipe_id, direction, parser_id, done=done):
                 done.append(1)
@@ -196,6 +211,19 @@ def _read_registers_main():
             "multi_pipe": len(pipes) > 1,
         })
 
+    dst_rows = []
+    for idx in PARAMS["dst_indexes"]:
+        if dst_reg is None:
+            errors.append("Register is missing from pipeline: " + DST_REG_NAME)
+            break
+        try:
+            per_pipe = read_cell(dst_reg, idx, from_hw)
+        except Exception as error:
+            errors.append("%s[%d]: %s" % (DST_REG_NAME, idx, error))
+            continue
+        dst_rows.append({"idx": idx, "new_conn": sum(per_pipe),
+                         "pipes": [p for p in range(len(per_pipe)) if per_pipe[p]]})
+
     read_s = round(time.time() - t_start, 4)
 
     # Clear idle buckets so that the next flow landing in them reports again.
@@ -227,6 +255,7 @@ def _read_registers_main():
         ("clear_s", round(time.time() - t_start - read_s, 4)),
         ("t_switch", t_start),
         ("errors", errors),
+        ("dst_rows", dst_rows),
         ("cleared", cleared),
         ("rows", rows),
     ])
@@ -252,6 +281,12 @@ def _read_registers_main():
     print("SYN: %d" % sum(r["syn"] for r in rows))
     print("ACK: %d" % sum(r["ack"] for r in rows))
     print("RST: %d" % sum(r["rst"] for r in rows))
+    if PARAMS["dst_indexes"]:
+        print("")
+        print("=== New connections (SYN without ACK) per destination bucket ===")
+        print("Buckets: %d" % len(dst_rows))
+        print("Total: %d" % sum(r["new_conn"] for r in dst_rows))
+        print("Max: %d" % max([r["new_conn"] for r in dst_rows] or [0]))
     if errors:
         print("")
         print("=== Read errors (%d) ===" % len(errors))
@@ -263,9 +298,10 @@ _read_registers_main()
 
 
 def build_inner_script(indexes, source: str, out_format: str, strict: bool, snapshot: str,
-                       clear_if_unchanged=None) -> str:
+                       clear_if_unchanged=None, dst_indexes=None) -> str:
     params = {"indexes": [int(i) for i in indexes], "source": source, "format": out_format,
               "strict": bool(strict), "snapshot": snapshot,
+              "dst_indexes": [int(i) for i in (dst_indexes or [])],
               "clear_if_unchanged": {str(int(k)): int(v) for k, v in (clear_if_unchanged or {}).items()}}
     return INNER_TEMPLATE.replace("__PARAMS__", repr(json.dumps(params)))
 
@@ -286,6 +322,8 @@ def main():
     ap.add_argument("--index-file", default=INDEX_FILE)
     ap.add_argument("--index-mode", choices=["cli", "file"], default="cli")
     ap.add_argument("--flow-buckets", type=int, default=FLOW_BUCKETS)
+    ap.add_argument("--dst-indexes", default="",
+                    help="comma-separated reg_newconn_dst indexes (flow_index.compute_newconn_dst_index)")
     ap.add_argument("--format", choices=["summary", "json"], default="summary")
     ap.add_argument("--bfshell", default=default_bfshell(),
                     help="local bfshell (default: $SDE_INSTALL/bin/bfshell)")
@@ -327,13 +365,21 @@ def main():
         if i not in idxs:
             idxs.append(i)
 
+    dst_idxs = []
+    for i in (int(x) for x in args.dst_indexes.split(",") if x.strip()):
+        if not 0 <= i < DST_BUCKETS:
+            print(f"[ERROR] destination index {i} outside [0, {DST_BUCKETS})", file=sys.stderr)
+            sys.exit(1)
+        if i not in dst_idxs:
+            dst_idxs.append(i)
+
     clear = parse_clear_arg(args.clear_if_unchanged)
     unread = sorted(set(clear) - set(idxs))
     if unread:
         print(f"[ERROR] --clear-if-unchanged lists buckets that are not read: {unread}", file=sys.stderr)
         sys.exit(1)
     script = build_inner_script(idxs, source, args.format, args.strict_core_registers, args.snapshot,
-                                clear_if_unchanged=clear)
+                                clear_if_unchanged=clear, dst_indexes=dst_idxs)
     out = run_bfshell_script(script, bfshell=args.bfshell, port=args.bf_port, ssh_host=args.ssh,
                              remote_sde_install=args.remote_sde_install, timeout=args.timeout)
     if args.format != "json":

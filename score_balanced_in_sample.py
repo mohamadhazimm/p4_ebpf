@@ -127,7 +127,7 @@ def main() -> int:
             "host_features": len(selected_host_indices),
             "hybrid_features": len(network_features) + len(selected_host_indices),
             "host_selector": (
-                "top 29 families by mean mutual information across five summaries, "
+                f"top {len(P4_FEATURES)} families by mean mutual information across five summaries, "
                 "computed using the full labeled dataset"
             ),
         },

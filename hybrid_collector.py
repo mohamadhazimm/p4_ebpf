@@ -19,6 +19,7 @@ from typing import Dict, List, Optional, Any
 sys.path.insert(0, str(Path(__file__).resolve().parent / "thesis-hybrid-ebpf-p4" / "python"))
 sys.path.append("/home/ubuntu/Desktop/p4_ebpf/thesis-hybrid-ebpf-p4/python")
 from listen_cpu_reports import ReportCollector
+from flow_index import compute_newconn_dst_index
 
 
 # ============================================================
@@ -100,6 +101,7 @@ HOST_ZERO = {
 # Based on your P4 ingress registers:
 # pkts, bytes, pkts_ab, bytes_ab, min_len, max_len,
 # first_ts, last_ts, syn, ack, rst
+# and, per destination bucket, newconn_dst
 # ============================================================
 
 NET_ZERO = {
@@ -143,6 +145,7 @@ NET_ZERO = {
     "net_syn_delta": 0,
     "net_ack_delta": 0,
     "net_rst_delta": 0,
+    "net_new_conn_dst_max": 0,
 
     # Flow direction activity
     "net_flows_with_ab": 0,
@@ -379,9 +382,10 @@ def run_p4_reader_json(
     switch_ssh: Optional[str] = None,
     snapshot: str = "sync",
     clear_if_unchanged: Optional[Dict[int, int]] = None,
+    dst_indexes: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
-    if not indexes:
-        return {"source": "empty", "flow_count": 0, "cleared": [], "rows": []}
+    if not indexes and not dst_indexes:
+        return {"source": "empty", "flow_count": 0, "dst_rows": [], "cleared": [], "rows": []}
 
     index_arg = ",".join(str(x) for x in indexes)
 
@@ -397,6 +401,8 @@ def run_p4_reader_json(
         cmd += ["--ssh", switch_ssh]
     if clear_if_unchanged:
         cmd += ["--clear-if-unchanged", ",".join(f"{i}:{p}" for i, p in sorted(clear_if_unchanged.items()))]
+    if dst_indexes:
+        cmd += ["--dst-indexes", ",".join(str(x) for x in dst_indexes)]
 
     result = subprocess.run(
         cmd,
@@ -471,11 +477,17 @@ def collect_windows_live(
     that many consecutive reads is cleared right after the read (only if it is
     still unchanged then). It is empty again, so the next flow that lands in it
     sends a new report instead of being merged silently into the old counters.
+
+    Each TCP report also names the reg_newconn_dst bucket of its (src, dst,
+    dport) key. Those buckets stay active the same way, while their count
+    changes; they are never cleared.
     """
     windows: List[Dict[str, object]] = []
     active_idx_last_seen: Dict[int, int] = {}
     last_pkts: Dict[int, int] = {}
     idle_reads: Dict[int, int] = {}
+    active_dst_last_seen: Dict[int, int] = {}
+    last_new_conn: Dict[int, int] = {}
 
     w = 0
     proc_done = False
@@ -497,6 +509,8 @@ def collect_windows_live(
 
         reports = collector.take(win_start_abs, win_end_abs)
         idxs = sorted({safe_int(r["idx"]) for r in reports})
+        dst_idxs = sorted({compute_newconn_dst_index(r["src_ip"], r["dst_ip"], safe_int(r["dport"]), 6)
+                           for r in reports if safe_int(r["proto"]) == 6})
         mismatches = sum(1 for r in reports if r["idx_source"] == "report" and r["idx"] != r["idx_computed"])
         if mismatches:
             print(f"[WARN] window {w}: {mismatches} report(s) carry an index that flow_index.py "
@@ -510,6 +524,14 @@ def collect_windows_live(
         )
         active_idx_last_seen = {idx: active_idx_last_seen[idx] for idx in active_idxs}
 
+        for idx in dst_idxs:
+            active_dst_last_seen[idx] = w
+        active_dst_idxs = sorted(
+            idx for idx, last_seen in active_dst_last_seen.items()
+            if (w - last_seen) <= active_ttl_windows
+        )
+        active_dst_last_seen = {idx: active_dst_last_seen[idx] for idx in active_dst_idxs}
+
         # Buckets that would complete clear_idle_windows idle reads with this read.
         clear_candidates = {}
         if clear_idle_windows > 0:
@@ -520,7 +542,7 @@ def collect_windows_live(
 
         read_start = time.time()
         payload = run_p4_reader_json(reader_path, active_idxs, switch_ssh=switch_ssh, snapshot=snapshot,
-                                     clear_if_unchanged=clear_candidates)
+                                     clear_if_unchanged=clear_candidates, dst_indexes=active_dst_idxs)
         read_end = time.time()
 
         for row in payload.get("rows", []):
@@ -532,6 +554,13 @@ def collect_windows_live(
             else:
                 idle_reads[idx] = idle_reads.get(idx, 0) + 1
             last_pkts[idx] = pkts
+
+        for row in payload.get("dst_rows", []):
+            idx = safe_int(row.get("idx"))
+            new_conn = safe_int(row.get("new_conn"))
+            if last_new_conn.get(idx) != new_conn:
+                active_dst_last_seen[idx] = w
+            last_new_conn[idx] = new_conn
 
         cleared = sorted(safe_int(x) for x in payload.get("cleared", []))
         for idx in cleared:
@@ -549,6 +578,9 @@ def collect_windows_live(
             "report_count": len(reports),
             "index_mismatches": mismatches,
             "rows": payload.get("rows", []),
+            "dst_indexes": dst_idxs,
+            "active_dst_indexes": active_dst_idxs,
+            "dst_rows": payload.get("dst_rows", []),
             "cleared_indexes": cleared,
             "p4_snapshot": payload.get("snapshot"),
             "p4_read_start_sec": round(read_start - global_t0, 3),
@@ -578,23 +610,33 @@ def build_net_summaries(
 ) -> List[Dict[str, object]]:
     """Window features from the register snapshots taken at each window end
     (collect_windows_live): deltas against the previous snapshot of the same
-    bucket index."""
+    bucket index. net_new_conn_dst_max is the largest increase of one
+    reg_newconn_dst bucket since its previous read."""
 
     out: List[Dict[str, object]] = []
 
     prev_by_idx: Dict[int, Dict[str, Any]] = {}
+    prev_new_conn: Dict[int, int] = {}
 
     for win in net_windows:
         rows = win.get("rows", [])
 
+        new_conn_max = 0
+        for row in win.get("dst_rows", []):
+            idx = get_row_int(row, "idx", 0)
+            new_conn = get_row_int(row, "new_conn", 0)
+            new_conn_max = max(new_conn_max, new_conn - prev_new_conn.get(idx, 0))
+            prev_new_conn[idx] = new_conn
+
         if not rows:
-            out.append(dict(NET_ZERO))
+            out.append(dict(NET_ZERO, net_new_conn_dst_max=new_conn_max))
             continue
 
         cleared_after_read = [safe_int(x) for x in win.get("cleared_indexes", [])]
 
         summary = dict(NET_ZERO)
         summary["net_flow_count_seen"] = len(rows)
+        summary["net_new_conn_dst_max"] = new_conn_max
 
         min_lens: List[int] = []
         max_lens: List[int] = []

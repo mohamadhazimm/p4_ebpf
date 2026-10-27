@@ -15,6 +15,17 @@ bucket.
 Since the data plane also puts the index into every CPU report
 (cpu_report_t.flow_index), this is only needed where no report is available,
 e.g. to predict buckets offline.
+
+reg_newconn_dst (new connections per destination) has its own index:
+crc16_dsthash over {srcAddr, dstAddr, l4_dport, protocol}, without @symmetric
+and without the source port, i.e. CRC-16/ARC over the 11 bytes
+
+    sip | dip | dport | proto     (network order)
+
+compute_newconn_dst_index() computes it (checked against the compiled hash
+matrix, perf/tools/hash_block_identify.py, and on the switch). It is
+directional and is not in the CPU report; the collector derives it from the
+report's 5-tuple.
 """
 import socket
 import struct
@@ -42,6 +53,12 @@ def compute_flow_index(src_ip: Union[str, int], dst_ip: Union[str, int],
                        sport: int, dport: int, proto: int) -> int:
     ip_x = ip_to_u32(src_ip) ^ ip_to_u32(dst_ip)
     blob = struct.pack("!IIHHB", 0, ip_x, 0, (sport ^ dport) & 0xFFFF, proto & 0xFF)
+    return crc16_arc(blob)
+
+
+def compute_newconn_dst_index(src_ip: Union[str, int], dst_ip: Union[str, int],
+                              dport: int, proto: int) -> int:
+    blob = struct.pack("!IIHB", ip_to_u32(src_ip), ip_to_u32(dst_ip), dport & 0xFFFF, proto & 0xFF)
     return crc16_arc(blob)
 
 

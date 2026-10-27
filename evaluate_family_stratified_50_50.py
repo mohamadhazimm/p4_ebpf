@@ -147,7 +147,7 @@ def main() -> int:
     network_matrix = numeric_matrix(rows, network_features)
     host_matrix = numeric_matrix(rows, host_features)
     if len(feature_family_indices(network_features)) != len(P4_FEATURES):
-        parser.error("P4 network pool must contain all 29 signal families")
+        parser.error(f"P4 network pool must contain all {len(P4_FEATURES)} signal families")
     host_family_indices = feature_family_indices(host_features)
     expected_summaries = len(P4_WINDOW_STATS)
     if any(len(indices) != expected_summaries for indices in host_family_indices.values()):

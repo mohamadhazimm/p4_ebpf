@@ -31,6 +31,12 @@ stays in `perf/results/` on PC1 and is not tracked by git (Section 11).
   shared bucket, including crafted ones. It costs 14 RAMs (+1.5%), 2 stateful ALUs and
   one more stage, with no measurable latency. It was tested on the switch but is not
   deployed (Section 5.3).
+- **New-connection counter (working tree, not deployed).** `reg_newconn_dst` counts TCP
+  SYNs without ACK per client, server and server port, against connection floods. With
+  65,536 buckets, as specified, the compiler spreads the program over 7 ingress stages
+  (+27 cycles estimated); with 16,384 buckets it fits the existing 5 stages at an
+  unchanged estimate. Both passed 12 of 12 checks on the switch, and the offline
+  reconstruction gives the same counts (Section 5.4).
 - **Compared with 20 systems published with Tofino results** (Section 7):
   - the latency overhead is in the range of the only two systems that report one;
   - the stage count is the lowest of the systems that keep per-flow state;
@@ -81,6 +87,9 @@ Builds:
 - **baseline**: forwarding only, with the same `forwarding` table and actions
   (`perf/variants/baseline.p4`).
 - **fingerprint**: the fixed build plus collision detection (Section 5.3).
+- **new-conn**: the fixed build plus the per-destination new-connection counter, as in
+  the working tree since 27 October; **new-conn 16k** with 16,384 instead of 65,536
+  destination buckets (Section 5.4).
 - **\*_lat**: the same programs wrapped for latency measurement (`perf/variants/lat/`).
 
 ### 1.3 Method and tools
@@ -327,6 +336,80 @@ and reports the sharing.
 - **Before use:** the readers of the CPU reports must handle `reason` 2, and `reg_fp`
   and `reg_shared` must be cleared together with the 14 counters.
 
+### 5.4 New connections per destination (working tree, tested on the switch, not deployed)
+
+Specified in `thesis-hybrid-ebpf-p4/P4_new_conn_rate_feature.md` (27 October). `reg_syn`
+counts per flow bucket, so a connection flood (thousands of 5-tuples from one client to
+one service, e.g. GoldenEye) leaves about one SYN in each bucket. The new register counts
+per destination instead:
+- **`reg_newconn_dst` (32 bits).** Every TCP segment with SYN set and ACK clear adds 1.
+  SYN+ACK, which `reg_syn` also counts, does not.
+- **Its own index, `crc16_dsthash`:** CRC16 over `{srcAddr, dstAddr, l4_dport, protocol}`,
+  without the source port and without `@symmetric`. All connections of one client to one
+  service port share a bucket; the index is directional.
+- **Control plane.** The index is not in the CPU report. The collector derives it from
+  each TCP report's 5-tuple (`flow_index.compute_newconn_dst_index()`) and reads those
+  buckets in the same session as the flow buckets (`read_registers_with_index.py
+  --dst-indexes`). The register is never cleared. The window feature
+  `net_new_conn_dst_max` is the largest increase of one bucket since its previous read;
+  `analyze_p4_pcap_ablation.py` computes it offline (Appendix A.4).
+
+| | Fixed build | 65,536 buckets (as specified) | 16,384 buckets |
+|---|---|---|---|
+| Ingress stages | 5 | 7 | 5 |
+| SRAM / map RAM | 197 / 196 | 214 / 213 (map RAM 37.0%) | 202 / 201 (34.9%) |
+| Stateful ALUs | 14 | 15 | 15 |
+| Hash bits | 172 | 252 | 186 |
+| Latency estimate ig/eg (cycles) | 131 / 170 | 158 / 170 | 131 / 170 |
+| Power estimate, ingress (W) | 7.49 | 8.12 | 7.88 |
+
+- **Compile:** bf-p4c 9.6.0, no warnings.
+- **Placement as specified.** At 32 bits, 65,536 entries need 17 map RAMs, and none of
+  stages 0–4 has that many free (Section 2). The compiler put the register into stage 1,
+  next to its hash, and moved 8 flow registers one or two stages later. They now span
+  stages 0–6 with stage 3 almost empty, although the dependency chain is still 4 stages.
+  Pinning the update to stage 5 (`@stage(5)` on a table) gave 8 ingress stages.
+- **16,384 buckets** (14-bit index: the low 14 bits of the same CRC) need 5 map RAMs. The
+  register goes into stage 0 (46 of 48 map RAMs), and no other register moves.
+- **Decision (27 October): 65,536 for now.** 16,384 stays the option if the two extra stages
+  matter; the spec (`P4_new_conn_rate_feature.md`, Section 5) carries the same note.
+- **Hashes:** in the 65,536 build, `hash_block_identify.py` matched the new stage-1 slice
+  to `compute_newconn_dst_index()` on 5,000 of 5,000 random tuples (inputs: exactly the
+  four fields), and the 20 index slices to `flow_index.py`. In the 16,384 build, stage 0
+  `result[32..45]` equals the low 14 bits on 3,000 of 3,000.
+- **On the switch** (`perf/tools/newconn_test.py`; 154 packets at 100 pkt/s, all
+  forwarded; read with the collector's `read_registers_with_index.py --ssh …
+  --dst-indexes`): 12 of 12 checks passed on both builds.
+
+  | Traffic | Expected `reg_newconn_dst` | Hardware |
+  |---|---|---|
+  | 40 handshakes 10.99.6.1 → 10.99.6.2:80, a new source port each | 40 | 40 |
+  | One SYN sent 3 times | 3 | 3 |
+  | 2 SYNs with ECE and CWR (ECN setup) | 2 | 2 |
+  | 5 SYNs of the same client to port 8080 | 5 | 5 |
+  | One SYN+FIN | 1 | 1 |
+  | The flood's SYN+ACKs, keyed server → client | 0 | 0 |
+  | ACK, FIN+ACK and RST only | 0 | 0 |
+  | UDP (key with protocol 17) | 0 | 0 |
+
+  All counts were in pipe 1 only. The 51 CPU reports were the expected ones, and the
+  destination buckets derived from them include every counted key. In the first flood
+  connection's flow bucket, `reg_pkts` was 3 and `reg_syn` 2: `reg_syn` still counts the
+  SYN+ACK.
+- **Offline parity.** `derive_p4_features` on the same 154 packets, re-timed into two
+  windows (the flood, then the rest), gives `net_new_conn_dst_max` = 40 and 5, the largest
+  hardware bucket of each part. Its `net_syn_delta` for the flood window is 80.
+- **Not measured yet:** latency, packet rate and line rate of these builds. The switch
+  runs the fixed build again.
+- **Limits.** The key includes the client address, so a SYN flood from random spoofed
+  sources spreads over many buckets with about one SYN each; its volume still shows in
+  `net_syn_delta`. Aliasing only adds counts. Of K active keys, a key shares its bucket
+  with probability about K/16,384 or K/65,536.
+- **Before use:** clear `reg_newconn_dst` with the 14 counters (`bfrt_gen.py clear-regs
+  --extra-registers reg_newconn_dst`). The collector's CSV and the offline datasets gain
+  the column `net_new_conn_dst_max`, so the P4 signal families go from 29 to 30: the
+  datasets that the `evaluate_*` scripts read must be regenerated.
+
 ## 6. Switch CPU side
 
 These two measurements cover the switch CPU and its driver, not the P4 program. The P4
@@ -569,6 +652,9 @@ Run these from the repository root on PC1.
 | 5.3 (fingerprint build) | `perf/variants/fingerprint/make_fp_sources.sh thesis-hybrid-ebpf-p4 OUT_DIR`, compile as above, `hash_block_identify.py BUILD_DIR` |
 | 5.3 (on the switch) | `fp_test.py make OUT_DIR SANITY_PCAP`; clear with `clear-regs --extra-registers reg_fp,reg_shared`; replay at 100 pkt/s while capturing `enp5s0`; `read-regs … --extra-registers reg_fp,reg_shared`; `fp_test.py check` |
 | 5.3 (latency) | `make_lat_sources.sh` on both source trees (main files renamed `basic_fix_lat.p4`, `basic_fp_lat.p4`); `run_lat.py RUN_DIR --prog basic_fix_lat --sizes 64,1518`, then `--prog basic_fp_lat` |
+| 5.4 (new-conn builds) | `sw_compile.sh` on `thesis-hybrid-ebpf-p4` (16,384 buckets: `src/basic_newconn_16k` of the run); `parse_resources.py`; `hash_block_identify.py BUILD_DIR` (16,384: the run's `check14.py`) |
+| 5.4 (on the switch) | `newconn_test.py make OUT_DIR [--index-bits 14]`; the run's `hw_cycle.sh RUN_DIR BUILD EXPECTED_JSON 65536\|16384` (load, set up, clear, capture, replay, read, check); then restore the fixed build |
+| 5.4 (offline parity) | the run's `offline_parity.py`, with Python ≥ 3.10, scikit-learn and scapy |
 | 6.1 (CPU reports) | `ip link set enp5s0 up` on the switch; `run_report_capacity.py RUN_DIR` |
 | 6.2 (readout) | `make_fill_pcap.py RUN_DIR/pcap --flows 30000`; replay at 10,000 pkt/s; `run_bfrt.sh RUN_DIR LABEL readout --out-dir SWITCH_DIR --label rN`; `check_readout.py RUN_DIR`. gRPC: `python2.7 sw_grpc_readout.py OUT.json.gz --prog basic --from-hw 1 --bind 1` on the switch |
 
@@ -610,6 +696,7 @@ notes are in `DISCOVERY.md` and `INCIDENT_bf_switchd_exit.md`.
 | 5.1 and Appendix A.2 (validation on the switch) | `fix_hwval_20261026_190643` |
 | 5.3 (sources, builds, resources, hash check, switch test) | `fp_20261026_201808` |
 | 5.3 latency | `fp_lat_20261026_204335` |
+| 5.4 (sources, builds, resources, hash checks, switch tests, offline parity) | `newconn_20261027_090913` |
 | 6.1, and clear and re-report | `p3_3_reports_20261026_192142` |
 | 6.2 | `p3_readout_20261026_164647` |
 
@@ -632,14 +719,16 @@ The `*_smoke_*` directories hold short checks of the tools before each test.
 | The report port was never passed to `program_forwarding.py` (on hardware the mirror would point to dev_port 2); index 0 was dropped; durations were dropped when the 32-bit timestamp wrapped | `--forward-report-port`, `--mirror-sid`, `--switch-ssh`, `--p4-snapshot`, `--active-ttl-windows`; index 0 kept; duration `(last_ts − first_ts) mod 2³²` |
 | `commands.txt`: the clear list missed 9 registers and named a non-existent `reg_fin`; its hash snippets used CRC-16/MODBUS | All 14 registers; the shared index function |
 
-23 unit tests (`cd thesis-hybrid-ebpf-p4/python && python3 -m unittest discover -s tests`)
+28 unit tests (`cd thesis-hybrid-ebpf-p4/python && python3 -m unittest discover -s tests`)
 cover:
 - the CRC-16/ARC check value, symmetry, and a vector from the compiled hash;
 - both report formats and the tcpdump stream parser;
 - the reader's embedded script, run with SDE 9.6 semantics (no f-strings, separate
   globals/locals);
 - pipe combining, the sync fallback, clearing, and bfshell's held-open stdin;
-- live window deltas, active-index refresh, idle clearing and the timestamp wrap.
+- live window deltas, active-index refresh, idle clearing and the timestamp wrap;
+- the new-connection index (vectors from the compiled hash), the reader's destination
+  buckets and the collector's `net_new_conn_dst_max` (Appendix A.4).
 
 ### A.2 Validation on the switch (fixed build, fixed scripts over SSH)
 
@@ -661,6 +750,22 @@ sudo python3 hybrid_collector.py --mode pcap ... \
 	--forward-int-port 132 --forward-ext-port 140 \
 	--forward-report-port 192 --cpu-iface enp5s0
 ```
+
+### A.4 New-connection counter (Section 5.4)
+
+| File | Change |
+|---|---|
+| `python/flow_index.py` | `compute_newconn_dst_index()`: CRC-16/ARC over sip, dip, dport and protocol |
+| `python/read_registers_with_index.py` | `--dst-indexes`: reads `reg_newconn_dst` in the same session and sync as the flow registers and returns `dst_rows`. It is never cleared. A build without the register gives an error entry, not a failure |
+| `hybrid_collector.py` | One destination bucket per TCP report, kept active like a flow bucket (TTL, or while its count changes); writes `net_new_conn_dst_max` |
+| `analyze_p4_pcap_ablation.py` | The same feature offline: per window, SYN-without-ACK segments per (src, dst, dport, protocol), maximum over the keys; added to `P4_FEATURES` |
+| `evaluate_*.py`, `score_balanced_in_sample.py` | Messages and descriptions use `len(P4_FEATURES)` instead of a fixed 29 |
+| `../p4_ebpf-dataset-construction/src/analyze_p4_emulated_scenarios.py` | Contract entry for the new column (it requires its contract, `NET_ZERO` and `P4_FEATURES` to match) |
+| `commands.txt` | The clear list includes `reg_newconn_dst` |
+| `perf/tools/hash_block_identify.py`, `perf/tools/newconn_test.py` | Candidate for the new index; the hardware test |
+
+`analyze_p4_pcap_ablation.py` here is older than the version `tests/test_pcap_window_alignment.py`
+expects (`byte_layer`, `rate_window`); the change is four small hunks to carry over.
 
 ## Appendix B. Errata
 

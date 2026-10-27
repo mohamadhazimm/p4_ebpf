@@ -3,7 +3,7 @@ from __future__ import annotations
 import random
 import unittest
 
-from flow_index import compute_flow_index, compute_flow_index_symmetric, crc16_arc
+from flow_index import compute_flow_index, compute_flow_index_symmetric, compute_newconn_dst_index, crc16_arc
 
 
 class FlowIndexTests(unittest.TestCase):
@@ -32,6 +32,13 @@ class FlowIndexTests(unittest.TestCase):
 
     def test_legacy_name_is_the_same_function(self):
         self.assertIs(compute_flow_index_symmetric, compute_flow_index)
+
+    def test_newconn_dst_index_known_vectors_from_the_compiled_hash(self):
+        # crc16_dsthash of the basic_newconn build (stage 1), evaluated from its
+        # compiled hash matrix (perf/tools/hash_block_identify.py). Directional.
+        self.assertEqual(compute_newconn_dst_index("10.99.6.1", "10.99.6.2", 80, 6), 11438)
+        self.assertEqual(compute_newconn_dst_index("10.99.6.2", "10.99.6.1", 80, 6), 32238)
+        self.assertEqual(compute_newconn_dst_index(0x0A630601, 0x0A630602, 80, 6), 11438)
 
 
 if __name__ == "__main__":

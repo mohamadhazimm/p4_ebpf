@@ -60,6 +60,7 @@ P4_FEATURES = [
     "net_syn_delta",
     "net_ack_delta",
     "net_rst_delta",
+    "net_new_conn_dst_max",
     "net_flows_with_ab",
     "net_flows_with_ba",
     "net_dir_valid_count",
@@ -203,6 +204,7 @@ def derive_p4_features(
 
     window_seconds = float(run_metadata["window_seconds"])
     window_deltas: list[dict[tuple, dict[str, int]]] = [dict() for _ in telemetry_rows]
+    window_new_conns: list[dict[tuple, int]] = [dict() for _ in telemetry_rows]
     packet_events: list[dict] = []
     frame_counts = [0] * len(telemetry_rows)
     first_source_by_flow: dict[tuple, tuple[str, int]] = {}
@@ -251,6 +253,11 @@ def derive_p4_features(
         if packet.haslayer(TCP):
             flags = int(packet[TCP].flags)
             syn, ack, rst = int(bool(flags & 0x02)), int(bool(flags & 0x10)), int(bool(flags & 0x04))
+            # reg_newconn_dst: SYN without ACK per (client, server, server port, protocol)
+            if (flags & 0x12) == 0x02:
+                new_conn_key = (ip_layer.src, ip_layer.dst, int(transport.dport), int(ip_layer.proto))
+                new_conns = window_new_conns[window_index]
+                new_conns[new_conn_key] = new_conns.get(new_conn_key, 0) + 1
         else:
             syn = ack = rst = 0
         event = {
@@ -371,6 +378,7 @@ def derive_p4_features(
                 "net_ba_ratio_pkt_delta": ba_packets / packets if packets else 0.0,
                 "net_ab_ratio_byte_delta": ab_bytes / byte_count if byte_count else 0.0,
                 "net_ba_ratio_byte_delta": ba_bytes / byte_count if byte_count else 0.0,
+                "net_new_conn_dst_max": max(window_new_conns[window_index].values(), default=0),
             }
         )
         summary["pcap_frames_in_window"] = frame_counts[window_index]

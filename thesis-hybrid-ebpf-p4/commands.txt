@@ -58,9 +58,9 @@ python3 /home/ubuntu/Desktop/p4_ebpf/thesis-hybrid-ebpf-p4/python/program_forwar
   
 
 *open bf-shell: /home/ubuntu/open-p4studio/install/bin/bfshell -p 9999
-*clear registers (all 14 in ingress.p4; there is no reg_fin) =>
+*clear registers (all 15 in ingress.p4; there is no reg_fin) =>
 ing = bfrt.basic.pipe.Ingress
-for r in ["reg_pkts", "reg_bytes", "reg_pkts_ab", "reg_bytes_ab", "reg_ref_src_port", "reg_ref_dst_port", "reg_dir_valid", "reg_min_len", "reg_max_len", "reg_first_ts", "reg_last_ts", "reg_syn", "reg_ack", "reg_rst"]: getattr(ing, r).clear()
+for r in ["reg_pkts", "reg_bytes", "reg_pkts_ab", "reg_bytes_ab", "reg_ref_src_port", "reg_ref_dst_port", "reg_dir_valid", "reg_min_len", "reg_max_len", "reg_first_ts", "reg_last_ts", "reg_syn", "reg_ack", "reg_rst", "reg_newconn_dst"]: getattr(ing, r).clear()
 
 bfrt.complete_operations()
 

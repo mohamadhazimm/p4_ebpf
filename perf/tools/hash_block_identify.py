@@ -21,7 +21,7 @@ from pathlib import Path
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(HERE)), "thesis-hybrid-ebpf-p4", "python"))
-from flow_index import compute_flow_index  # noqa: E402
+from flow_index import compute_flow_index, compute_newconn_dst_index  # noqa: E402
 from hash_matrix_check import FIELDS, eval_func  # noqa: E402
 from hash_quality import reflected_crc16  # noqa: E402
 
@@ -36,6 +36,8 @@ def raw(t, swap=False):
 
 CANDIDATES = {
     "flow index (flow_index.py)": lambda t: compute_flow_index(t["sip"], t["dip"], t["sp"], t["dp"], t["pr"]),
+    "new-conn dst index (flow_index.py): CRC-16/ARC over (sip,dip,dp,pr)":
+        lambda t: compute_newconn_dst_index(t["sip"], t["dip"], t["dp"], t["pr"]),
     "fingerprint fwd: CRC 0x8BB7 refl over (sip,dip,sp,dp,pr)": lambda t: crc_t10(raw(t)),
     "fingerprint rev: CRC 0x8BB7 refl over (dip,sip,dp,sp,pr)": lambda t: crc_t10(raw(t, swap=True)),
 }
