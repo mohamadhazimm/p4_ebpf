@@ -1,7 +1,7 @@
 # P4 data plane on the Tofino: hardware performance
 
 This document reports the hardware evaluation of the P4 half of the hybrid P4/eBPF
-malware detector (`thesis-hybrid-ebpf-p4`) on the NETLAB Tofino, 26 October 2026. It
+malware detector (`thesis-hybrid-ebpf-p4`) on the NETLAB Tofino, 26–29 October 2026. It
 covers:
 - the P4 program's resources, packet rate, latency and flow table;
 - the problems found in the program, and their fixes;
@@ -14,13 +14,18 @@ stays in `perf/results/` on PC1 and is not tracked by git (Section 11).
 
 ## Summary
 
-- **No loss, exact counting.** About 238 million frames per program went through at up
-  to 0.37 Mpps with zero loss. The per-flow packet and byte counters equal the port
-  counters. That rate is the traffic generator's limit (≤ 4% of line rate), not the
-  switch's (Section 3).
+- **Line rate, no loss, exact counting.** With the switch's own packet generator, the
+  detector forwarded 99.9% of 100G line rate at 128–1518 B in every run, with no loss,
+  and its per-flow counters matched every packet: 13.1 billion packets in 27 runs. Fed
+  up to 150% of a port's line rate, it still counted every packet; only the 100G output
+  port dropped the excess. At 64 B the generator tops out at 91% of line rate. The
+  forwarding-only baseline behaves identically (Section 3.2). PC1 alone reaches only
+  0.37 Mpps (Section 3).
 - **Latency.** The detector adds a constant 69–70 ns over a forwarding-only program at
   every frame size (ingress parser to egress parser, ASIC clock). p99 stays within 8 ns
-  of the median (Section 4).
+  of the median (Section 4). With the per-packet report method of the DNS water-torture
+  detector (`reference_evaluation/P4_Code`), the current build adds 91 ns (337 vs
+  246 ns), against that detector's 181 ns (Section 4.1).
 - **Resources.** The detector uses 5 of 12 ingress stages, 20.5% of SRAM, 34% of map RAM,
   1% of TCAM and 14 of 48 stateful ALUs. 2¹⁶ buckets is the largest flow table that
   compiles (Section 2).
@@ -39,12 +44,14 @@ stays in `perf/results/` on PC1 and is not tracked by git (Section 11).
   reconstruction gives the same counts (Section 5.4).
 - **Compared with 20 systems published with Tofino results** (Section 7):
   - the latency overhead is in the range of the only two systems that report one;
-  - the stage count is the lowest of the systems that keep per-flow state;
+  - the stage count is the lowest of the systems that keep per-flow state (5, or 7
+    with Section 5.4's counter, against 9–12);
   - SRAM use is mid-range.
 
-  Throughput is the gap: they measured up to 100 Gbps per port, this evaluation only
-  0.37 Mpps.
-- **Still open:** a line-rate test with the switch's own packet generator (Section 8).
+  Throughput is on par: 99.9% of line rate on a 100G port, measured like NetWarden and
+  P4Control with the switch's own packet generator.
+- **Still open:** the Section 4.1 runs on the reference's own path (collector on PC2),
+  and 64-B line rate, which needs an external generator (Section 8).
 
 ## 1. Setup
 
@@ -155,7 +162,8 @@ speed for 20 s, 5 repetitions. Offered load is PC1's PHY counter.
 - **Exact counting under load.** In all 35 detector runs, the flow's `reg_pkts` delta
   equals the switch's received-frame count, and `reg_bytes` matches (mod 2³²).
 - **No line-rate claim follows from this test.** Detector and baseline differ by −3.9%
-  to +2.5%, with overlapping ranges (sender noise).
+  to +2.5%, with overlapping ranges (sender noise). Section 3.2 measures line rate with
+  the switch's own packet generator.
 
 ### 3.1 Why the measured rate is low
 
@@ -177,6 +185,51 @@ The systems in Section 7 that report about 100 Gbps used one of:
 - hardware generators (HorusEye: Spirent N11U; Mousika: Keysight XGS12-SDL);
 - the switch's own packet generator (NetWarden, P4Control);
 - traffic looped through all switch ports (Planter, IIsy).
+
+### 3.2 Line rate with the switch's packet generator (29 October)
+
+The generator of pipe 1 sends one UDP flow back to back, inside the switch. Its 6-byte
+header takes the place of the destination MAC, which the detector never reads, so the
+programs run unchanged: the working-tree detector (with Section 5.4's counter, 7 ingress
+stages) and the forwarding-only baseline. The only addition is a forwarding entry from
+the generator's port to 16/0. That port (pipe 0, no cable) runs at 100G in MAC near-end
+loopback, so nothing leaves the switch: its TX counter gives the rate, and the
+looped-back copies are counted again in pipe 0 and dropped there.
+- **Paced:** each timer tick (about 4 µs) sends a burst, 99.9% of line rate on average;
+  3 runs per size, 10 s measured each.
+- **Saturating:** the generator at its maximum, 1 run per size.
+- **Checked in every run:** the generator's packet count, the sink's TX and RX counters,
+  the TM's drops at the sink, and the flow's `reg_pkts` and `reg_bytes` in both pipes.
+
+| Frame (B) | 100G line rate (Mpps) | Paced, detector | Paced, baseline | Saturating: offered / sent |
+|---|---|---|---|---|
+| 64 | 148.81 | 91.09% (generator maximum) | 91.09% | – |
+| 128 | 84.46 | 99.88% | 99.88% | 111% / 100.00% |
+| 256 | 45.29 | 99.89% | 99.89% | 128% / 100.00% |
+| 512 | 23.50 | 99.87% | 99.87% | 140% / 100.00% |
+| 1024 | 11.97 | 99.89% | 99.89% | 148% / 100.00% |
+| 1280 | 9.62 | 99.88% | 99.88% | 149% / 100.00% |
+| 1518 | 8.13 | 99.88% | 99.88% | 150% / 100.00% |
+
+Percentages are of the 100G line rate (L1: 20 B of preamble and gap per frame), so 99.88%
+at 1518 B is 99.88 Gbps. The 3 paced runs of each size agree within 0.01 points, and the
+saturating runs are the same for both programs.
+- **Line rate with no loss.** In every paced run and at 64 B, generated = transmitted =
+  received, and the TM dropped nothing.
+- **Exact counting at line rate.** In all 27 detector runs, the flow's `reg_pkts` in
+  pipe 1 grew by exactly the generated count and `reg_bytes` by the generated bytes
+  (mod 2³²); pipe 0 counted exactly the looped-back copies. That is 13.1 billion packets.
+- **Beyond line rate.** At its maximum, the generator offers 111–150% of one port's line
+  rate. The sink then sends 100.00%, the TM drops exactly the rest, and the detector's
+  pipe-1 counters still equal the generated count: up to 93.8 Mpps (128 B) and 150 Gbps
+  (1518 B) went through its pipeline.
+- **No cost over forwarding:** the baseline's rates are the same within 0.01 points.
+- **64 B:** one pipe's generator tops out at 135.5 Mpps, 91% of line rate; two generator
+  apps give the same total. Both programs were lossless and exact at that rate. 100% at
+  64 B needs an external generator.
+- **Limits:** one flow, since the generator cannot vary header fields; one CPU report per
+  run. bfrt_python cannot reach the generator in SDE 9.6, so `perf/tools/sw_pktgen_run.py`
+  uses BF Runtime gRPC, as the SDE's `tna_pktgen` test does.
 
 ## 4. ASIC latency
 
@@ -210,6 +263,43 @@ repetitions each.
   - In the detector copy, one table sits one stage later, with an unchanged latency
     estimate.
   - The egress MAU (padded, the same in all builds) and transmission are not covered.
+
+### 4.1 With the method of the DNS water-torture detector (29 October)
+
+The DNS water-torture detector of `reference_evaluation/P4_Code` was measured with
+per-packet reports. That method is applied here unchanged:
+- **In the program** (`perf/variants/hwl/`, generated from the unmodified sources):
+  ingress writes `ig_prsr_md.global_tstamp` into an 8-byte bridge header; egress inserts
+  the package's 20-byte `HWL1` report (ingress and egress-parser timestamps) after the
+  Ethernet header of IPv4/UDP packets and sets EtherType 0x88BC. CPU reports skip the
+  bridge parse.
+- **PC side**, the package's scripts unchanged: `send_probes.py` (82-byte DNS queries,
+  1010 per run, 100 pkt/s) and `collect_reports.py` (checks that every probe arrived
+  unchanged; 10 warm-up probes excluded). 3 runs per program.
+- **Builds:** the working tree (with Section 5.4's counter) and the forwarding-only
+  baseline, both with the instrumentation. It leaves the detector's ingress unchanged
+  (7 stages, 158-cycle estimate) and adds one egress stage.
+
+| Program | min | median | mean | p99 | max (ns) |
+|---|---|---|---|---|---|
+| Baseline | 244 | 246 | 245.6 | 247 | 247–248 |
+| Detector | 336 | 337 | 337.5 | 341 | 342 |
+| DNS water-torture detector: its baseline (reference) | 256 | 258 | 257.7 | 261 | 262–263 |
+| DNS water-torture detector (reference) | 437 | 439 | 438.7 | 441 | 442 |
+
+- **The detector adds 91 ns** (median 337 vs 246 ns); the DNS water-torture detector adds
+  181 ns over its own baseline. Both show the same 4–6 ns spread at 100 pkt/s.
+- **Not like for like:** the DNS detector parses query names and runs its random forest
+  in the switch; this detector extracts features and leaves the decision to the model.
+- **Against Section 4:** the build without Section 5.4's counter measured +70 ns there.
+  The counter's 2 extra ingress stages (+27 cycles estimated) likely explain most of the
+  difference; this was not measured separately.
+- **All 6 runs:** 1010 of 1010 reports, none malformed or missing. The first probe of each
+  detector run sent one correct CPU report.
+- **Path:** PC1 → 1/0 → switch → 1/0 → PC1, reports captured on PC1 and decoded with
+  `collect_reports.py --pcap`. The reference used PC1 → 1/0 → switch → 2/0 → PC2. The
+  egress port lies outside the measured interval; the runs on the reference's path,
+  with the collector on PC2, are still to be done.
 
 ## 5. Flow table
 
@@ -477,10 +567,12 @@ whole chip; ours are per pipe.
 
 **Where this work stands:**
 - **Latency.** NetWarden (+3–101 ns) and P4Control (+100–110 ns) are the only systems
-  that report an overhead over forwarding, and this work's +70 ns lies in that range.
+  that report an overhead over forwarding, and this work's +70 ns lies in that range, as
+  do the +91 ns of the build with Section 5.4's counter under the reference method
+  (Section 4.1).
   The others report absolute times of 365 ns to 2 µs, over different intervals. Here it
   is 321–404 ns from ingress parser to egress parser.
-- **Stages.** This work uses 5. Every system with per-flow state that reports its stages
+- **Stages.** This work uses 5, or 7 with Section 5.4's counter. Every system with per-flow state that reports its stages
   uses 9–12; Peregrine uses 12 in one pipe and 11 in the other. Only the stateless
   per-packet models use fewer.
 - **Memory.**
@@ -498,11 +590,13 @@ whole chip; ours are per pipe.
   - Leo, SpliDT and Pegasus size for 1M without testing that many.
 - **Throughput.** The others measured up to about 100 Gbps per port (HorusEye, NetBeacon,
   BoS, Mousika, NetWarden, P4Control), or 6.4 Tbps with traffic looped through all ports
-  (Planter, IIsy). This evaluation reached 0.37 Mpps (Section 3.1).
+  (Planter, IIsy). This work: 99.9% of line rate (99.88 Gbps) per 100G port with no loss
+  at 128–1518 B, with the switch's own generator like NetWarden and P4Control; at 64 B
+  that generator stops at 91% (Section 3.2).
 
 | System | Venue | Switch | In the switch | Flows (state per flow) | Stages | SRAM / TCAM | Stateful ALUs | Latency | Throughput |
 |---|---|---|---|---|---|---|---|---|---|
-| **This work** | – | Tofino 1, Wedge100BF-32X | per-flow features; detection off the switch | 65,536 (45 B) | 5 ingress | 20.5% / 1.0% | 14 of 48 (29.2%) | +70 ns over forwarding (ASIC timestamps); 321–404 ns parser to egress parser | no loss up to 0.37 Mpps (PC1-bound) |
+| **This work** | – | Tofino 1, Wedge100BF-32X | per-flow features; detection off the switch | 65,536 (45 B) | 5 ingress (7 with Section 5.4) | 20.5% / 1.0% | 14 of 48 (29.2%) | +70 ns over forwarding (ASIC timestamps); 321–404 ns parser to egress parser; +91 ns with Section 5.4 (reference method) | 99.9% of 100G line rate, no loss (on-switch generator, 128–1518 B; 91% at 64 B) |
 | FlowLens | NDSS 2021 | Tofino (compiled; no hardware traffic test) | packet-length and inter-arrival histograms; switch CPU classifies | n.r. (NDA); 20–302 B | n.r. | 38.54% / 0.00% (stage average) | n.r. | n.r. | n.r. (line speed claimed) |
 | Peregrine | arXiv 2024 | Tofino 1, Wedge 100BF-32X | ~100 features, records to a server | n.r. | 100% / 91.7% of pipes 0 / 1 | 37.2% + 6.4% / 6.9% + 9.7% | meter ALU 72.9% / 6.9% | n.r. | end to end at 100G (DPDK pktgen); 6.4 Tbps from compile |
 | HorusEye | USENIX Sec 2023 | Tofino, H3C S9830-32H-H | burst features + iForest whitelist; autoencoder on a GPU decides | 32,000–64,000 (design analysis) | 9 (derived) | 9.90% / 2.78% | n.r. | 1027–1142 ns per packet (Spirent) | 100G on one port, zero loss (Spirent N11U) |
@@ -565,24 +659,25 @@ Sources:
   and neither describes its method.
 - The stage count is the lowest of the systems in Section 7 that keep per-flow state and
   report their stages.
-- Counting is exact under load (Section 3). The compiled hash matches software bit for
-  bit, so the offline collision numbers of Section 5.2 hold for the switch.
+- Line rate with no loss, measured as NetWarden and P4Control did (Section 3.2), and the
+  latency under the method of the DNS water-torture detector (Section 4.1).
+- Counting is exact at line rate (Section 3.2). The compiled hash matches software bit
+  for bit, so the offline collision numbers of Section 5.2 hold for the switch.
 
-**Open: line rate.** Section 3 reaches only 0.37 Mpps, while the systems in Section 7
-measured up to 100 Gbps per port. NetWarden and P4Control did so on the same switch model
-with the switch's own packet generator ("software packet generators cannot saturate the
-switch linespeed", NetWarden). The test, not yet done or approved:
-- **Wrapper:** like `perf/variants/lat/`, it parses the packet generator's header on its
-  internal port and then runs the unchanged detector. The SDE includes an example
-  (`p4-examples/p4_16_programs/tna_pktgen`).
-- **Traffic:** 64 B and 1518 B packets at 100G, generated inside the switch and sent
-  through the detector and out of a 100G port.
-- **Pass criterion:** generated count = the detector's register count = transmitted
-  count, with zero drops.
+**Line rate: done** (Section 3.2), with the switch's own packet generator, as NetWarden
+and P4Control did ("software packet generators cannot saturate the switch linespeed",
+NetWarden). The pass criterion, generated = the detector's register count = transmitted
+with zero drops, holds at 99.9% of line rate for 128–1518 B. No wrapper was needed: the
+generator's header replaces the destination MAC, which the detector does not read.
+
+**Open:**
+- the Section 4.1 runs on the reference's path, with the collector on PC2;
+- 64-B line rate, which needs an external generator (one pipe's generator stops at 91%).
 
 Optional:
-- the same test with every packet a new flow, so that the CPU reports overflow, to show
-  that forwarding is unaffected;
+- the line-rate test with every packet a new flow, so that the CPU reports overflow, to
+  show that forwarding is unaffected (needs distinct 5-tuples, which the generator
+  cannot make);
 - resources against flow-table size (2¹² to 2¹⁶ buckets), compile only.
 
 **Likely reviewer questions:**
@@ -600,17 +695,19 @@ Optional:
 
 **For a 6-page paper:**
 - the resource table (Section 2);
-- latency per frame size (Section 4);
-- the line-rate result;
+- latency per frame size (Sections 4 and 4.1);
+- the line-rate result (Section 3.2);
 - 6–8 rows of the comparison table (Section 7).
 
 Section 6 measures the switch CPU, not the P4 program, and can be left out.
 
 ## 9. Limitations
 
-- **Throughput** was measured only up to PC1's limit (≤ 4% of line rate; Section 3.1).
-- **Latency** covers ingress parser to egress parser in instrumented copies, without
-  queueing.
+- **Throughput** was measured for one flow from the switch's generator: 99.9% of line
+  rate at 128–1518 B and 91% at 64 B, the generator's limit (Section 3.2). PC1 alone
+  reaches ≤ 4% (Section 3.1).
+- **Latency** covers ingress parser to egress parser in instrumented copies, at low rates
+  without queueing.
 - **Timestamps** are 32-bit nanoseconds, so durations of flows longer than 4.295 s alias.
   `first_ts` is also re-stamped if a first packet's timestamp has its low 32 bits all
   zero (once in 2³² ns).
@@ -625,7 +722,7 @@ Section 6 measures the switch CPU, not the P4 program, and can be left out.
   - Flows with `sp == dp` always count as A→B.
 - **`enp5s0`** must be up on the switch for reports; switchd restarts bring it down.
 - **Not measured:**
-  - line rate (Section 8);
+  - 64-B line rate (Section 3.2);
   - TCP/UDP throughput with iperf3 and RTT with ping, which would measure PC1;
   - the collision rate on the switch over several flow counts. One point was measured
     (Section 5.2); the other numbers are offline, with the verified compiled hash.
@@ -647,7 +744,9 @@ Run these from the repository root on PC1.
 | Ports, forwarding, mirror | `run_bfrt.sh RUN_DIR LABEL setup --prog basic --ports 132,140 --fwd 132:140,140:132 --mirror-sid 1` |
 | Port map, sanity | `make_test_pcaps.py portmap\|sanity OUT_DIR`, replay, `run_bfrt.sh RUN_DIR LABEL read-regs --prog basic --idx …`, `check_sanity.py EXPECTED READ` |
 | 3 (packet rate) | `run_pktrate.py RUN_DIR --prog basic --regs`, then `--prog baseline` |
+| 3.2 (line rate) | load the build; on the switch `python2.7 sw_pktgen_run.py OUT.json --prog basic --size S [--rate-pct 99.9] --seconds 10 --flow-index 44993` (the run's `matrix.sh` covers all sizes); `pktgen_summary.py RUN_DIR LABEL` |
 | 4 (latency) | sources from `perf/variants/lat/make_lat_sources.sh`; `run_lat.py RUN_DIR --prog basic_lat`, then `--prog baseline_lat` |
+| 4.1 (reference method) | `perf/variants/hwl/make_hwl_sources.sh thesis-hybrid-ebpf-p4 OUT_DIR`, compile `basic_hwl` and `baseline_hwl`; the run's `hwl_hairpin_runs.sh RUN_DIR BUILD PROG 3`; on the reference's path, `reference_evaluation/P4_Code/scripts/send_probes.py` on PC1 and `collect_reports.py` on PC2 |
 | 5.2 (hash quality, offline) | `hash_quality.py [--sizes 20000,50000]` |
 | 5.3 (fingerprint build) | `perf/variants/fingerprint/make_fp_sources.sh thesis-hybrid-ebpf-p4 OUT_DIR`, compile as above, `hash_block_identify.py BUILD_DIR` |
 | 5.3 (on the switch) | `fp_test.py make OUT_DIR SANITY_PCAP`; clear with `clear-regs --extra-registers reg_fp,reg_shared`; replay at 100 pkt/s while capturing `enp5s0`; `read-regs … --extra-registers reg_fp,reg_shared`; `fp_test.py check` |
@@ -691,7 +790,9 @@ notes are in `DISCOVERY.md` and `INCIDENT_bf_switchd_exit.md`.
 | 2 | `p1_compile_20261026_141824` |
 | Port map, register sanity (deployed build) | `p2_bringup_20261026_144700` |
 | 3 | `p2_3_pktrate_20261026_150840` |
+| 3.2 | `pktgen_20261029_123642` |
 | 4 | `p2_5_lat_compile_20261026_154902` (design, builds), `p2_5_lat_20261026_155720` |
+| 4.1 | `hwl_20261029_112932` |
 | 5.1 and Appendix A (patch, files before and after, builds, hash checks) | `fix_20261026_174315` |
 | 5.1 and Appendix A.2 (validation on the switch) | `fix_hwval_20261026_190643` |
 | 5.3 (sources, builds, resources, hash check, switch test) | `fp_20261026_201808` |

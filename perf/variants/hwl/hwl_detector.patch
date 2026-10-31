@@ -1,0 +1,127 @@
+diff -ru a/egress.p4 b/egress.p4
+--- a/egress.p4
++++ b/egress.p4
+@@ -31,5 +31,17 @@
+ 
+     apply {
+         packet_size_hist.apply();
++
++        if (hdr.ipv4.isValid() && hdr.ipv4.protocol == IP_PROTO_UDP) {
++            hdr.hw_report.setValid();
++            hdr.hw_report.magic               = HW_LATENCY_MAGIC;
++            hdr.hw_report.original_ether_type = hdr.ethernet.eth_type;
++            hdr.hw_report.ingress_ns          = hdr.hw_bridge.ingress_ns;
++            hdr.hw_report.egress_ns           = eg_prsr_md.global_tstamp;
++            hdr.hw_report.score               = hdr.hw_bridge.score;
++            hdr.hw_report.tier                = hdr.hw_bridge.tier;
++            hdr.ethernet.eth_type             = ETHERTYPE_HW_LATENCY;
++        }
++        hdr.hw_bridge.setInvalid();
+     }
+ }
+\ No newline at end of file
+diff -ru a/egress_parser.p4 b/egress_parser.p4
+--- a/egress_parser.p4
++++ b/egress_parser.p4
+@@ -8,6 +8,23 @@
+ {
+     state start {
+         pkt.extract(eg_intr_md);
++        transition select(eg_intr_md.egress_port) {
++            HW_LATENCY_CPU_PORT: accept;
++            default: parse_hw_bridge;
++        }
++    }
++
++    state parse_hw_bridge {
++        pkt.extract(hdr.hw_bridge);
++        pkt.extract(hdr.ethernet);
++        transition select(hdr.ethernet.eth_type) {
++            ETHERTYPE_IPV4: parse_ipv4;
++            default: accept;
++        }
++    }
++
++    state parse_ipv4 {
++        pkt.extract(hdr.ipv4);
+         transition accept;
+     }
+ }
+\ No newline at end of file
+diff -ru a/headers.p4 b/headers.p4
+--- a/headers.p4
++++ b/headers.p4
+@@ -46,6 +46,29 @@
+     bit<16> checksum;
+ }
+ 
++/* ASIC latency report, the measurement of reference_evaluation/P4_Code
++ * (perf/variants/hwl): ingress puts its parser timestamp into a bridge header,
++ * and egress inserts the 20-byte report after Ethernet of IPv4/UDP packets and
++ * sets EtherType 0x88BC. Decoded by that package's scripts/probe_format.py. */
++const bit<32> HW_LATENCY_MAGIC     = 0x48574C31;   /* "HWL1" */
++const bit<16> ETHERTYPE_HW_LATENCY = 0x88BC;
++const PortId_t HW_LATENCY_CPU_PORT = 192;          /* mirrored CPU reports: no bridge */
++
++header hw_latency_bridge_h {
++    bit<48> ingress_ns;
++    bit<8>  score;
++    bit<8>  tier;
++}
++
++header hw_latency_report_h {
++    bit<32> magic;
++    bit<16> original_ether_type;
++    bit<48> ingress_ns;
++    bit<48> egress_ns;
++    bit<8>  score;
++    bit<8>  tier;
++}
++
+ /* Report payload mirrored to CPU/host (18 bytes, magic CPU_REPORT_MAGIC).
+  * flow_index is the register bucket the data plane chose, so the collector
+  * reads it from the report instead of recomputing the hash. */
+@@ -63,6 +86,7 @@
+ }
+ 
+ struct my_headers_t {
++    hw_latency_bridge_h hw_bridge;
+     ethernet_t ethernet;
+     ipv4_t     ipv4;
+     tcp_t      tcp;
+@@ -101,7 +125,9 @@
+ }
+ 
+ struct my_egress_headers_t {
++    hw_latency_bridge_h hw_bridge;
+     ethernet_t ethernet;
++    hw_latency_report_h hw_report;
+     ipv4_t     ipv4;
+     tcp_t      tcp;
+     udp_t      udp;
+diff -ru a/ingress_deparser.p4 b/ingress_deparser.p4
+--- a/ingress_deparser.p4
++++ b/ingress_deparser.p4
+@@ -11,6 +11,7 @@
+             flow_report_mirror.emit<cpu_report_t>(meta.cpu_mirror_sid, meta.cpu_report);
+         }
+ 
++        pkt.emit(hdr.hw_bridge);
+         pkt.emit(hdr.ethernet);
+         pkt.emit(hdr.ipv4);
+         pkt.emit(hdr.tcp);
+diff -ru a/ingress.p4 b/ingress.p4
+--- a/ingress.p4
++++ b/ingress.p4
+@@ -231,6 +231,11 @@
+     }
+ 
+     apply {
++        hdr.hw_bridge.setValid();
++        hdr.hw_bridge.ingress_ns = ig_prsr_md.global_tstamp;
++        hdr.hw_bridge.score      = 0;
++        hdr.hw_bridge.tier       = 0;
++
+ #if P4_ENABLE_FEATURES
+         meta.dir_ab = 1w1;
+ #endif
