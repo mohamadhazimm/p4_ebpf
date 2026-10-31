@@ -1,0 +1,30 @@
+{
+  "boundary": "ingress-parser arrival to egress-parser arrival",
+  "units": "nanoseconds",
+  "expected_sent": 1010,
+  "probe_ethernet_bytes_without_fcs": 82,
+  "output_report_overhead_bytes": 20,
+  "unique_reports": 1010,
+  "missing_reports": 0,
+  "warmup_sequence_range": [
+    0,
+    9
+  ],
+  "measured_packets": 1000,
+  "capture_counts": {
+    "malformed_reports": 0,
+    "out_of_range": 0,
+    "duplicates": 0
+  },
+  "clock_source": "two 48-bit timestamps from the Tofino ASIC",
+  "includes": "ingress processing and intervening traffic-manager buffering",
+  "excludes": "remaining egress processing, output MAC and cables, BlueField trip",
+  "pcap_timestamps_used_for_latency": false,
+  "missing_reports_note": "Missing reports can include path loss or capture loss; inspect port/capture counters.",
+  "min_ns": 244,
+  "mean_ns": 245.627,
+  "median_ns": 246.0,
+  "p95_ns": 246.0,
+  "p99_ns": 247.0,
+  "max_ns": 248
+}

@@ -875,6 +875,17 @@ notes are in `DISCOVERY.md` and `INCIDENT_bf_switchd_exit.md`.
 
 The `*_smoke_*` directories hold short checks of the tools before each test.
 
+Only the per-probe latencies of the hairpin runs are tracked by git, as
+`RUN/BUILD_hairpin_rN/packet_latencies.csv` and `summary.json`, the output of
+`collect_reports.py`:
+- **Builds:** in `hwl_20261029_112932` (Section 4.1, with the counter), `basic_hwl` and
+  `baseline_hwl`. In `nonewconn_20261031_094244` (Section 5.5, the paper's build),
+  `basic_hwl_nonewconn` and `baseline_hwl_nonewconn`.
+- **Rows:** one per probe, 1010 per run: `seq`, `qname`, `ingress_ns` and `egress_ns` (ASIC
+  timestamps), `latency_ns` = `egress_ns` − `ingress_ns`, `score`, `tier`, and
+  `original_sha256` (of the probe as sent).
+- **Warm-up:** probes 0–9 are warm-up and excluded from the statistics in `summary.json`.
+
 ## Appendix A. Changes outside the P4 program
 
 ### A.1 Collector and scripts (`thesis-hybrid-ebpf-p4/python`, `hybrid_collector.py`)

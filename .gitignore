@@ -14,7 +14,12 @@ __pycache__/
 
 # Hardware benchmark runs: per-command logs, P4 builds, pcaps, register dumps
 # and captures. They stay on disk; p4_perf.md is the summary.
-/perf/results/
+# Exception: the per-probe latencies of the Section 4.1/5.5 hairpin runs
+# (collect_reports.py output: packet_latencies.csv and summary.json).
+/perf/results/**
+!/perf/results/**/
+!/perf/results/*/*_hairpin_r[0-9]/packet_latencies.csv
+!/perf/results/*/*_hairpin_r[0-9]/summary.json
 /perf/plots/
 
 # Generated host monitoring outputs
