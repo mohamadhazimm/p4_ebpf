@@ -7,6 +7,7 @@ __pycache__/
 /libbpf-bootstrap/examples/c/execmon
 /libbpf-bootstrap/examples/c/filemon
 /libbpf-bootstrap/examples/c/hostmon
+/libbpf-bootstrap/examples/c/modelmon
 
 # bf-p4c output directories, wherever a program is compiled
 *.tofino/
