@@ -146,6 +146,22 @@ therefore stays active while its packet counter keeps changing. A bucket idle
 for `--clear-idle-windows` reads (default 3, `0` disables) is cleared right
 after its read, so the next flow landing in it reports again instead of being
 merged silently into the old counters.
+
+For the same reason every run starts by clearing all detector registers
+(`thesis-hybrid-ebpf-p4/python/reset_registers.py`, which also works on its
+own and with `--ssh`; `--no-register-reset` skips it). A bucket left from an
+earlier run would keep `dir_valid` set, so a new flow landing in it would send
+no report and never be read, and `reg_newconn_dst` would return its count since
+the switch started.
+
+A register read that fails, or takes longer than `--p4-read-timeout` (default
+120 s), is retried `--p4-read-retries` times (default 2). Each window's row is
+written to `OUT.<run_id>.partial.csv` as soon as it is complete. A finished run
+appends its rows to the output CSV; a failed or interrupted run keeps them in
+`OUT.<run_id>.incomplete.csv` and does not touch the output CSV. Rows follow the
+register reads: host windows after the last read get no row. HostMon runs in
+its own process group (directly when the collector runs as root), so the
+collector's stop signal reaches it and it prints its last, partial window.
 Its defaults use ports 0 and 1 for forwarding, report port 2, and CPU-report
 interface `veth5`; these are virtual-model defaults. The legacy collector
 emits a different feature schema from the shared-arm classifier and is not
