@@ -1,0 +1,5 @@
+# Runtime state, logs, captures and results of the live tests
+/run/
+/results/
+/data/
+/www/

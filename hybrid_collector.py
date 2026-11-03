@@ -3,13 +3,14 @@
 import argparse
 import csv
 import json
+import os
 import signal
 import subprocess
 import sys
 import time
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Callable, Dict, List, Optional, Any
 
 
 # ============================================================
@@ -30,6 +31,7 @@ DEFAULT_HOSTMON = "/home/ubuntu/Desktop/p4_ebpf/libbpf-bootstrap/examples/c/host
 DEFAULT_P4_READER = "/home/ubuntu/Desktop/p4_ebpf/thesis-hybrid-ebpf-p4/python/read_registers_with_index.py"
 DEFAULT_REPLAY = "/home/ubuntu/Desktop/p4_ebpf/thesis-hybrid-ebpf-p4/python/replay_pcaps_with_index.py"
 DEFAULT_P4_FORWARDER = "/home/ubuntu/Desktop/p4_ebpf/thesis-hybrid-ebpf-p4/python/program_forwarding.py"
+DEFAULT_P4_RESETTER = str(Path(__file__).resolve().parent / "thesis-hybrid-ebpf-p4" / "python" / "reset_registers.py")
 
 DEFAULT_OUT_CSV = "hybrid_windows.csv"
 
@@ -333,39 +335,63 @@ def summarize_host_window(win: Optional[List[Dict[str, object]]]) -> Dict[str, o
 # PROCESS MANAGEMENT
 # ============================================================
 
-def start_hostmon(hostmon_path: str, output_path: str, window_sec: float) -> subprocess.Popen:
+def start_hostmon(hostmon_path: str, output_path: str, window_sec: float,
+                  use_sudo: Optional[bool] = None) -> subprocess.Popen:
+    """Start HostMon in its own process group.
+
+    As root (how the collector runs) HostMon is started directly, so the stop
+    signal reaches it. Otherwise it goes through sudo; sudo does not relay a
+    signal sent from the command's own process group, which is why a HostMon
+    started through sudo in the collector's group kept running after
+    stop_hostmon(). In a group of its own the signal is relayed.
+    """
     fout = open(output_path, "w")
+    if use_sudo is None:
+        use_sudo = os.geteuid() != 0
+    cmd = (["sudo"] if use_sudo else []) + [hostmon_path, str(window_sec)]
 
     proc = subprocess.Popen(
-        ["sudo", hostmon_path, str(window_sec)],
+        cmd,
         stdout=fout,
         stderr=subprocess.STDOUT,
         text=True,
+        start_new_session=True,
     )
 
     proc._collector_file = fout
     return proc
 
 
-def stop_hostmon(proc: subprocess.Popen, grace: float = 2.0) -> None:
-    if proc.poll() is None:
-        proc.send_signal(signal.SIGINT)
-
+def stop_hostmon(proc: subprocess.Popen, grace: float = 5.0) -> None:
+    """SIGINT (HostMon prints its last, partial window and exits), then
+    SIGTERM, then SIGKILL to HostMon's whole process group, so that nothing
+    of it outlives the run."""
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        if proc.poll() is not None:
+            break
         try:
+            proc.send_signal(sig)
             proc.wait(timeout=grace)
         except subprocess.TimeoutExpired:
-            proc.terminate()
-
-            try:
-                proc.wait(timeout=grace)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=grace)
+            continue
+        except ProcessLookupError:
+            break
+    if proc.poll() is None:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
+        proc.wait(timeout=grace)
 
     fout = getattr(proc, "_collector_file", None)
 
     if fout:
         fout.close()
+
+
+def read_host_windows(path: str) -> List[Dict[str, object]]:
+    p = Path(path)
+    return parse_host_windows(p.read_text(errors="replace")) if p.exists() else []
 
 
 def run_scenario_command(cmd: str, shell: str = "/bin/bash") -> subprocess.Popen:
@@ -383,6 +409,7 @@ def run_p4_reader_json(
     snapshot: str = "sync",
     clear_if_unchanged: Optional[Dict[int, int]] = None,
     dst_indexes: Optional[List[int]] = None,
+    timeout: Optional[float] = None,
 ) -> Dict[str, Any]:
     if not indexes and not dst_indexes:
         return {"source": "empty", "flow_count": 0, "dst_rows": [], "cleared": [], "rows": []}
@@ -403,12 +430,15 @@ def run_p4_reader_json(
         cmd += ["--clear-if-unchanged", ",".join(f"{i}:{p}" for i, p in sorted(clear_if_unchanged.items()))]
     if dst_indexes:
         cmd += ["--dst-indexes", ",".join(str(x) for x in dst_indexes)]
+    if timeout is not None:
+        cmd += ["--timeout", str(timeout)]   # the reader's bfshell session
 
     result = subprocess.run(
         cmd,
         check=True,
         capture_output=True,
         text=True,
+        timeout=None if timeout is None else timeout + 30,
     )
 
     raw = result.stdout or ""
@@ -431,6 +461,62 @@ def run_p4_reader_json(
     )
 
 
+class P4ReadError(RuntimeError):
+    """A register read failed on every attempt."""
+
+
+BUSY_SHELL = "Only one Python shell instance allowed"
+
+
+def describe_failure(error: BaseException) -> str:
+    if isinstance(error, subprocess.CalledProcessError):
+        text = "\n".join(t for t in (error.stderr, error.stdout) if t)
+        lines = [l.strip() for l in text.splitlines() if l.strip() and not l.strip().startswith("bfshell>")]
+        busy = [l for l in lines if BUSY_SHELL in l]
+        tail = busy[-1:] or lines[-1:]   # the busy-shell message, or the exception line of a traceback
+        return f"exit status {error.returncode}" + (": " + tail[0] if tail else "")
+    if isinstance(error, subprocess.TimeoutExpired):
+        return f"no answer within {error.timeout:.0f} s"
+    return f"{type(error).__name__}: {error}"
+
+
+def read_p4_with_retries(
+    reader_path: str,
+    indexes: List[int],
+    window: int,
+    retries: int = 0,
+    timeout: Optional[float] = None,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """run_p4_reader_json, tried retries + 1 times. A bfshell session can fail
+    to start or hang; one such read must not end the run.
+
+    A retried read repeats the same clear_if_unchanged request; a bucket that
+    an interrupted attempt has already cleared no longer has the expected
+    packet count, so it is not cleared again, and its next delta starts from
+    the zero it now reads.
+
+    Killing a bfshell client that timed out does not stop its script on the
+    switch, and bf_switchd refuses a second Python shell meanwhile ("Only one
+    Python shell instance allowed"); that refusal waits longer before the
+    next attempt."""
+    if timeout is not None:
+        kwargs["timeout"] = timeout
+    for attempt in range(retries + 1):
+        try:
+            return run_p4_reader_json(reader_path, indexes, **kwargs)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError, ValueError) as error:
+            reason = describe_failure(error)
+            if attempt == retries:
+                raise P4ReadError(f"register read of window {window} failed after {retries + 1} attempt(s): "
+                                  f"{reason}") from error
+            wait = 15.0 if BUSY_SHELL in reason else 2.0
+            print(f"[WARN] window {window}: register read attempt {attempt + 1} failed ({reason}); "
+                  f"retrying in {wait:.0f} s")
+            time.sleep(wait)
+    raise AssertionError("unreachable")
+
+
 def run_p4_forwarder(
     forwarder_path: str,
     int_port: int,
@@ -438,7 +524,10 @@ def run_p4_forwarder(
     report_port: int,
     mirror_sid: int,
     switch_ssh: Optional[str] = None,
+    attempts: int = 3,
 ) -> None:
+    """Retried: the first bfshell session right after BFRT starts listening can
+    fail ("Can't startup clish")."""
     cmd = [
         sys.executable,
         forwarder_path,
@@ -449,7 +538,29 @@ def run_p4_forwarder(
     ]
     if switch_ssh:
         cmd += ["--ssh", switch_ssh]
+    for attempt in range(1, attempts + 1):
+        try:
+            subprocess.run(cmd, check=True)
+            return
+        except subprocess.CalledProcessError:
+            if attempt == attempts:
+                raise
+            print(f"[WARN] programming forwarding failed (attempt {attempt} of {attempts}); retrying")
+            time.sleep(5.0)
+
+
+def run_p4_register_reset(resetter_path: str, switch_ssh: Optional[str] = None) -> None:
+    """Clear all detector registers (reset_registers.py) before the run.
+
+    A bucket left from an earlier run keeps dir_valid = 1, so a new flow that
+    lands in it sends no CPU report and is never read; reg_newconn_dst would
+    return its count since the switch started."""
+    cmd = [sys.executable, resetter_path]
+    if switch_ssh:
+        cmd += ["--ssh", switch_ssh]
+    started = time.time()
     subprocess.run(cmd, check=True)
+    print(f"[INFO] P4 registers cleared in {time.time() - started:.1f} s")
 
 
 def collect_windows_live(
@@ -463,9 +574,16 @@ def collect_windows_live(
     switch_ssh: Optional[str] = None,
     snapshot: str = "sync",
     clear_idle_windows: int = 3,
+    read_timeout: Optional[float] = None,
+    read_retries: int = 0,
+    on_window: Optional[Callable[[Dict[str, object]], None]] = None,
 ) -> List[Dict[str, object]]:
     """Per window: the CPU-reported bucket indexes, and the P4 registers of all
     active indexes read at the end of that window.
+
+    A failed register read is retried read_retries times (each attempt
+    limited to read_timeout seconds) before P4ReadError ends the collection.
+    on_window, if given, receives every window as soon as it is read.
 
     The collector keeps capturing reports in the background while the
     registers are read, so a read does not open a gap in the report capture.
@@ -541,8 +659,9 @@ def collect_windows_live(
             }
 
         read_start = time.time()
-        payload = run_p4_reader_json(reader_path, active_idxs, switch_ssh=switch_ssh, snapshot=snapshot,
-                                     clear_if_unchanged=clear_candidates, dst_indexes=active_dst_idxs)
+        payload = read_p4_with_retries(reader_path, active_idxs, w, retries=read_retries, timeout=read_timeout,
+                                       switch_ssh=switch_ssh, snapshot=snapshot,
+                                       clear_if_unchanged=clear_candidates, dst_indexes=active_dst_idxs)
         read_end = time.time()
 
         for row in payload.get("rows", []):
@@ -586,6 +705,8 @@ def collect_windows_live(
             "p4_read_start_sec": round(read_start - global_t0, 3),
             "p4_read_sec": round(read_end - read_start, 3),
         })
+        if on_window is not None:
+            on_window(windows[-1])
 
         if not proc_done and proc.poll() is not None:
             proc_done = True
@@ -604,21 +725,25 @@ def collect_windows_live(
 # P4 SUMMARY BUILDER
 # ============================================================
 
-def build_net_summaries(
-    net_windows: List[Dict[str, object]],
-    window_sec: float,
-) -> List[Dict[str, object]]:
+class NetSummarizer:
     """Window features from the register snapshots taken at each window end
     (collect_windows_live): deltas against the previous snapshot of the same
     bucket index. net_new_conn_dst_max is the largest increase of one
-    reg_newconn_dst bucket since its previous read."""
+    reg_newconn_dst bucket since its previous read.
 
-    out: List[Dict[str, object]] = []
+    add() takes the windows one at a time, in order, so that a window's row
+    can be written as soon as the window is read."""
 
-    prev_by_idx: Dict[int, Dict[str, Any]] = {}
-    prev_new_conn: Dict[int, int] = {}
+    def __init__(self, window_sec: float):
+        self.window_sec = window_sec
+        self.prev_by_idx: Dict[int, Dict[str, Any]] = {}
+        self.prev_new_conn: Dict[int, int] = {}
 
-    for win in net_windows:
+    def add(self, win: Dict[str, object]) -> Dict[str, object]:
+        window_sec = self.window_sec
+        prev_by_idx = self.prev_by_idx
+        prev_new_conn = self.prev_new_conn
+
         rows = win.get("rows", [])
 
         new_conn_max = 0
@@ -629,8 +754,7 @@ def build_net_summaries(
             prev_new_conn[idx] = new_conn
 
         if not rows:
-            out.append(dict(NET_ZERO, net_new_conn_dst_max=new_conn_max))
-            continue
+            return dict(NET_ZERO, net_new_conn_dst_max=new_conn_max)
 
         cleared_after_read = [safe_int(x) for x in win.get("cleared_indexes", [])]
 
@@ -766,9 +890,16 @@ def build_net_summaries(
         summary["net_ab_ratio_byte_delta"] = safe_div(bytes_ab_delta, bytes_delta)
         summary["net_ba_ratio_byte_delta"] = safe_div(bytes_ba_delta, bytes_delta)
 
-        out.append(summary)
+        return summary
 
-    return out
+
+def build_net_summaries(
+    net_windows: List[Dict[str, object]],
+    window_sec: float,
+) -> List[Dict[str, object]]:
+    """NetSummarizer over all windows of a run."""
+    summarizer = NetSummarizer(window_sec)
+    return [summarizer.add(win) for win in net_windows]
 
 
 # ============================================================
@@ -804,44 +935,103 @@ def build_rows(
 ) -> List[Dict[str, object]]:
 
     count = max(len(host_windows), len(net_windows))
-    rows: List[Dict[str, object]] = []
+    return [
+        build_row(args, run_id, i,
+                  host_windows[i] if i < len(host_windows) else None,
+                  net_windows[i] if i < len(net_windows) else None,
+                  net_summaries[i] if i < len(net_summaries) else dict(NET_ZERO))
+        for i in range(count)
+    ]
 
-    for i in range(count):
-        host_meta = host_windows[i] if i < len(host_windows) else None
-        net_meta = net_windows[i] if i < len(net_windows) else None
-        net_summary = net_summaries[i] if i < len(net_summaries) else dict(NET_ZERO)
 
-        host_rows = host_meta["rows"] if host_meta else None
-        host_summary = summarize_host_window(host_rows)
+def build_row(
+    args,
+    run_id: str,
+    i: int,
+    host_meta: Optional[Dict[str, object]],
+    net_meta: Optional[Dict[str, object]],
+    net_summary: Dict[str, object],
+) -> Dict[str, object]:
+    host_rows = host_meta["rows"] if host_meta else None
+    host_summary = summarize_host_window(host_rows)
 
-        row = {
-            "timestamp": int(time.time()),
-            "run_id": run_id,
-            "scenario_name": args.scenario_name,
-            "label": args.label,
-            "mode": args.mode,
-            "window_id": i,
+    row = {
+        "timestamp": int(time.time()),
+        "run_id": run_id,
+        "scenario_name": args.scenario_name,
+        "label": args.label,
+        "mode": args.mode,
+        "window_id": i,
 
-            "host_window_id": host_meta["host_window_id"] if host_meta else i,
-            "host_window_start_sec": host_meta["host_window_start_sec"] if host_meta else i * args.window_sec,
-            "host_window_end_sec": host_meta["host_window_end_sec"] if host_meta else (i + 1) * args.window_sec,
-            "host_window_duration_sec": host_meta["host_window_duration_sec"] if host_meta else args.window_sec,
+        "host_window_id": host_meta["host_window_id"] if host_meta else i,
+        "host_window_start_sec": host_meta["host_window_start_sec"] if host_meta else i * args.window_sec,
+        "host_window_end_sec": host_meta["host_window_end_sec"] if host_meta else (i + 1) * args.window_sec,
+        "host_window_duration_sec": host_meta["host_window_duration_sec"] if host_meta else args.window_sec,
 
-            "net_window_id": net_meta["net_window_id"] if net_meta else i,
-            "net_window_start_sec": net_meta["net_window_start_sec"] if net_meta else i * args.window_sec,
-            "net_window_end_sec": net_meta["net_window_end_sec"] if net_meta else (i + 1) * args.window_sec,
-            "net_window_duration_sec": net_meta["net_window_duration_sec"] if net_meta else args.window_sec,
+        "net_window_id": net_meta["net_window_id"] if net_meta else i,
+        "net_window_start_sec": net_meta["net_window_start_sec"] if net_meta else i * args.window_sec,
+        "net_window_end_sec": net_meta["net_window_end_sec"] if net_meta else (i + 1) * args.window_sec,
+        "net_window_duration_sec": net_meta["net_window_duration_sec"] if net_meta else args.window_sec,
 
-            "cpu_index_count": len(net_meta["indexes"]) if net_meta else 0,
-            "cpu_indexes": json.dumps(net_meta["indexes"] if net_meta else []),
-        }
+        "cpu_index_count": len(net_meta["indexes"]) if net_meta else 0,
+        "cpu_indexes": json.dumps(net_meta["indexes"] if net_meta else []),
+    }
 
-        row.update(host_summary)
-        row.update(net_summary)
+    row.update(host_summary)
+    row.update(net_summary)
+    return row
 
-        rows.append(row)
 
-    return rows
+class RunWriter:
+    """The rows of one run, written as soon as they are complete.
+
+    While the run lasts, each row goes to PARTIAL next to the output CSV
+    (OUT.<run_id>.partial.csv), so a collector that dies mid-run leaves its
+    windows on disk. commit() appends the rows to the output CSV: only complete
+    runs reach it, as before. abandon() renames PARTIAL to
+    OUT.<run_id>.incomplete.csv for a run that failed.
+    """
+
+    def __init__(self, out_csv: str, run_id: str):
+        out = Path(out_csv)
+        tag = re.sub(r"[^A-Za-z0-9_.-]", "_", run_id)
+        self.out_csv = out
+        self.partial = out.with_name(f"{out.stem}.{tag}.partial.csv")
+        self.incomplete = out.with_name(f"{out.stem}.{tag}.incomplete.csv")
+        self.rows: List[Dict[str, object]] = []
+        self._file = None
+        self._writer = None
+
+    @property
+    def count(self) -> int:
+        return len(self.rows)
+
+    def write(self, row: Dict[str, object]) -> None:
+        if self._writer is None:
+            self._file = open(self.partial, "w", newline="")
+            self._writer = csv.DictWriter(self._file, fieldnames=list(row.keys()))
+            self._writer.writeheader()
+        self._writer.writerow(row)
+        self._file.flush()
+        self.rows.append(row)
+
+    def _close(self) -> None:
+        if self._file is not None:
+            self._file.close()
+            self._file = None
+
+    def commit(self) -> None:
+        self._close()
+        append_csv_rows(str(self.out_csv), self.rows)
+        if self.partial.exists():
+            self.partial.unlink()
+
+    def abandon(self) -> Optional[Path]:
+        self._close()
+        if self.partial.exists():
+            self.partial.replace(self.incomplete)
+            return self.incomplete
+        return None
 
 
 # ============================================================
@@ -879,6 +1069,15 @@ def main() -> None:
     ap.add_argument("--clear-idle-windows", type=int, default=3,
                     help="clear a bucket after this many reads without new packets, so that the next "
                          "flow in it reports again (0 = never clear)")
+    ap.add_argument("--p4-resetter", default=DEFAULT_P4_RESETTER)
+    ap.add_argument("--no-register-reset", action="store_true",
+                    help="do not clear the P4 registers before the run (a bucket left from an earlier run "
+                         "then sends no CPU report for a new flow that lands in it)")
+    ap.add_argument("--p4-read-timeout", type=float, default=120.0,
+                    help="seconds one register read's bfshell session may take before the read is retried "
+                         "(the reader process itself is stopped 30 s later)")
+    ap.add_argument("--p4-read-retries", type=int, default=2,
+                    help="retries of a failed register read before the run stops")
 
     ap.add_argument("--command")
     ap.add_argument("--shell", default="/bin/bash")
@@ -907,6 +1106,9 @@ def main() -> None:
     if not args.skip_p4_forwarding and not Path(args.p4_forwarder).exists():
         raise FileNotFoundError(f"Forwarding setup file not found: {args.p4_forwarder}")
 
+    if not args.no_register_reset and not Path(args.p4_resetter).exists():
+        raise FileNotFoundError(f"Register reset script not found: {args.p4_resetter}")
+
     if args.mode == "pcap" and not Path(args.replay_script).exists():
         raise FileNotFoundError(f"Replay script not found: {args.replay_script}")
 
@@ -915,6 +1117,28 @@ def main() -> None:
     report_collector = None
 
     run_id = f"{args.scenario_name}_{int(time.time())}"
+    writer = RunWriter(args.out_csv, run_id)
+    summarizer = NetSummarizer(args.window_sec)
+    net_windows: List[Dict[str, object]] = []
+    net_summaries: List[Dict[str, object]] = []
+    committed = False
+
+    def write_ready_rows(host_windows: List[Dict[str, object]], final: bool) -> None:
+        # Row i pairs host window i with network window i; the network windows
+        # define the rows. HostMon prints a window when it ends, so during the
+        # run a host window is used only once the next one has appeared.
+        ready = len(host_windows) if final else len(host_windows) - 1
+        while writer.count < len(net_windows):
+            i = writer.count
+            if not final and i >= ready:
+                break
+            host_meta = host_windows[i] if i < len(host_windows) else None
+            writer.write(build_row(args, run_id, i, host_meta, net_windows[i], net_summaries[i]))
+
+    def on_window(win: Dict[str, object]) -> None:
+        net_windows.append(win)
+        net_summaries.append(summarizer.add(win))
+        write_ready_rows(read_host_windows(args.hostmon_log), final=False)
 
     try:
         if not args.skip_p4_forwarding:
@@ -927,6 +1151,13 @@ def main() -> None:
                 args.mirror_sid,
                 switch_ssh=args.switch_ssh,
             )
+
+        if args.no_register_reset:
+            print("[WARN] P4 registers not cleared (--no-register-reset): a flow that lands in a bucket left "
+                  "from an earlier run sends no CPU report and is not counted")
+        else:
+            print(f"[INFO] Clearing the P4 registers via: {args.p4_resetter}")
+            run_p4_register_reset(args.p4_resetter, switch_ssh=args.switch_ssh)
 
         where = f"{args.switch_ssh}:{args.cpu_iface}" if args.switch_ssh else args.cpu_iface
         print(f"[INFO] Collecting CPU reports on {where}")
@@ -961,7 +1192,7 @@ def main() -> None:
             workload_proc = run_scenario_command(args.command, shell=args.shell)
 
         print("[INFO] Reading P4 registers at the end of every window")
-        net_windows = collect_windows_live(
+        collect_windows_live(
             collector=report_collector,
             proc=workload_proc,
             window_sec=args.window_sec,
@@ -972,6 +1203,9 @@ def main() -> None:
             switch_ssh=args.switch_ssh,
             snapshot=args.p4_snapshot,
             clear_idle_windows=args.clear_idle_windows,
+            read_timeout=args.p4_read_timeout,
+            read_retries=args.p4_read_retries,
+            on_window=on_window,
         )
         report_collector.stop()
         print(f"[INFO] CPU reports: {sum(w['report_count'] for w in net_windows)} in "
@@ -980,16 +1214,13 @@ def main() -> None:
               f"{sum(len(w['cleared_indexes']) for w in net_windows)}")
 
         workload_proc.wait()
-
-        if workload_proc.returncode != 0:
-            raise RuntimeError(f"Workload failed with code {workload_proc.returncode}")
+        workload_rc = workload_proc.returncode
 
         print("[INFO] Stopping HostMon")
         stop_hostmon(host_proc)
         host_proc = None
 
-        host_text = Path(args.hostmon_log).read_text() if Path(args.hostmon_log).exists() else ""
-        host_windows = parse_host_windows(host_text)
+        host_windows = read_host_windows(args.hostmon_log)
 
         if host_windows:
             print(
@@ -1005,24 +1236,19 @@ def main() -> None:
 
         if len(host_windows) != len(net_windows):
             print(f"[WARN] host_windows={len(host_windows)} net_windows={len(net_windows)}; pairing by index")
+        if len(host_windows) > len(net_windows):
+            print(f"[INFO] {len(host_windows) - len(net_windows)} host window(s) after the last register read "
+                  f"have no network data and get no row")
 
-        print("[INFO] Building P4 window summaries")
-        net_summaries = build_net_summaries(
-            net_windows=net_windows,
-            window_sec=args.window_sec,
-        )
+        write_ready_rows(host_windows, final=True)
 
-        rows = build_rows(
-            args=args,
-            run_id=run_id,
-            host_windows=host_windows,
-            net_windows=net_windows,
-            net_summaries=net_summaries,
-        )
+        if workload_rc != 0:
+            raise RuntimeError(f"Workload failed with code {workload_rc}")
 
-        append_csv_rows(args.out_csv, rows)
+        writer.commit()
+        committed = True
 
-        print(f"[OK] Added {len(rows)} rows to {args.out_csv}")
+        print(f"[OK] Added {writer.count} rows to {args.out_csv}")
         print(f"[OK] run_id: {run_id}")
         print(f"[OK] host_windows={len(host_windows)}")
         print(f"[OK] net_windows={len(net_windows)}")
@@ -1041,6 +1267,18 @@ def main() -> None:
 
         if report_collector is not None:
             report_collector.stop()
+
+        if not committed:
+            # Keep what was collected; the output CSV only receives complete runs.
+            try:
+                if writer.count < len(net_windows):
+                    write_ready_rows(read_host_windows(args.hostmon_log), final=True)
+                kept = writer.abandon()
+                if kept is not None:
+                    print(f"[ERROR] the run did not complete; its {writer.count} window rows are in {kept} "
+                          f"(not added to {args.out_csv})")
+            except Exception as error:
+                print(f"[ERROR] could not save the windows collected so far: {error}")
 
 
 if __name__ == "__main__":
