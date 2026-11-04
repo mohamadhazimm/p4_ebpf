@@ -30,7 +30,7 @@ SDE=${SDE_INSTALL:-/home/ubuntu/open-p4studio/install}
 REPO=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
 LT=$REPO/live_test
 RUN=$LT/run
-BUILD=$REPO/thesis-hybrid-ebpf-p4/basic.tofino
+BUILD=${P4_BUILD:-$REPO/thesis-hybrid-ebpf-p4/basic.tofino}   # P4_BUILD: another compiled basic.tofino
 CONF=$BUILD/basic.conf
 PORTS=$REPO/thesis-hybrid-ebpf-p4/ports.json
 PYDIR=$REPO/thesis-hybrid-ebpf-p4/python
@@ -120,6 +120,7 @@ start_model() {
 }
 
 start_switchd() {
+    local pid=""
     if pgrep -x bf_switchd >/dev/null; then log "bf_switchd already running"; else
         mkdir -p "$RUN/switchd"
         local extra=()
@@ -128,11 +129,16 @@ start_switchd() {
             "PATH=$SDE/bin:/usr/sbin:/usr/bin:/sbin:/bin" setsid nohup "$SDE/bin/bf_switchd" --background \
             --install-dir "$SDE" --conf-file "$CONF" "${extra[@]}" \
             > "$RUN/switchd/bf_switchd.out" 2>&1 < /dev/null) &
+        pid=$!   # the exec chain keeps this PID; its name is env/setsid/nohup for a moment
         log "bf_switchd started${extra:+ (${extra[*]})}; waiting for BFRT (port 9999)"
     fi
     local t0=$SECONDS
     until listening 9999; do
-        pgrep -x bf_switchd >/dev/null || die "bf_switchd exited (see $RUN/switchd/bf_switchd.out)"
+        if [ -n "$pid" ]; then
+            kill -0 "$pid" 2>/dev/null || die "bf_switchd exited (see $RUN/switchd/bf_switchd.out)"
+        else
+            pgrep -x bf_switchd >/dev/null || die "bf_switchd exited (see $RUN/switchd/bf_switchd.out)"
+        fi
         if (( (SECONDS - t0) % 60 == 0 && SECONDS > t0 )); then
             log "  ... $(( (SECONDS - t0) / 60 )) min, $(grep -c mc_mgr_add_port "$RUN/switchd/bf_drivers.log" 2>/dev/null || echo 0) ports added"
         fi
