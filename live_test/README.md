@@ -39,7 +39,9 @@ sudo live_test/testbed.sh down
 
 `up` starts bf_switchd with `--skip-port-add` and adds only ports 0-2
 (`P4_FAST=0` adds all 288 model ports: 35 minutes here). The model and
-bf_switchd busy-poll about 2.3 CPU cores while up.
+bf_switchd busy-poll about 2.3 CPU cores while up. `P4_BUILD=/path/to/basic.tofino`
+starts another compiled build. The release repo's validations use its
+`p4/basic.tofino` this way (see [RESULTS.md](RESULTS.md), 2026-11-04).
 
 The collector clears all registers at the start of every run (~200 s on the
 model, `--no-register-reset` skips it); before that fix, flows landing in buckets
@@ -75,5 +77,6 @@ python3 live_test/analyze_host.py --run-dir live_test/results/cmd_mixed_w40_...
 
 `collector_probe.py` runs `hybrid_collector.main()` unchanged and only logs
 what the CSV leaves out (window origin, register snapshot times, rows, process
-PIDs); it also stops the hostmon the collector leaves running. Results of the
-first round are in [RESULTS.md](RESULTS.md).
+PIDs); it also stops the hostmon the collector leaves running. Results are in
+[RESULTS.md](RESULTS.md). On 2026-11-03 that was this repo's collector. On 2026-11-04 it was the
+release repo's three validations, with the commands used on this VM.
