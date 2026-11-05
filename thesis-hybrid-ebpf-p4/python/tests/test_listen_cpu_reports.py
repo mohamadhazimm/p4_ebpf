@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import io
+import os
 import socket
 import struct
+import sys
+import tempfile
+import textwrap
+import time
 import unittest
+from pathlib import Path
 
 from flow_index import compute_flow_index
-from listen_cpu_reports import LEGACY_MAGIC, MAGIC, iter_pcap_stream, parse_cpu_report
+from listen_cpu_reports import LEGACY_MAGIC, MAGIC, ReportCollector, iter_pcap_stream, parse_cpu_report
 
 PACKET_TAIL = bytes(range(46))  # mirrored copies carry the start of the packet after the report
 
@@ -53,6 +59,59 @@ class PcapStreamTests(unittest.TestCase):
         out = list(iter_pcap_stream(io.BytesIO(stream)))
         self.assertEqual([f for _, f in out], frames)
         self.assertAlmostEqual(out[1][0], 101.5)
+
+
+class RemoteCaptureTests(unittest.TestCase):
+    """ReportCollector(ssh_host=...) through a stand-in `ssh` on PATH that runs
+    the remote command locally, with tcpdump replaced by a script that writes a
+    pcap stream with one report and then waits to be killed: stop() must end
+    that process through a second ssh, not only the local ssh."""
+
+    def test_stop_kills_the_capture_on_the_remote_host(self):
+        d = Path(tempfile.mkdtemp())
+        frame = report(MAGIC, "10.0.0.1", "10.0.0.2", 1234, 80, 6, idx=7)
+        pidfile = d / "tcpdump.pid"
+        fake_tcpdump = d / "fake_tcpdump.py"
+        fake_tcpdump.write_text(textwrap.dedent('''\
+            import os, struct, sys, time
+            frame = bytes.fromhex(%r)
+            out = sys.stdout.buffer
+            out.write(struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 262144, 1))
+            out.write(struct.pack("<IIII", 1, 0, len(frame), len(frame)) + frame)
+            out.flush()
+            open(%r, "w").write(str(os.getpid()))
+            os.rename(%r, %r)
+            time.sleep(600)
+            ''') % (frame.hex(), str(pidfile) + ".tmp", str(pidfile) + ".tmp", str(pidfile)))
+        ssh = d / "ssh"
+        ssh.write_text(textwrap.dedent('''\
+            #!/bin/sh
+            # stand-in for ssh: drop the options and the host, log the command, run it locally
+            while [ "$#" -gt 0 ]; do case "$1" in -o) shift 2;; -*) shift;; *) break;; esac; done
+            shift
+            echo "$*" >> %r
+            cmd=$(printf '%%s' "$*" | sed "s|exec tcpdump .*|exec %s %s|")
+            exec sh -c "$cmd"
+            ''') % (str(d / "ssh.log"), sys.executable, str(fake_tcpdump)))
+        ssh.chmod(0o755)
+        saved_path = os.environ["PATH"]
+        os.environ["PATH"] = str(d) + os.pathsep + saved_path
+        try:
+            rc = ReportCollector("enp5s0", ssh_host="root@switch").start()
+            deadline = time.time() + 10
+            while time.time() < deadline and not pidfile.exists():
+                time.sleep(0.05)
+            pid = int(pidfile.read_text())
+            while time.time() < deadline and not rc.take(0, float("inf")):
+                time.sleep(0.05)
+            self.assertEqual([r["idx"] for r in rc.take(0, float("inf"))], [7])
+            rc.stop()
+        finally:
+            os.environ["PATH"] = saved_path
+        self.assertEqual(rc.remote_pid, pid)
+        self.assertIn("kill %d" % pid, (d / "ssh.log").read_text())
+        with self.assertRaises(ProcessLookupError):   # ended and reaped, not left running
+            os.kill(pid, 0)
 
 
 if __name__ == "__main__":

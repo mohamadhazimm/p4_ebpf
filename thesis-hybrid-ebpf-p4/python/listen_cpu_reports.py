@@ -105,6 +105,7 @@ class ReportCollector:
         self._sniffer = None
         self._proc = None
         self._thread = None
+        self.remote_pid: Optional[int] = None   # the tcpdump on ssh_host, to end it in stop()
         self.frames_seen = 0
 
     def _add(self, raw: bytes) -> None:
@@ -119,16 +120,32 @@ class ReportCollector:
 
     def start(self) -> "ReportCollector":
         if self.ssh_host:
-            cmd = "tcpdump -i %s -U -s 128 -w - %s" % (shlex.quote(self.iface), shlex.quote(TCPDUMP_FILTER))
-            self._proc = subprocess.Popen(["ssh", "-o", "BatchMode=yes", self.ssh_host, cmd],
-                                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                          stderr=subprocess.DEVNULL)
+            # The remote shell prints its PID and then becomes tcpdump (exec), so
+            # stop() can kill it: without a terminal, sshd does not end the
+            # command when the local ssh is terminated, and tcpdump would run on
+            # until its next write to the closed pipe, i.e. the next report.
+            cmd = "echo $$ >&2; exec tcpdump -i %s -U -s 128 -w - %s" % (shlex.quote(self.iface),
+                                                                          shlex.quote(TCPDUMP_FILTER))
+            proc = subprocess.Popen(["ssh", "-o", "BatchMode=yes", self.ssh_host, cmd],
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self._proc = proc
 
             def pump():
-                for _ts, frame in iter_pcap_stream(self._proc.stdout):
+                for _ts, frame in iter_pcap_stream(proc.stdout):
                     self._add(frame)
+
+            def pump_stderr():
+                first = True
+                for line in proc.stderr:
+                    if first:
+                        first = False
+                        try:
+                            self.remote_pid = int(line.decode("ascii", "replace").strip())
+                        except ValueError:
+                            pass
             self._thread = threading.Thread(target=pump, daemon=True)
             self._thread.start()
+            threading.Thread(target=pump_stderr, daemon=True).start()
         else:
             from scapy.all import AsyncSniffer
             self._sniffer = AsyncSniffer(iface=self.iface, store=False,
@@ -141,11 +158,28 @@ class ReportCollector:
             self._sniffer.stop()
             self._sniffer = None
         if self._proc is not None:
-            self._proc.terminate()
-            try:
-                self._proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self._proc.kill()
+            if self.ssh_host:
+                deadline = time.time() + 2.0   # the PID line, if the session has only just started
+                while self.remote_pid is None and self._proc.poll() is None and time.time() < deadline:
+                    time.sleep(0.05)
+            if self.ssh_host and self.remote_pid:
+                # End the capture on the switch; the ssh session then ends by itself.
+                try:
+                    subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", self.ssh_host,
+                                    "kill %d" % self.remote_pid], stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+                try:
+                    self._proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            if self._proc.poll() is None:
+                self._proc.terminate()
+                try:
+                    self._proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self._proc.kill()
             self._proc = None
 
     def take(self, start: float, end: float) -> List[Dict[str, object]]:

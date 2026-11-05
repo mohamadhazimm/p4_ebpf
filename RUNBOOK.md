@@ -77,6 +77,12 @@ Expected: one JSON line with `"tables"` listing the 14 registers, `"missing": []
 `"sync_reg_dir_valid_ms"` of a few ms. A host-side probe that fails (RPC error, missing
 field, `fast_equals_safe: false`) means: use the on-switch placement only.
 
+`"protobuf"` names the client's protobuf package and implementation, e.g.
+`3.6.1/python`: `python` means no C implementation, where the generic protobuf classes
+cost 40-120 us per register entry (Section 10) and the wire-format route is the one to
+use. Probe it with `--raw-wire` as well: expected `"parser": "raw"` and
+`"raw_equals_safe": true` (the module's wire-format parser agrees with the client's).
+
 ## 3. Known answer and idle clearing (bucket 6886)
 
 The 100-packet test connection of `perf/tools/make_test_pcaps.py sanity` lands in bucket
@@ -122,11 +128,20 @@ python3 thesis-hybrid-ebpf-p4/python/batched_reader.py --grpc-addr 172.168.1.2:5
     --bench 100,500,1000,2000,5000,10000,20000 --bench-windows 5 --out perf/results/bench_switch_host.json
 ```
 
+The same table with the wire-format route and the Syncs in one RPC (Section 10):
+
+```sh
+ssh root@172.168.1.2 'python2.7 /root/hazim_perf/tools/batched_reader.py \
+    --bench 100,500,1000,2000,5000,10000,20000 --bench-windows 5 --raw-wire --sync-batched \
+    --out /root/hazim_perf/bench_switch_py27_raw.json'
+```
+
 Each prints the table of the report (`sync ms | read ms | clear ms | total ms |
-us/bucket | fits 0.5 s?`); `--bench-budget` changes the window length, `--safe-parse`
-times the client's own parser instead of the fast one, `--chunk N` the keys per Read,
-`--sync-batched` the 14 Syncs in one Write RPC instead of 14 (worth measuring on the
-switch; see Section 8 for why it is not the default).
+us/bucket | fits 0.5 s?`, with the error count of a size whose reads or clears failed);
+`--bench-budget` changes the window length, `--safe-parse` times the client's own parser
+instead of the fast one, `--raw-wire` the wire-format route, `--chunk N` the keys per
+Read, `--sync-batched` the 14 Syncs in one Write RPC instead of 14 (exact on the switch,
+Section 9; see Section 8 for why it is not the default).
 The sampled buckets are random and are zeroed by the clear: run it on an idle switch
 (the collector resets all registers at the start of a run anyway).
 
@@ -148,13 +163,15 @@ python3 live_test/reader_ab.py --switch-ssh root@172.168.1.2 --cpu-iface enp5s0 
 
 with traffic through the switch meanwhile (e.g. `tcpreplay` of a capture from PC1, or
 the `testers/` through 1/0 -> 2/0). Each window prints `identical`, `traffic between`,
-`MISMATCH` and `only in one` counts and the wall time of both reads. Expected:
-`MISMATCH 0`, `only in one 0`, `dst equal True` in every window. `traffic between`
-rows are buckets whose packet counter differs between the two snapshots (they are
-taken ~1.5 s apart because the legacy read opens a bfshell session; the later snapshot
-has the larger counters, which the script checks): they are the documented case
+`MISMATCH` and `only in one` counts for the flow rows and for the `reg_newconn_dst`
+rows, and the wall time of both reads. Expected: `MISMATCH 0` and `only in one 0` for
+both kinds in every window, verdict `PASS`. `traffic between` rows are buckets whose
+packet counter (connection counter for dst rows) differs between the two snapshots
+(they are taken ~1.5 s apart because the legacy read opens a bfshell session; the later
+snapshot has the larger counters, which the script checks): they are the documented case
 "rows identical except where the two snapshots fall on different sides of a packet
-arrival". The JSON keeps the per-row differences.
+arrival". The JSON keeps the per-row differences. `--raw-wire` and `--sync-batched`
+pass through to the batched reader.
 
 The CSV-level variant: two collector runs of the same replayed capture, one with
 `--reader legacy`, one with `--reader batched`; the `net_*` columns of the two CSVs
@@ -173,15 +190,16 @@ sudo python3 hybrid_collector.py --mode command --scenario-name ab_batched --lab
 `--reader-timing` (or `P4_READER_TIMING=1`) prints one line per window for either reader:
 
 ```
-[TIMING] window 12: reader=batched active=2143 dst=37 sync=41.2 ms read=118.7 ms clear=3.1 ms wall=171.0 ms overhead=8.0 ms cleared=5 rpcs={'sync_rpcs': 1, 'read_rpcs': 15, 'read_entities': 30039, 'clear_rpcs': 1}
+[TIMING] window 12: reader=batched/fast active=2143 dst=37 sync=41.2 ms read=118.7 ms clear=3.1 ms wall=171.0 ms overhead=8.0 ms cleared=5 rpcs={'sync_rpcs': 1, 'read_rpcs': 15, 'read_entities': 30039, 'clear_rpcs': 1}
 ```
 
 `overhead` is wall time minus sync, read and clear: the bfshell session and SSH for the
-legacy reader, the request/answer pipe for the batched one. `--reader-timing-file` keeps
-the same values as JSON lines; `--reader legacy --reader-timing` gives the "before"
-column. `--reader-local --grpc-addr ...` places the batched reader on this host;
-`--reader-chunk`, `--reader-safe-parse`, `--reader-sync-batched`, `--grpc-client-id` and
-`--p4-name` pass through.
+legacy reader, the request/answer pipe for the batched one; `/fast`, `/raw` or `/safe` is
+the batched reader's route. `--reader-timing-file` keeps the same values as JSON lines;
+`--reader legacy --reader-timing` gives the "before" column. `--reader-local --grpc-addr
+...` places the batched reader on this host; `--reader-chunk`, `--reader-safe-parse`,
+`--reader-raw-wire`, `--reader-sync-batched`, `--grpc-client-id` and `--p4-name` pass
+through. For the switch, Section 10 recommends `--reader-raw-wire --reader-sync-batched`.
 
 The default is still `--reader legacy`; switch the default once Sections 3 to 5 have
 passed on the switch.
@@ -238,6 +256,10 @@ Results on this VM (2026-11-05, open-p4studio 9.13.4, model + bf_switchd, Python
 - The probe or bench against the Tofino model is slow (seconds per read): the model's
   bf_switchd serves one register entry in milliseconds and a register sync in seconds;
   only the ASIC's numbers count.
+- `"parser": "fast"` or `"safe"` in the ready line although `--raw-wire` was given: the
+  route disagreed with the client's parser on the first read (logged as
+  `[batched] the raw route disagrees with the client's parser ...`) or the client has no
+  `channel`/field ids. The values are still right, only slower; send the log line.
 
 ## 9. Results on the switch (2026-11-05)
 
@@ -371,14 +393,83 @@ Open items:
    against it, the server's 5 s wait, applies to the model. It is a candidate default for
    the switch.
 3. `live_test/reader_ab.py`: classify dst rows like flow rows (the later read >= the
-   earlier one) and keep them in the JSON.
+   earlier one) and keep them in the JSON. *Done 2026-11-05 (Section 10).*
 4. `tests/test_batched_reader.py`: four tests assume the fast parser and fail where
    `bfruntime_pb2` cannot be imported; skip them there. They are
    `test_rpc_counts_per_window`, `test_safe_parse_and_chunking_give_the_same_windows`,
    `test_reads_come_from_the_synced_snapshot` and `test_one_shot_probe_and_bench_modes`.
+   *Done 2026-11-05: the expectations follow the route in use, so they pass there too.*
 5. `batched_reader.py --bench` does not report a window's `errors`, so a failed clear would
-   show as `clear 0.0 ms`.
+   show as `clear 0.0 ms`. *Done 2026-11-05: errors and cleared counts per size, in the
+   table and the JSON.*
 6. `ReportCollector` with `ssh_host`: `stop()` ends the local ssh only; the tcpdump on the
-   switch keeps running until it captures the next frame.
+   switch keeps running until it captures the next frame. *Done 2026-11-05: the remote
+   shell reports its PID and `stop()` kills it over ssh.*
 7. The host placement is not measured. From the CPU split, a host client that parses at
-   Section 7's rate could cut the per-bucket cost about 3-4x (an estimate).
+   Section 7's rate could cut the per-bucket cost about 3-4x (an estimate). *Section 10
+   measures where the client's time goes and adds a route that does not need the host.*
+
+## 10. Follow-up on this VM (2026-11-05): where the client's time goes, and `--raw-wire`
+
+What Section 9 established: the batched reader returns the legacy reader's data on the
+switch and the collector's counts with it are exact; per window it is 4-5x faster because
+it opens no bfshell session; per bucket it is not faster (1.1-1.55 ms vs 1.14 ms), so a
+0.5 s window holds about 350 active buckets, not the 2,000 of the target. The reader
+process at 90% of a core against bf_switchd at 26% says the time is in the client.
+
+The client-side cost of one register table read and of the clear, measured here on the
+same code paths with 2,000 keys and 2 pipes (`protobuf 4.23.4`, Python 3.10, i7-13620H;
+best of 5):
+
+| step | protobuf with its C implementation (`upb`) | protobuf without it (`python`) | wire format (`--raw-wire`) |
+|---|---|---|---|
+| decode the ReadResponse (per entity) | 2.9 us | 44.2 us | 4.3-4.6 us |
+| build the ReadRequest (per key) | 1.7 us | 41.6 us | 0.1 us |
+| build the clear WriteRequest (per update) | 2.2 us | 120.5 us | 0.1 us |
+
+The `python` column is the client the switch runs (the SDE's Python 2.7 protobuf has no
+C extension unless the probe's `"protobuf"` field says `cpp`): request building and
+response decoding through the generic protobuf classes are what the reader process does
+at 90% of a core. The wire-format route costs the same few microseconds whatever the
+protobuf implementation, with identical output (`tests/test_batched_reader.py`,
+`RawWireTests`: same 120 windows and CSV as the fast route, the request bytes equal the
+protobuf-built requests, the parser decodes server-style responses, and the route falls
+back to the fast one when its self-check fails). Against the real BF Runtime server of
+this VM's model (open-p4studio 9.13.4) the probe reports `raw_equals_safe: true` and
+`p4_known_answer.py --reader batched --raw-wire` passes 19/19, including the clear through
+a raw Write, the zero read-back and the re-report (`live_test/results/ka_batched_raw.json`).
+
+Expected on the switch, to be measured (the switch CPU is about 3x slower than this one
+and bf_switchd's own ~20 us per entry stays): reads about 0.3-0.4 ms per bucket instead
+of 1.1-1.55, clears about 0.3 ms per bucket instead of 0.55-0.75, so a 0.5 s window with
+`--sync-batched` (30 ms) holds about 1,000-1,300 active buckets. 2,000 per 0.5 s stays
+out of reach of a gRPC client because of the server's cost per entry; that is Phase 2's
+case (a C++ bf_rt client in process reads the shadow without gRPC or protobuf).
+
+Commands for the next switch session, after `scp` of the current `batched_reader.py`
+(Section 2):
+
+```sh
+# 1. the client's protobuf implementation and the wire-format self-check (2 lines of JSON)
+ssh root@172.168.1.2 'python2.7 /root/hazim_perf/tools/batched_reader.py --probe --sde-install /root/bf-sde-9.6.0/install'
+ssh root@172.168.1.2 'python2.7 /root/hazim_perf/tools/batched_reader.py --probe --raw-wire --sde-install /root/bf-sde-9.6.0/install'
+# 2. the timing table of Section 4 with the new route (compare with Section 9's)
+ssh root@172.168.1.2 'python2.7 /root/hazim_perf/tools/batched_reader.py --bench 100,500,1000,2000,5000,10000,20000 \
+    --bench-windows 5 --raw-wire --sync-batched --out /root/hazim_perf/bench_switch_py27_raw.json'
+# 3. known answer and idle clearing (Section 3) with --raw-wire added to each command
+# 4. the A/B of Section 5 and the collector of Section 6 with the new route
+python3 live_test/reader_ab.py --switch-ssh root@172.168.1.2 --cpu-iface enp5s0 --windows 20 --window-sec 10 \
+    --raw-wire --sync-batched --out perf/results/reader_ab_switch_raw.json
+sudo python3 hybrid_collector.py ... --reader batched --reader-raw-wire --reader-sync-batched \
+    --reader-timing --reader-timing-file timing_batched_raw.jsonl
+```
+
+If 1 shows `raw_equals_safe: true` and 2-4 pass, the collector's switch defaults become
+`--reader batched --reader-raw-wire --reader-sync-batched`.
+
+Also done on this VM: `live_test/reader_ab.py` classifies the `reg_newconn_dst` rows like
+the flow rows (`dst_counts`, `dst_diffs`, verdict without the "dst equal" condition);
+`batched_reader.py --bench` reports errors and cleared counts; the four tests pass without
+`bfruntime_pb2`; `ReportCollector.stop()` ends the tcpdump on the switch; the probe and the
+ready line report `protobuf` and `parser`; `--reader-timing` prints the route
+(`reader=batched/raw`).

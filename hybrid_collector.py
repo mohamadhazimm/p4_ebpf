@@ -544,7 +544,8 @@ class BatchedReaderProcess:
                  client_id: int = 7, p4_name: str = "basic", switch_ssh: Optional[str] = None,
                  remote_sde_install: str = DEFAULT_REMOTE_SDE_INSTALL, chunk: int = 4096,
                  safe_parse: bool = False, strict: bool = False, sync_batched: bool = False,
-                 start_timeout: float = 90.0, extra_args: Optional[List[str]] = None, echo: bool = True):
+                 raw_wire: bool = False, start_timeout: float = 90.0, extra_args: Optional[List[str]] = None,
+                 echo: bool = True):
         self.script = script
         self.grpc_addr = grpc_addr
         self.client_id = client_id
@@ -555,6 +556,7 @@ class BatchedReaderProcess:
         self.safe_parse = safe_parse
         self.strict = strict
         self.sync_batched = sync_batched
+        self.raw_wire = raw_wire
         self.start_timeout = start_timeout
         self.extra_args = list(extra_args or [])
         self.echo = echo
@@ -571,6 +573,8 @@ class BatchedReaderProcess:
             args.append("--safe-parse")
         if self.sync_batched:
             args.append("--sync-batched")
+        if self.raw_wire:
+            args.append("--raw-wire")
         if self.strict:
             args.append("--strict-core-registers")
         return args + self.extra_args
@@ -716,13 +720,15 @@ def make_timing_logger(reader_name: str, path: Optional[str] = None) -> Callable
         clear_ms = float(timing.get("clear_ms", clear_s * 1000.0))
         overhead_ms = wall_ms - sync_ms - read_ms - clear_ms
         rpcs = {k: timing[k] for k in ("sync_rpcs", "read_rpcs", "read_entities", "clear_rpcs") if k in timing}
-        record = {"window": window, "reader": reader_name, "active": n_active, "dst": n_dst,
+        parser = timing.get("parser")   # batched reader: raw / fast / safe
+        record = {"window": window, "reader": reader_name, "parser": parser, "active": n_active, "dst": n_dst,
                   "snapshot": payload.get("snapshot"), "sync_ms": round(sync_ms, 3), "read_ms": round(read_ms, 3),
                   "clear_ms": round(clear_ms, 3), "wall_ms": round(wall_ms, 3), "overhead_ms": round(overhead_ms, 3),
                   "us_per_bucket": round(wall_ms * 1000.0 / n_active, 1) if n_active else None,
                   "cleared": len(payload.get("cleared") or []), "errors": len(payload.get("errors") or []),
                   "rpcs": rpcs}
-        print(f"[TIMING] window {window}: reader={reader_name} active={n_active} dst={n_dst} "
+        print(f"[TIMING] window {window}: reader={reader_name}{'/' + parser if parser else ''} "
+              f"active={n_active} dst={n_dst} "
               f"sync={sync_ms:.1f} ms read={read_ms:.1f} ms clear={clear_ms:.1f} ms wall={wall_ms:.1f} ms "
               f"overhead={overhead_ms:.1f} ms cleared={record['cleared']}"
               + (f" rpcs={rpcs}" if rpcs else ""), flush=True)
@@ -1327,6 +1333,10 @@ def main() -> None:
                     help="batched reader: parse responses with the client's to_dict() only (slower)")
     ap.add_argument("--reader-sync-batched", action="store_true",
                     help="batched reader: the 14 register Syncs in one Write RPC instead of one per table")
+    ap.add_argument("--reader-raw-wire", action="store_true",
+                    help="batched reader: byte templates and a wire-format parser instead of the protobuf classes "
+                         "per entity (for a client without the C protobuf implementation, such as the SDE 9.6 "
+                         "one on the switch; checked against the client's parser on the first read)")
     ap.add_argument("--remote-sde-install", default=DEFAULT_REMOTE_SDE_INSTALL,
                     help="SDE install on the switch (--switch-ssh)")
     ap.add_argument("--reader-timing", action="store_true",
@@ -1421,7 +1431,8 @@ def main() -> None:
                 args.batched_reader, grpc_addr=args.grpc_addr, client_id=args.grpc_client_id, p4_name=args.p4_name,
                 switch_ssh=None if args.reader_local else args.switch_ssh,
                 remote_sde_install=args.remote_sde_install, chunk=args.reader_chunk,
-                safe_parse=args.reader_safe_parse, sync_batched=args.reader_sync_batched)
+                safe_parse=args.reader_safe_parse, sync_batched=args.reader_sync_batched,
+                raw_wire=args.reader_raw_wire)
             ready = batched_reader.start()
             print(f"[INFO] batched gRPC reader ready: {json.dumps(ready)}")
 

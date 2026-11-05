@@ -43,6 +43,11 @@ from read_registers_with_index import INNER_TEMPLATE, build_inner_script  # noqa
 
 COMPARE_KEYS = ("flow_count", "snapshot", "errors", "dst_rows", "cleared", "rows")
 M32 = 1 << 32
+# The generated bfruntime_pb2 is what the fast and raw routes need; where it is
+# not importable (a host without an SDE), the reader runs the safe route and the
+# first read of a run makes no self-check (2 Read RPCs on a sample otherwise).
+HAS_PB2 = bfrt_mock.bfruntime_pb2 is not None
+SELF_CHECK_RPCS = 2 if HAS_PB2 else 0
 
 
 def run_legacy(switch, indexes, dst_indexes=(), clear_if_unchanged=None, snapshot="sync", strict=True):
@@ -57,12 +62,13 @@ def run_legacy(switch, indexes, dst_indexes=(), clear_if_unchanged=None, snapsho
     return json.loads(lines[-1])
 
 
-def make_batched(switch, fast=True, chunk=4096, strict=True, addr="mock:1", sync_batched=False, client_id=7):
+def make_batched(switch, fast=True, chunk=4096, strict=True, addr="mock:1", sync_batched=False, client_id=7,
+                 raw=False):
     bfrt_mock.serve(switch, addr)
     iface, info, bound = batched_reader.connect(bfrt_mock, addr, client_id, 0, "basic", bind=True)
     return batched_reader.BatchedRegisterReader(bfrt_mock, iface, info, p4_name="basic", strict=strict,
                                                 chunk=chunk, fast=fast, sync_batched=sync_batched,
-                                                p4_name_in_requests=not bound)
+                                                p4_name_in_requests=not bound, raw=raw)
 
 
 def run_batched(reader, indexes, dst_indexes=(), clear_if_unchanged=None, snapshot="sync"):
@@ -399,19 +405,23 @@ class EquivalenceTests(unittest.TestCase):
         # Batched: one Sync write per table, 14 (+1) Reads, one clear write per window.
         windows_with_active = sum(1 for w in win_b if w["active_indexes"])
         windows_with_clears = sum(1 for w in win_b if w["cleared_indexes"])
-        self.assertEqual(sw_b.stats["read_rpcs"], 14 * windows_with_active + windows_with_dst + 2)  # +2: self-check
+        self.assertEqual(sw_b.stats["read_rpcs"], 14 * windows_with_active + windows_with_dst + SELF_CHECK_RPCS)
         first_active = next(len(w["active_indexes"]) for w in win_b if w["active_indexes"])
-        self.assertEqual(sw_b.stats["read_entities"], 14 * active_cells + dst_cells + 2 * min(4, first_active))
+        self.assertEqual(sw_b.stats["read_entities"],
+                         14 * active_cells + dst_cells + SELF_CHECK_RPCS * min(4, first_active))
         self.assertEqual(sw_b.stats["sync_ops"], 14 * len(win_b) + windows_with_dst)
-        self.assertEqual(sw_b.stats["write_rpcs"], 14 * len(win_b) + windows_with_dst + windows_with_clears)
+        # One clear Write per window on the fast route; the safe route's entry_mod() makes one per table.
+        clear_writes = windows_with_clears if HAS_PB2 else 14 * windows_with_clears
+        self.assertEqual(sw_b.stats["write_rpcs"], 14 * len(win_b) + windows_with_dst + clear_writes)
         self.assertEqual(sw_b.stats["write_updates"], 14 * sum(len(w["cleared_indexes"]) for w in win_b))
         self.assertEqual(sw_b.stats["read_from_hw"], 0)
-        # --sync-batched: the 14 (+1) Syncs of a window in one Write.
+        # --sync-batched: the 14 (+1) Syncs of a window in one Write (it needs the protobuf module).
         sw_s, win_s, _, csv_s, _ = run_pass(batched_factory(sync_batched=True),
                                             lambda sw: Scenario(sw, 1, self.N_WINDOWS), self.N_WINDOWS)
         self.assertEqual(self.strip(win_s), self.strip(win_b))
         self.assertEqual(sw_s.stats["sync_ops"], sw_b.stats["sync_ops"])
-        self.assertEqual(sw_s.stats["write_rpcs"], len(win_s) + windows_with_clears)
+        self.assertEqual(sw_s.stats["write_rpcs"],
+                         len(win_s) + windows_with_clears if HAS_PB2 else sw_b.stats["write_rpcs"])
 
     def test_safe_parse_and_chunking_give_the_same_windows(self):
         (_, win_fast, _, csv_fast, _), (_, win_safe, _, csv_safe, _) = (
@@ -424,7 +434,7 @@ class EquivalenceTests(unittest.TestCase):
         self.assertEqual(self.strip(win_fast), self.strip(win_c))
         expected_rpcs = sum(14 * -(-len(w["active_indexes"]) // 7) + -(-len(w["active_dst_indexes"]) // 7)
                             for w in win_c)
-        self.assertEqual(sw_c.stats["read_rpcs"], expected_rpcs + 2)  # +2: the fast path's one-time self-check
+        self.assertEqual(sw_c.stats["read_rpcs"], expected_rpcs + SELF_CHECK_RPCS)
 
 
 class IdleClearingTests(unittest.TestCase):
@@ -506,7 +516,7 @@ class VariantTests(unittest.TestCase):
         self.assertEqual(run_batched(reader, [KNOWN_IDX], snapshot="hw")["rows"][0]["pkts"], 101)
         # Without a sync the shadow still holds the previous snapshot, as on the switch.
         tbl = reader.tables["reg_pkts"]
-        self.assertEqual(reader._read_fast(tbl, [KNOWN_IDX], False, dict(read_rpcs=0, read_entities=0)),
+        self.assertEqual(reader._read_table(tbl, [KNOWN_IDX], False, dict(read_rpcs=0, read_entities=0)),
                          {KNOWN_IDX: [0, 100]})
         self.assertEqual(run_batched(reader, [KNOWN_IDX])["rows"][0]["pkts"], 101)
 
@@ -559,7 +569,8 @@ class VariantTests(unittest.TestCase):
         self.assertEqual((record["window"], record["reader"], record["active"], record["cleared"]), (3, "batched", 1, 1))
         self.assertAlmostEqual(record["wall_ms"], 250.0)
         self.assertEqual(record["rpcs"]["read_rpcs"], 14)
-        self.assertIn("[TIMING] window 3: reader=batched active=1", out.getvalue())
+        self.assertEqual(record["parser"], payload["timing"]["parser"])
+        self.assertIn("[TIMING] window 3: reader=batched/%s active=1" % payload["timing"]["parser"], out.getvalue())
         # The legacy payload has no "timing": its sync_s/read_s/clear_s are used.
         legacy = run_legacy(sw, [KNOWN_IDX])
         with contextlib.redirect_stdout(io.StringIO()) as out:
@@ -630,8 +641,19 @@ class ServeProtocolTests(unittest.TestCase):
                                capture_output=True, text=True, env=env, timeout=60)
         self.assertEqual(probe.returncode, 0, probe.stderr)
         result = json.loads(probe.stdout.strip().splitlines()[-1])
-        self.assertTrue(result["fast_equals_safe"])
         self.assertEqual(result["pipes"], 2)
+        self.assertIn(result["parser"], ("fast", "safe"))   # fast where the subprocess imports bfruntime_pb2
+        if result["parser"] == "fast":
+            self.assertTrue(result["fast_equals_safe"])
+            self.assertIn("/", result["protobuf"])
+        probe = subprocess.run([sys.executable, self.script, "--mock-cells", self.cells, "--probe", "--raw-wire"],
+                               capture_output=True, text=True, env=env, timeout=60)
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        result = json.loads(probe.stdout.strip().splitlines()[-1])
+        self.assertIn(result["parser"], ("raw", "safe"))
+        if result["parser"] == "raw":
+            self.assertTrue(result["raw_equals_safe"])
+            self.assertEqual(result["raw_read"], result["safe_read"])
         out = os.path.join(self.dir.name, "bench.json")
         bench = subprocess.run([sys.executable, self.script, "--mock-cells", self.cells, "--bench", "10,50",
                                 "--bench-windows", "2", "--out", out], capture_output=True, text=True, env=env,
@@ -640,7 +662,148 @@ class ServeProtocolTests(unittest.TestCase):
         table = json.loads(Path(out).read_text())["results"]
         self.assertEqual([r["active"] for r in table], [10, 50])
         self.assertEqual(table[1]["read_rpcs"], 14)
+        self.assertEqual((table[1]["errors"], table[1]["cleared"]), (0, 100))   # 2 windows x 50 buckets cleared
         self.assertIn("| 50 |", bench.stdout)
+
+
+@unittest.skipUnless(HAS_PB2, "the raw route needs the generated bfruntime_pb2")
+class RawWireTests(unittest.TestCase):
+    """--raw-wire: byte templates for the requests, the wire-format parser for
+    the responses; the same windows, rows and CSV as the fast route."""
+
+    def test_known_answer_bucket_6886_through_the_raw_route(self):
+        sw = play_known_answer(bfrt_mock.MockSwitch())
+        raw = run_batched(make_batched(sw, raw=True), [KNOWN_IDX])
+        self.assertEqual(raw["timing"]["parser"], "raw")
+        self.assertEqual({k: raw["rows"][0][k] for k in KNOWN_ROW}, KNOWN_ROW)
+        self.assertEqual(comparable(raw), comparable(run_legacy(sw, [KNOWN_IDX])))
+        # 14 tables through the channel, plus the self-check: one raw and one safe read of the sample.
+        self.assertEqual((sw.stats["read_rpcs"], sw.stats["raw_read_rpcs"]), (16, 15))
+
+    def test_raw_route_gives_the_same_windows_and_csv_as_the_fast_route(self):
+        n = EquivalenceTests.N_WINDOWS
+        sw_f, win_f, _, csv_f, _ = run_pass(batched_factory(fast=True), lambda sw: Scenario(sw, 1, n), n)
+        sw_r, win_r, _, csv_r, _ = run_pass(batched_factory(raw=True), lambda sw: Scenario(sw, 1, n), n)
+        self.assertEqual(EquivalenceTests.strip(win_f), EquivalenceTests.strip(win_r))
+        self.assertEqual(csv_f, csv_r)
+        self.assertEqual(sw_r.stats["read_entities"], sw_f.stats["read_entities"])
+        self.assertEqual(sw_r.stats["write_updates"], sw_f.stats["write_updates"])
+        # Every Read but the self-check's safe one went as bytes; so did every clear.
+        self.assertEqual(sw_r.stats["raw_read_rpcs"], sw_r.stats["read_rpcs"] - 1)
+        windows_with_clears = sum(1 for w in win_r if w["cleared_indexes"])
+        self.assertGreater(windows_with_clears, 0)
+        self.assertEqual(sw_r.stats["raw_write_rpcs"], windows_with_clears)
+        sw_c, win_c, _, csv_c, _ = run_pass(batched_factory(raw=True, chunk=7), lambda sw: Scenario(sw, 1, n), n)
+        self.assertEqual(EquivalenceTests.strip(win_f), EquivalenceTests.strip(win_c))
+        self.assertEqual(csv_f, csv_c)
+
+    def test_wire_parser_decodes_a_server_style_response(self):
+        pb2 = bfrt_mock.bfruntime_pb2
+        rsp = pb2.ReadResponse()
+        rsp.status.add()                                      # unknown to the parser: skipped
+        te = rsp.entities.add().table_entry                   # one DataField per pipe, as the server sends
+        te.table_id = 1000
+        te.is_default_entry = True                            # a field the parser does not look at
+        kf = te.key.fields.add()
+        kf.field_id = 1
+        kf.exact.value = batched_reader.int_to_bytes(KNOWN_IDX, 4)
+        for v in (0, 100):
+            df = te.data.fields.add()
+            df.field_id = 1
+            df.stream = batched_reader.int_to_bytes(v, 4)
+        other = te.data.fields.add()                          # another data field: ignored
+        other.field_id = 2
+        other.stream = b"\x07"
+        te = rsp.entities.add().table_entry                   # 16-bit register, two pipes
+        te.table_id = 1004
+        kf = te.key.fields.add()
+        kf.field_id = 1
+        kf.exact.value = batched_reader.int_to_bytes(5, 4)
+        for v in (40001, 0):
+            df = te.data.fields.add()
+            df.field_id = 1
+            df.stream = batched_reader.int_to_bytes(v, 2)
+        te = rsp.entities.add().table_entry                   # a client that squashes the pipes: int_arr_val
+        te.table_id = 1000
+        kf = te.key.fields.add()
+        kf.field_id = 1
+        kf.exact.value = batched_reader.int_to_bytes(65535, 4)
+        df = te.data.fields.add()
+        df.field_id = 1
+        df.int_arr_val.val.extend([3, 4])
+        rsp.entities.add().table_operation.table_id = 1000    # not a table entry: skipped
+        out = {}
+        self.assertEqual(batched_reader.parse_read_response(rsp.SerializeToString(), 1, out), 3)
+        self.assertEqual(out, {KNOWN_IDX: [0, 100], 5: [40001, 0], 65535: [3, 4]})
+        self.assertEqual(batched_reader.parse_read_response(rsp.SerializeToString(), 9, {}), 0)
+
+    def test_request_templates_equal_the_protobuf_requests(self):
+        pb2 = bfrt_mock.bfruntime_pb2
+        reader = make_batched(play_known_answer(bfrt_mock.MockSwitch()), raw=True)
+        idxs = [1, KNOWN_IDX, 65535]
+        for t in (reader.tables["reg_pkts"], reader.tables["reg_ref_src_port"], reader.dst_table):
+            for from_hw in (False, True):
+                head, tail = t.raw_read_entity(pb2, from_hw)
+                raw = reader._raw_head(pb2.ReadRequest) + b"".join(head + t.pack_key(i) + tail for i in idxs)
+                want = pb2.ReadRequest()
+                reader._fill_target(want)
+                want.client_id = 7
+                for i in idxs:
+                    te = want.entities.add().table_entry
+                    te.table_id = t.table_id
+                    te.table_flags.from_hw = from_hw
+                    kf = te.key.fields.add()
+                    kf.field_id = t.key_id
+                    kf.exact.value = batched_reader.int_to_bytes(i, t.key_size)
+                self.assertEqual(pb2.ReadRequest.FromString(raw), want)
+            head, tail = t.raw_clear_update(pb2)
+            raw = reader._raw_head(pb2.WriteRequest) + b"".join(head + t.pack_key(i) + tail for i in idxs)
+            want = pb2.WriteRequest()
+            reader._fill_target(want)
+            want.client_id = 7
+            for i in idxs:
+                upd = want.updates.add()
+                upd.type = pb2.Update.MODIFY
+                te = upd.entity.table_entry
+                te.table_id = t.table_id
+                kf = te.key.fields.add()
+                kf.field_id = t.key_id
+                kf.exact.value = batched_reader.int_to_bytes(i, t.key_size)
+                df = te.data.fields.add()
+                df.field_id = t.data_id
+                df.stream = batched_reader.int_to_bytes(0, t.data_size)
+            self.assertEqual(pb2.WriteRequest.FromString(raw), want)
+
+    def test_raw_route_falls_back_when_the_wire_parser_disagrees(self):
+        sw = play_known_answer(bfrt_mock.MockSwitch())
+        reader = make_batched(sw, raw=True)
+        original = batched_reader.parse_read_response
+        batched_reader.parse_read_response = lambda wire, data_id, out: 0
+        try:
+            payload = run_batched(reader, [KNOWN_IDX])
+        finally:
+            batched_reader.parse_read_response = original
+        self.assertEqual((reader.raw, reader.route()), (False, "fast"))
+        self.assertEqual({k: payload["rows"][0][k] for k in KNOWN_ROW}, KNOWN_ROW)
+        self.assertEqual(payload["errors"], [])
+        self.assertEqual(payload["timing"]["parser"], "raw")   # the route when the window began
+        self.assertEqual(run_batched(reader, [KNOWN_IDX])["timing"]["parser"], "fast")
+
+
+class ReaderAbTests(unittest.TestCase):
+    def test_flow_and_dst_rows_of_the_two_readers_are_classified(self):
+        from live_test.reader_ab import compare_dst_rows, compare_rows
+        a = dict(KNOWN_ROW)
+        later = dict(a, pkts=101, bytes=32480, ack=99, bpp=1.0)   # a packet arrived between the two reads
+        self.assertEqual(compare_rows(a, a, True), ("identical", {}))
+        self.assertEqual(compare_rows(a, later, True)[0], "traffic between")
+        self.assertEqual(compare_rows(later, a, True)[0], "MISMATCH")            # the later read is smaller
+        self.assertEqual(compare_rows(a, dict(a, syn=3), True)[0], "MISMATCH")   # same pkts, a field differs
+        d = {"idx": 55719, "new_conn": 3, "pipes": [1]}
+        self.assertEqual(compare_dst_rows(d, d, True), ("identical", {}))
+        self.assertEqual(compare_dst_rows(d, dict(d, new_conn=5), True)[0], "traffic between")
+        self.assertEqual(compare_dst_rows(dict(d, new_conn=5), d, True)[0], "MISMATCH")
+        self.assertEqual(compare_dst_rows(d, dict(d, pipes=[0, 1]), True)[0], "MISMATCH")
 
 
 if __name__ == "__main__":

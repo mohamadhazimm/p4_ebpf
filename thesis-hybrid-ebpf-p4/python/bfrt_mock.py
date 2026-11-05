@@ -87,6 +87,7 @@ class MockSwitch(object):
         self.table_ids = dict((n, 1000 + i) for i, n in enumerate(self.registers))
         self.stats = {"sync_rpcs": 0, "sync_ops": 0, "read_rpcs": 0, "read_entities": 0,
                       "read_from_hw": 0, "write_rpcs": 0, "write_updates": 0,
+                      "raw_read_rpcs": 0, "raw_write_rpcs": 0,   # of the above, those sent as bytes (--raw-wire)
                       "legacy_gets": 0, "legacy_syncs": 0, "legacy_mods": 0}
         self.hang_on = 0          # tests: hang on this Read RPC ...
         self.hang_marker = None   # ... only once, recorded in this file
@@ -449,6 +450,43 @@ class _BfRtInfo(object):
         return self.p4_name
 
 
+class _Channel(object):
+    """The two grpc.Channel calls the reader's --raw-wire route makes: bytes
+    in, bytes out, served by the same MockSwitch handlers as the stub."""
+
+    def __init__(self, switch, client_id):
+        self.switch = switch
+        self.client_id = client_id
+
+    def unary_stream(self, method, request_serializer=None, response_deserializer=None):
+        if not method.endswith("/Read"):
+            raise ValueError("unexpected method %s" % method)
+
+        def call(request, timeout=None, metadata=None):
+            req = bfruntime_pb2.ReadRequest.FromString(request)
+            if req.client_id != self.client_id:
+                raise RuntimeError("raw Read without the client id (%r)" % req.client_id)
+            self.switch.stats["raw_read_rpcs"] += 1
+            for rsp in self.switch.rpc_read(req):
+                yield rsp.SerializeToString()
+        return call
+
+    def unary_unary(self, method, request_serializer=None, response_deserializer=None):
+        if not method.endswith("/Write"):
+            raise ValueError("unexpected method %s" % method)
+
+        def call(request, timeout=None, metadata=None):
+            req = bfruntime_pb2.WriteRequest.FromString(request)
+            if req.client_id != self.client_id:
+                raise RuntimeError("raw Write without the client id (%r)" % req.client_id)
+            self.switch.stats["raw_write_rpcs"] += 1
+            return self.switch.rpc_write(req).SerializeToString()
+        return call
+
+    def close(self):
+        pass
+
+
 class ClientInterface(object):
     def __init__(self, grpc_addr, client_id, device_id, notifications=None, timeout=1, num_tries=5,
                  perform_subscribe=True):
@@ -460,6 +498,7 @@ class ClientInterface(object):
         self.device_id = device_id
         self.is_independent = not perform_subscribe
         self.reader_writer_interface = _ReaderWriter(switch, client_id)
+        self.channel = _Channel(switch, client_id) if bfruntime_pb2 is not None else None
         self.bound = None
         self.torn_down = False
 

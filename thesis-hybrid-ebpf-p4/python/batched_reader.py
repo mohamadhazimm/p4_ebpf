@@ -34,11 +34,26 @@ so the payload has the same keys, the same values and the same row order:
 "timing" is new (per-window instrumentation: milliseconds per phase and RPC
 counts); hybrid_collector.py prints it with --reader-timing.
 
-Two ways to read the entries of a Read response: the documented client route
-(entry_get() -> _Data/_Key objects -> to_dict(); --safe-parse) and a fast
-route that builds the ReadRequest and walks the protobuf response directly
-(default). The fast route checks itself against the client route on the first
-read of a run and falls back to it if they disagree.
+Three routes between the key lists and the per-pipe values:
+
+  safe  (--safe-parse)  the documented client route: entry_get() -> _Key/_Data
+                        objects -> to_dict(); entry_mod() for the clears;
+  fast  (default)       ReadRequest/WriteRequest built with the generated
+                        protobuf classes, the ReadResponse walked directly,
+                        without the client's objects;
+  raw   (--raw-wire)    requests joined from per-table byte templates (one
+                        entity serialized once by the protobuf classes, the key
+                        bytes substituted) and responses decoded by the
+                        wire-format parser of this module: the protobuf classes
+                        are not used per entity. The SDE 9.6 client on the
+                        switch runs protobuf without its C implementation,
+                        where the generic classes cost 40-120 us per entity
+                        (RUNBOOK.md Sections 9-10); the raw route costs a few
+                        us whatever the implementation.
+
+The fast and raw routes compare themselves with the safe route on the first
+read of a run (--probe reports the comparison) and fall back to it if they
+disagree.
 
 Runs under Python 2.7 and 3: on the switch with the SDE 9.6 client
 (/root/bf-sde-9.6.0/install/lib/python2.7/site-packages, python2.7) or on the
@@ -67,6 +82,7 @@ import inspect
 import json
 import os
 import random
+import struct
 import sys
 import time
 from collections import OrderedDict
@@ -86,6 +102,7 @@ DEFAULT_GRPC_ADDR = "127.0.0.1:50052"
 DEFAULT_CLIENT_ID = 7
 DEFAULT_CHUNK = 4096
 SDE_INSTALL_CANDIDATES = ["/root/bf-sde-9.6.0/install", "/home/ubuntu/open-p4studio/install"]
+RPC_SERVICE = "bfrt_proto.BfRuntime"   # the gRPC service of bfruntime.proto (--raw-wire calls it directly)
 
 
 def log(msg):
@@ -186,6 +203,199 @@ def accepts_kwarg(func, name):
         return False
 
 
+def protobuf_info():
+    """'<version>/<implementation>' of the protobuf package in use; the pure
+    'python' implementation is what makes the fast route slow on the switch."""
+    try:
+        import google.protobuf
+        from google.protobuf.internal import api_implementation
+        return "%s/%s" % (getattr(google.protobuf, "__version__", "?"), api_implementation.Type())
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------------------------
+# Wire format (--raw-wire): byte templates for the requests, a parser for the
+# ReadResponse. Field numbers from bfruntime.proto: ReadResponse.entities 1,
+# Entity.table_entry 1, TableEntry.key 2 / data 3, TableKey.fields 1,
+# KeyField.exact 2, Exact.value 1, TableData.fields 2, DataField.field_id 1 /
+# stream 2 / int_arr_val 5, IntArray.val 1. Unknown fields are skipped.
+
+def encode_varint(n):
+    out = bytearray()
+    while n >= 0x80:
+        out.append((n & 0x7F) | 0x80)
+        n >>= 7
+    out.append(n)
+    return bytes(out)
+
+
+def key_packer(size):
+    """bucket index -> big-endian key bytes of the table's key size."""
+    fmt = {1: ">B", 2: ">H", 4: ">I", 8: ">Q"}.get(size)
+    if fmt:
+        return lambda idx: struct.pack(fmt, idx)
+    return lambda idx: int_to_bytes(idx, size)
+
+
+def field_tag(msg_class, field_name):
+    """Tag bytes of a length-delimited field of a generated message class."""
+    return encode_varint((msg_class.DESCRIPTOR.fields_by_name[field_name].number << 3) | 2)
+
+
+def locate_key(build, key_size):
+    """build(key_bytes) -> serialized message. Returns (head, tail) around the
+    key bytes, found by serializing with two different placeholder keys."""
+    a = build(bytes(bytearray([0xA5] * key_size)))
+    b = build(bytes(bytearray([0x5A] * key_size)))
+    diff = [i for i in range(min(len(a), len(b))) if a[i:i + 1] != b[i:i + 1]]
+    if len(a) != len(b) or len(diff) != key_size or diff[-1] - diff[0] + 1 != key_size:
+        raise RuntimeError("could not locate the key bytes in the serialized entity")
+    return a[:diff[0]], a[diff[0] + key_size:]
+
+
+def _varint(buf, pos):
+    b = buf[pos]
+    if b < 0x80:
+        return b, pos + 1
+    result = b & 0x7F
+    shift = 7
+    pos += 1
+    while True:
+        b = buf[pos]
+        pos += 1
+        result |= (b & 0x7F) << shift
+        if b < 0x80:
+            return result, pos
+        shift += 7
+
+
+def _skip(buf, pos, wire_type):
+    if wire_type == 0:
+        while buf[pos] >= 0x80:
+            pos += 1
+        return pos + 1
+    if wire_type == 2:
+        ln, pos = _varint(buf, pos)
+        return pos + ln
+    if wire_type == 1:
+        return pos + 8
+    if wire_type == 5:
+        return pos + 4
+    raise ValueError("unsupported wire type %d" % wire_type)
+
+
+def _to_int(buf, pos, end):
+    n = 0
+    for i in range(pos, end):
+        n = (n << 8) | buf[i]
+    return n
+
+
+def parse_read_response(wire, data_id, out):
+    """Decode one serialized ReadResponse into out[idx] = per-pipe values of
+    the data field data_id (one DataField per pipe with `stream` bytes, as the
+    BF Runtime server sends, or one int_arr_val). Returns the entries added."""
+    buf = bytearray(wire)
+    n = len(buf)
+    pos = 0
+    added = 0
+    while pos < n:
+        tag, pos = _varint(buf, pos)
+        if tag != 0x0A:                                  # ReadResponse.entities
+            pos = _skip(buf, pos, tag & 7)
+            continue
+        ln, pos = _varint(buf, pos)
+        ent_end = pos + ln
+        idx = None
+        vals = []
+        while pos < ent_end:                             # Entity
+            tag, pos = _varint(buf, pos)
+            if tag != 0x0A:                              # Entity.table_entry
+                pos = _skip(buf, pos, tag & 7)
+                continue
+            ln, pos = _varint(buf, pos)
+            te_end = pos + ln
+            while pos < te_end:                          # TableEntry
+                tag, pos = _varint(buf, pos)
+                if tag == 0x12:                          # key
+                    ln, pos = _varint(buf, pos)
+                    k_end = pos + ln
+                    while pos < k_end:                   # TableKey.fields
+                        tag, pos = _varint(buf, pos)
+                        if tag != 0x0A:
+                            pos = _skip(buf, pos, tag & 7)
+                            continue
+                        ln, pos = _varint(buf, pos)
+                        kf_end = pos + ln
+                        while pos < kf_end:              # KeyField
+                            tag, pos = _varint(buf, pos)
+                            if tag == 0x12:              # exact
+                                ln, pos = _varint(buf, pos)
+                                ex_end = pos + ln
+                                while pos < ex_end:      # Exact.value
+                                    tag, pos = _varint(buf, pos)
+                                    if tag == 0x0A:
+                                        ln, pos = _varint(buf, pos)
+                                        idx = _to_int(buf, pos, pos + ln)
+                                        pos += ln
+                                    else:
+                                        pos = _skip(buf, pos, tag & 7)
+                            else:
+                                pos = _skip(buf, pos, tag & 7)
+                elif tag == 0x1A:                        # data
+                    ln, pos = _varint(buf, pos)
+                    d_end = pos + ln
+                    while pos < d_end:                   # TableData
+                        tag, pos = _varint(buf, pos)
+                        if tag != 0x12:                  # TableData.fields
+                            pos = _skip(buf, pos, tag & 7)
+                            continue
+                        ln, pos = _varint(buf, pos)
+                        df_end = pos + ln
+                        fid = None
+                        val = None
+                        arr = None
+                        while pos < df_end:              # DataField
+                            tag, pos = _varint(buf, pos)
+                            if tag == 0x08:              # field_id
+                                fid, pos = _varint(buf, pos)
+                            elif tag == 0x12:            # stream
+                                ln, pos = _varint(buf, pos)
+                                val = _to_int(buf, pos, pos + ln)
+                                pos += ln
+                            elif tag == 0x2A:            # int_arr_val
+                                ln, pos = _varint(buf, pos)
+                                ia_end = pos + ln
+                                arr = []
+                                while pos < ia_end:      # IntArray.val, packed or not
+                                    tag, pos = _varint(buf, pos)
+                                    if tag == 0x08:
+                                        x, pos = _varint(buf, pos)
+                                        arr.append(x)
+                                    elif tag == 0x0A:
+                                        ln, pos = _varint(buf, pos)
+                                        p_end = pos + ln
+                                        while pos < p_end:
+                                            x, pos = _varint(buf, pos)
+                                            arr.append(x)
+                                    else:
+                                        pos = _skip(buf, pos, tag & 7)
+                            else:
+                                pos = _skip(buf, pos, tag & 7)
+                        if fid == data_id:
+                            if val is not None:
+                                vals.append(val)
+                            elif arr:
+                                vals.extend(arr)
+                else:
+                    pos = _skip(buf, pos, tag & 7)
+        if idx is not None and vals:
+            out[idx] = vals
+            added += 1
+    return added
+
+
 # --------------------------------------------------------------------------
 # Client import (real SDE client or the mock).
 
@@ -270,6 +480,8 @@ class RegisterTable(object):
             self.data_size = tbl.info.data_field_size_get(self.data_name)[0]
         except Exception:
             self.data_size = 4
+        self.pack_key = key_packer(self.key_size)
+        self.templates = {}   # --raw-wire: (head, tail) bytes around the key of one serialized entity
         self.sync_op = None
         try:
             ops = list(tbl.info.operations_supported_get() or [])
@@ -280,12 +492,53 @@ class RegisterTable(object):
                 self.sync_op = op
                 break
 
+    def raw_read_entity(self, pb2, from_hw):
+        """(head, tail) of one serialized ReadRequest.entities element of this table."""
+        key = ("read", bool(from_hw))
+        if key not in self.templates:
+            tag = field_tag(pb2.ReadRequest, "entities")
+
+            def build(k):
+                ent = pb2.Entity()
+                te = ent.table_entry
+                te.table_id = self.table_id
+                te.table_flags.from_hw = bool(from_hw)
+                kf = te.key.fields.add()
+                kf.field_id = self.key_id
+                kf.exact.value = k
+                body = ent.SerializeToString()
+                return tag + encode_varint(len(body)) + body
+            self.templates[key] = locate_key(build, self.key_size)
+        return self.templates[key]
+
+    def raw_clear_update(self, pb2):
+        """(head, tail) of one serialized WriteRequest.updates element zeroing this register."""
+        if "clear" not in self.templates:
+            tag = field_tag(pb2.WriteRequest, "updates")
+            zero = int_to_bytes(0, self.data_size)
+
+            def build(k):
+                upd = pb2.Update()
+                upd.type = pb2.Update.MODIFY
+                te = upd.entity.table_entry
+                te.table_id = self.table_id
+                kf = te.key.fields.add()
+                kf.field_id = self.key_id
+                kf.exact.value = k
+                df = te.data.fields.add()
+                df.field_id = self.data_id
+                df.stream = zero
+                body = upd.SerializeToString()
+                return tag + encode_varint(len(body)) + body
+            self.templates["clear"] = locate_key(build, self.key_size)
+        return self.templates["clear"]
+
 
 class BatchedRegisterReader(object):
     """read_window(): one snapshot of the active buckets, legacy payload."""
 
     def __init__(self, gc, iface, info, p4_name="basic", strict=False, chunk=DEFAULT_CHUNK,
-                 fast=True, device_id=0, sync_batched=False, p4_name_in_requests=False):
+                 fast=True, device_id=0, sync_batched=False, p4_name_in_requests=False, raw=False):
         self.gc = gc
         self.iface = iface
         self.info = info
@@ -298,10 +551,25 @@ class BatchedRegisterReader(object):
         self.target = gc.Target(device_id=device_id, pipe_id=0xFFFF)
         self.pb2 = getattr(gc, "bfruntime_pb2", None)
         self.fast = bool(fast) and self.pb2 is not None
-        self.fast_checked = False
+        self.checked = set()   # routes compared with the safe one on the first read of the run
         self.rw = getattr(iface, "reader_writer_interface", None)
         if self.rw is None:
             self.fast = False
+        # The raw route sends bytes through the client's grpc channel itself.
+        self.channel = getattr(iface, "channel", None)
+        self.raw = bool(raw) and self.pb2 is not None and self.channel is not None
+        self._raw_read_call = self._raw_write_call = None
+        self._raw_heads = {}
+        if self.raw:
+            try:
+                self._raw_read_call = self.channel.unary_stream("/%s/Read" % RPC_SERVICE)
+                self._raw_write_call = self.channel.unary_unary("/%s/Write" % RPC_SERVICE)
+            except Exception as error:
+                log("no raw calls on the client's channel (%s)" % error)
+                self.raw = False
+        if bool(raw) and not self.raw:
+            log("the wire-format route needs the protobuf module and the client's grpc channel: using the %s route"
+                % ("fast" if self.fast else "safe"))
         self.tables = OrderedDict()
         for name in REG_NAMES:
             try:
@@ -315,10 +583,15 @@ class BatchedRegisterReader(object):
         except KeyError:
             self.dst_table = None
         self.flow_tables = [t for t in self.tables.values() if t is not None]
-        if self.fast and not all(t.ids_ok for t in self.flow_tables + [self.dst_table] if t is not None):
+        if (self.fast or self.raw) and not all(t.ids_ok for t in self.flow_tables + [self.dst_table]
+                                               if t is not None):
             log("the client does not expose the field ids: using entry_get()/entry_mod() only")
-            self.fast = False
+            self.fast = self.raw = False
         self.windows = 0
+
+    def route(self):
+        """The route in use: 'raw', 'fast' or 'safe'."""
+        return "raw" if self.raw else ("fast" if self.fast else "safe")
 
     # ---------------------------------------------------------------- sync
 
@@ -411,27 +684,70 @@ class BatchedRegisterReader(object):
                 timing["read_entities"] += 1
         return values
 
+    def _raw_head(self, cls):
+        """Serialized target, client id (and p4_name) of a request: the bytes before the entities."""
+        if cls not in self._raw_heads:
+            req = cls()
+            self._fill_target(req)
+            req.client_id = getattr(self.rw, "client_id", getattr(self.iface, "client_id", 0))
+            self._raw_heads[cls] = req.SerializeToString()
+        return self._raw_heads[cls]
+
+    def _read_raw(self, t, indexes, from_hw, timing):
+        """Like _read_fast, from byte templates and the wire-format parser."""
+        head, tail = t.raw_read_entity(self.pb2, from_hw)
+        prefix = self._raw_head(self.pb2.ReadRequest)
+        pack = t.pack_key
+        values = {}
+        for start in range(0, len(indexes), self.chunk):
+            chunk = indexes[start:start + self.chunk]
+            req = prefix + b"".join([head + pack(idx) + tail for idx in chunk])
+            timing["read_rpcs"] += 1
+            for rsp in self._raw_read_call(req):
+                timing["read_entities"] += parse_read_response(rsp, t.data_id, values)
+        return values
+
+    def _read_route(self, route, t, indexes, from_hw, timing):
+        if route == "raw":
+            return self._read_raw(t, indexes, from_hw, timing)
+        if route == "fast":
+            return self._read_fast(t, indexes, from_hw, timing)
+        return self._read_safe(t, indexes, from_hw, timing)
+
     def _read_table(self, t, indexes, from_hw, timing):
-        if self.fast and not self.fast_checked:
-            # First read of the run: compare the fast route with the client's own parser.
-            self.fast_checked = True
+        # First read of the run: compare the route in use with the client's own
+        # parser on a sample; on disagreement fall back to the next route.
+        while self.route() != "safe" and self.route() not in self.checked:
+            route = self.route()
+            self.checked.add(route)
             sample = list(indexes[:4])
             probe = dict(read_rpcs=0, read_entities=0)
             want = self._read_safe(t, sample, from_hw, probe)
-            got = self._read_fast(t, sample, from_hw, probe)
+            try:
+                got = self._read_route(route, t, sample, from_hw, probe)
+            except Exception as error:
+                got = "error: %s" % error
             if want != got:
-                log("fast response parsing disagrees with the client (%r vs %r): using the client's parser"
-                    % (want, got))
-                self.fast = False
-        if self.fast:
-            return self._read_fast(t, indexes, from_hw, timing)
-        return self._read_safe(t, indexes, from_hw, timing)
+                log("the %s route disagrees with the client's parser (%r vs %r): not using it" % (route, got, want))
+                if route == "raw":
+                    self.raw = False
+                else:
+                    self.fast = False
+        return self._read_route(self.route(), t, indexes, from_hw, timing)
 
     # ---------------------------------------------------------------- clear
 
     def _clear(self, indexes, timing):
         t0 = time.time()
-        if self.fast:
+        if self.raw:
+            parts = [self._raw_head(self.pb2.WriteRequest)]
+            for t in self.flow_tables:
+                head, tail = t.raw_clear_update(self.pb2)
+                pack = t.pack_key
+                parts.append(b"".join([head + pack(idx) + tail for idx in indexes]))
+            self._raw_write_call(b"".join(parts))
+            timing["clear_rpcs"] = 1
+        elif self.fast:
             req = self.pb2.WriteRequest()
             self._fill_target(req)
             for t in self.flow_tables:
@@ -473,7 +789,7 @@ class BatchedRegisterReader(object):
         timing = OrderedDict([("active", len(indexes)), ("dst", len(dst_indexes)),
                               ("sync_ms", 0.0), ("sync_rpcs", 0), ("read_ms", 0.0), ("read_rpcs", 0),
                               ("read_entities", 0), ("clear_ms", 0.0), ("clear_rpcs", 0),
-                              ("cleared", 0), ("fast", bool(self.fast))])
+                              ("cleared", 0), ("parser", self.route())])
         t_start = time.time()
         errors = []
         sync_s = None
@@ -603,7 +919,8 @@ def open_reader(args):
     iface, info, bound = connect(gc, args.grpc_addr, args.client_id, args.device_id, args.p4_name, bind=args.bind)
     reader = BatchedRegisterReader(gc, iface, info, p4_name=args.p4_name, strict=args.strict_core_registers,
                                    chunk=args.chunk, fast=not args.safe_parse, device_id=args.device_id,
-                                   sync_batched=args.sync_batched, p4_name_in_requests=not bound)
+                                   sync_batched=args.sync_batched, p4_name_in_requests=not bound,
+                                   raw=args.raw_wire and not args.safe_parse)
     return gc, reader
 
 
@@ -615,6 +932,9 @@ def describe(reader):
         ("dst_table", reader.dst_table is not None),
         ("sync_ops", dict((t.name, t.sync_op) for t in reader.flow_tables)),
         ("fast", reader.fast),
+        ("raw", reader.raw),
+        ("parser", reader.route()),
+        ("protobuf", protobuf_info()),
         ("bound", not reader.p4_name_in_requests),
         ("sync_batched", reader.sync_batched),
         ("chunk", reader.chunk),
@@ -711,6 +1031,14 @@ def probe(args):
         fast = reader._read_fast(t, [0, 1], False, timing)
         out["fast_read"] = dict((str(k), v) for k, v in fast.items())
         out["fast_equals_safe"] = fast == safe
+    if reader.raw:
+        try:
+            raw = reader._read_raw(t, [0, 1], False, timing)
+            out["raw_read"] = dict((str(k), v) for k, v in raw.items())
+            out["raw_equals_safe"] = raw == safe
+        except Exception as error:
+            out["raw_error"] = str(error)
+            out["raw_equals_safe"] = False
     out["pipes"] = len(list(safe.values())[0]) if safe else None
     tm = {}
     try:
@@ -737,6 +1065,8 @@ def bench(args):
     for n in sizes:
         indexes = sorted(rng.sample(range(FLOW_BUCKETS), n))
         per = []
+        errors = []
+        cleared = 0
         for w in range(args.bench_windows):
             clear = {}
             if args.bench_clear:
@@ -744,25 +1074,35 @@ def bench(args):
                 # collector would for idle buckets).
                 first = reader.read_window(indexes, [], {}, snapshot)
                 clear = dict((r["idx"], r["pkts"]) for r in first["rows"])
+                errors.extend(first["errors"])
             p = reader.read_window(indexes, [], clear, snapshot)
             per.append(p["timing"])
+            errors.extend(p["errors"])
+            cleared += len(p["cleared"])
+            if p["errors"]:
+                # A failed clear or read shows as a short time otherwise.
+                log("bench %d buckets, window %d: %d error(s), e.g. %s" % (n, w, len(p["errors"]), p["errors"][0]))
         med = lambda key: sorted(x[key] for x in per)[len(per) // 2]
         sync_ms, read_ms, clear_ms = med("sync_ms"), med("read_ms"), med("clear_ms")
         total = sync_ms + read_ms + clear_ms
         row = OrderedDict([("active", n), ("windows", len(per)), ("sync_ms", sync_ms), ("read_ms", read_ms),
                            ("clear_ms", clear_ms), ("total_ms", round(total, 3)),
                            ("us_per_bucket", round(total * 1000.0 / n, 2)),
-                           ("fits", total <= args.bench_budget * 1000.0), ("fast", per[0]["fast"]),
-                           ("read_rpcs", per[0]["read_rpcs"]), ("sync_rpcs", per[0]["sync_rpcs"])])
+                           ("fits", total <= args.bench_budget * 1000.0), ("parser", per[0]["parser"]),
+                           ("read_rpcs", per[0]["read_rpcs"]), ("sync_rpcs", per[0]["sync_rpcs"]),
+                           ("read_entities", per[0]["read_entities"]), ("cleared", cleared),
+                           ("errors", len(errors)), ("first_error", errors[0] if errors else None)])
         results.append(row)
         print("| %d | %.1f | %.1f | %.1f | %.1f | %.1f | %s |" % (
-            n, sync_ms, read_ms, clear_ms, total, row["us_per_bucket"], "yes" if row["fits"] else "no"))
+            n, sync_ms, read_ms, clear_ms, total, row["us_per_bucket"],
+            ("yes" if row["fits"] else "no") + (" (%d errors)" % len(errors) if errors else "")))
         sys.stdout.flush()
     reader.close()
     if args.out:
         with open(args.out, "w") as f:
             json.dump({"grpc_addr": args.grpc_addr, "python": sys.version.split()[0], "snapshot": snapshot,
-                       "chunk": reader.chunk, "fast": reader.fast, "windows": args.bench_windows,
+                       "chunk": reader.chunk, "parser": reader.route(), "protobuf": protobuf_info(),
+                       "sync_batched": reader.sync_batched, "windows": args.bench_windows,
                        "results": results}, f, indent=1)
         print("-> %s" % args.out)
 
@@ -777,6 +1117,10 @@ def main():
     ap.add_argument("--sde-install", help="SDE install whose python site-packages hold bfrt_grpc")
     ap.add_argument("--chunk", type=int, default=DEFAULT_CHUNK, help="keys per Read request")
     ap.add_argument("--safe-parse", action="store_true", help="use entry_get()/to_dict() only")
+    ap.add_argument("--raw-wire", action="store_true",
+                    help="build the requests from byte templates and decode the responses with this module's "
+                         "wire-format parser (no protobuf class per entity; checked against the client's parser "
+                         "on the first read)")
     ap.add_argument("--sync-batched", action="store_true",
                     help="send the 14 register Syncs in one Write RPC (default: one Write per table)")
     ap.add_argument("--strict-core-registers", action="store_true")
