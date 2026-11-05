@@ -5,8 +5,9 @@
 
 hybrid_collector.main() runs as it is. Two names are wrapped, only to log:
 
-  * run_p4_reader_json: for every register read, when the collector called it
-    and when it returned, and from the reader's payload the switch-side start
+  * run_p4_reader_json (--reader legacy) and BatchedReaderProcess.read
+    (--reader batched): for every register read, when the collector called it
+    and when it returned, and from the reader's payload the reader-side start
     time t_switch, the sync/read/clear durations, the rows and the cleared
     buckets.
   * subprocess.Popen: the time and arguments of every process started. The
@@ -94,19 +95,29 @@ def main() -> None:
 
         hc.run_scenario_command = scenario
 
-    def reader(*args, **kwargs):
-        t0 = time.time()
-        payload = orig_reader(*args, **kwargs)
-        t1 = time.time()
+    def record(reader_name, indexes, payload, t0, t1):
         log["reads"].append({
-            "call_start": t0, "call_end": t1,
-            "indexes": list(args[1]) if len(args) > 1 else kwargs.get("indexes"),
+            "reader": reader_name, "call_start": t0, "call_end": t1,
+            "indexes": list(indexes) if indexes is not None else None,
             "t_switch": payload.get("t_switch"), "sync_s": payload.get("sync_s"),
             "read_s": payload.get("read_s"), "clear_s": payload.get("clear_s"),
             "snapshot": payload.get("snapshot"), "errors": payload.get("errors", []),
             "cleared": payload.get("cleared", []), "rows": payload.get("rows", []),
-            "dst_rows": payload.get("dst_rows", []),
+            "dst_rows": payload.get("dst_rows", []), "timing": payload.get("timing"),
         })
+
+    def reader(*args, **kwargs):
+        t0 = time.time()
+        payload = orig_reader(*args, **kwargs)
+        record("legacy", args[1] if len(args) > 1 else kwargs.get("indexes"), payload, t0, time.time())
+        return payload
+
+    orig_batched_read = hc.BatchedReaderProcess.read
+
+    def batched_read(self, indexes, *args, **kwargs):
+        t0 = time.time()
+        payload = orig_batched_read(self, indexes, *args, **kwargs)
+        record("batched", indexes, payload, t0, time.time())
         return payload
 
     class Popen(orig_popen):
@@ -124,6 +135,7 @@ def main() -> None:
         return {int(p) for p in res.stdout.split()}
 
     hc.run_p4_reader_json = reader
+    hc.BatchedReaderProcess.read = batched_read
     subprocess.Popen = Popen
     sys.argv = ["hybrid_collector.py"] + rest
     before = hostmon_pids()
@@ -131,6 +143,7 @@ def main() -> None:
         hc.main()
     finally:
         subprocess.Popen = orig_popen
+        hc.BatchedReaderProcess.read = orig_batched_read
         # Before the collector fix, stop_hostmon() signalled a sudo wrapper that
         # does not relay a signal from its own process group, and hostmon
         # outlived the run. This check reports (and stops) any that does.
