@@ -161,9 +161,13 @@ Two register readers exist. `--reader legacy` (the default) runs
 Runtime gRPC client that syncs each register table once, reads all active buckets
 of a table in one Read RPC and clears idle buckets in one Write RPC per window, with
 the same rows (`thesis-hybrid-ebpf-p4/python/tests/test_batched_reader.py` checks
-both readers window by window on `bfrt_mock.py`). `--reader-timing` prints the
+both readers window by window on `bfrt_mock.py`). `--reader-raw-wire` makes it build
+its requests and decode its responses on the protobuf wire format directly, for a client
+whose protobuf package has no C implementation (the SDE 9.6 one on the switch), and
+`--reader-sync-batched` sends the register syncs in one RPC. `--reader-timing` prints the
 per-window sync/read/clear times of either reader. [`RUNBOOK.md`](RUNBOOK.md) has the
-commands to validate and time the batched reader on the Wedge100BF-32X.
+commands to validate and time the batched reader on the Wedge100BF-32X, and the results
+of 2026-11-05 (Sections 9 and 10).
 
 A register read that fails, or takes longer than `--p4-read-timeout` (default
 120 s), is retried `--p4-read-retries` times (default 2). Each window's row is

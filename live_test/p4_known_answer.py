@@ -47,7 +47,7 @@ from listen_cpu_reports import ReportCollector  # noqa: E402
 
 READER = PYDIR / "read_registers_with_index.py"
 BATCHED_READER = PYDIR / "batched_reader.py"
-READER_OPTS = {"reader": "legacy", "grpc_addr": "127.0.0.1:50052"}
+READER_OPTS = {"reader": "legacy", "grpc_addr": "127.0.0.1:50052", "extra": []}
 FLOW_REGS = ["reg_pkts", "reg_bytes", "reg_pkts_ab", "reg_bytes_ab", "reg_ref_src_port",
              "reg_ref_dst_port", "reg_dir_valid", "reg_min_len", "reg_max_len", "reg_first_ts",
              "reg_last_ts", "reg_syn", "reg_ack", "reg_rst"]
@@ -153,7 +153,7 @@ def zero_buckets(idxs, dst_idxs):
 
 def read(idxs, dst_idxs, clear=None):
     if READER_OPTS["reader"] == "batched":
-        cmd = [sys.executable, str(BATCHED_READER), "--grpc-addr", READER_OPTS["grpc_addr"]]
+        cmd = [sys.executable, str(BATCHED_READER), "--grpc-addr", READER_OPTS["grpc_addr"]] + READER_OPTS["extra"]
     else:
         cmd = [sys.executable, str(READER)]
     cmd += ["--index-mode", "cli", "--indexes", ",".join(map(str, idxs)),
@@ -182,8 +182,11 @@ def main():
     ap.add_argument("--reader", choices=["legacy", "batched"], default="legacy",
                     help="register reader under test (legacy = bfshell/bfrt_python, batched = BF Runtime gRPC)")
     ap.add_argument("--grpc-addr", default="127.0.0.1:50052", help="BF Runtime gRPC server for --reader batched")
+    ap.add_argument("--raw-wire", action="store_true", help="--reader batched: its wire-format route (--raw-wire)")
+    ap.add_argument("--sync-batched", action="store_true", help="--reader batched: the Syncs in one Write RPC")
     args = ap.parse_args()
-    READER_OPTS.update(reader=args.reader, grpc_addr=args.grpc_addr)
+    READER_OPTS.update(reader=args.reader, grpc_addr=args.grpc_addr,
+                       extra=(["--raw-wire"] if args.raw_wire else []) + (["--sync-batched"] if args.sync_batched else []))
     int_out = args.int_egress_iface or args.int_iface
     ext_out = args.ext_egress_iface or args.ext_iface
 
