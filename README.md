@@ -154,6 +154,17 @@ earlier run would keep `dir_valid` set, so a new flow landing in it would send
 no report and never be read, and `reg_newconn_dst` would return its count since
 the switch started.
 
+Two register readers exist. `--reader legacy` (the default) runs
+`read_registers_with_index.py`: a bfshell/bfrt_python session per window with one
+`get()` per register per bucket (14 calls, ~1.14 ms per bucket on the switch plus
+~1.5 s per session). `--reader batched` runs `batched_reader.py`: one long-lived BF
+Runtime gRPC client that syncs each register table once, reads all active buckets
+of a table in one Read RPC and clears idle buckets in one Write RPC per window, with
+the same rows (`thesis-hybrid-ebpf-p4/python/tests/test_batched_reader.py` checks
+both readers window by window on `bfrt_mock.py`). `--reader-timing` prints the
+per-window sync/read/clear times of either reader. [`RUNBOOK.md`](RUNBOOK.md) has the
+commands to validate and time the batched reader on the Wedge100BF-32X.
+
 A register read that fails, or takes longer than `--p4-read-timeout` (default
 120 s), is retried `--p4-read-retries` times (default 2). Each window's row is
 written to `OUT.<run_id>.partial.csv` as soon as it is complete. A finished run

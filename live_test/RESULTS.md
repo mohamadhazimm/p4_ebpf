@@ -165,6 +165,28 @@ The results are git-ignored, under `$REL/validation/`:
 Open question for the user: whether to reproduce the dataset's launcher. That needs the original
 collector's code.
 
+## 2026-11-05: the batched gRPC register reader on the model
+
+`hybrid_collector.py --reader batched` reads the registers with
+`thesis-hybrid-ebpf-p4/python/batched_reader.py`: one BF Runtime gRPC client for the
+whole run, one `Sync` per register table, one Read RPC per table with all active
+buckets, one Write RPC for the idle clears, instead of a bfshell session per window
+with one `get()` per register per bucket. Same rows by construction (its `combine()`
+and row fields are copies of the legacy script's, checked by the tests). Checked on
+the real components of this VM, benign traffic only:
+
+| Check | Result |
+| --- | --- |
+| `p4_known_answer.py --reader batched` | 19/19 (all 14 registers + `reg_newconn_dst` exact, clear, zero read-back, re-report from 1) |
+| `run_pcap_test.sh` with `EXTRA="--reader batched --reader-timing --clear-idle-windows 0"` (`pcap_benign_mix_w60_20261105_191620`) | 1,023/1,023 packets, 84/84 flows exact, CSV equals the per-bucket read model in all 7 windows |
+| `tests/test_batched_reader.py` (bfrt_mock) | legacy and batched windows and CSV rows identical over 120 windows with clears, re-reports, two-pipe flows and counters wrapping mod 2^32 |
+| per window on the model (`--reader-timing`) | 15 syncs 57-74 s, reads of 33-84 buckets 32-46 s, IPC overhead 3-8 ms; the legacy reader's session alone is 1.4-1.5 s on the switch |
+
+The model's bf_switchd serves one register entry in milliseconds and one sync in seconds,
+so these times say nothing about the switch; the switch commands are in
+[`RUNBOOK.md`](../RUNBOOK.md). The run's windows are late by 55-268 s for the same reason
+(sync reads, 60 s windows), which is why only the per-bucket read model matches per window.
+
 ## Limits of the software model
 
 Forwarding ~100-200 packets/s (1 MiB of HTTP in 8 s). Register sync 15 s idle and
