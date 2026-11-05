@@ -20,7 +20,9 @@ Checked:
               first packet's 5-tuple, flow_index = flow_index.py), parsed with
               the collector's own listen_cpu_reports.ReportCollector
   registers   all 14 flow registers and reg_newconn_dst, read with the
-              collector's read_registers_with_index.py, against the expected
+              collector's read_registers_with_index.py (--reader legacy, the
+              default) or batched_reader.py over BF Runtime gRPC
+              (--reader batched --grpc-addr HOST:50052), against the expected
               values (bytes = IPv4 totalLen)
   clear       --clear-if-unchanged zeroes a bucket; its next packet reports again
 
@@ -44,6 +46,8 @@ from flow_index import compute_flow_index, compute_newconn_dst_index  # noqa: E4
 from listen_cpu_reports import ReportCollector  # noqa: E402
 
 READER = PYDIR / "read_registers_with_index.py"
+BATCHED_READER = PYDIR / "batched_reader.py"
+READER_OPTS = {"reader": "legacy", "grpc_addr": "127.0.0.1:50052"}
 FLOW_REGS = ["reg_pkts", "reg_bytes", "reg_pkts_ab", "reg_bytes_ab", "reg_ref_src_port",
              "reg_ref_dst_port", "reg_dir_valid", "reg_min_len", "reg_max_len", "reg_first_ts",
              "reg_last_ts", "reg_syn", "reg_ack", "reg_rst"]
@@ -148,8 +152,12 @@ def zero_buckets(idxs, dst_idxs):
 
 
 def read(idxs, dst_idxs, clear=None):
-    cmd = [sys.executable, str(READER), "--index-mode", "cli", "--indexes", ",".join(map(str, idxs)),
-           "--format", "json", "--snapshot", "sync", "--strict-core-registers"]
+    if READER_OPTS["reader"] == "batched":
+        cmd = [sys.executable, str(BATCHED_READER), "--grpc-addr", READER_OPTS["grpc_addr"]]
+    else:
+        cmd = [sys.executable, str(READER)]
+    cmd += ["--index-mode", "cli", "--indexes", ",".join(map(str, idxs)),
+            "--format", "json", "--snapshot", "sync", "--strict-core-registers"]
     if dst_idxs:
         cmd += ["--dst-indexes", ",".join(map(str, dst_idxs))]
     if clear:
@@ -171,7 +179,11 @@ def main():
     ap.add_argument("--ext-egress-iface", default=None, help="where port-1 output appears (default: --ext-iface)")
     ap.add_argument("--cpu-iface", default="veth5")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--reader", choices=["legacy", "batched"], default="legacy",
+                    help="register reader under test (legacy = bfshell/bfrt_python, batched = BF Runtime gRPC)")
+    ap.add_argument("--grpc-addr", default="127.0.0.1:50052", help="BF Runtime gRPC server for --reader batched")
     args = ap.parse_args()
+    READER_OPTS.update(reader=args.reader, grpc_addr=args.grpc_addr)
     int_out = args.int_egress_iface or args.int_iface
     ext_out = args.ext_egress_iface or args.ext_iface
 
@@ -189,7 +201,7 @@ def main():
     if len(set(dst_idx.values())) != len(dst_idx):
         sys.exit("new-connection keys collide; change the addresses")
 
-    results = {"checks": [], "flows": {}, "timing": {}}
+    results = {"checks": [], "flows": {}, "timing": {}, "reader": args.reader}
 
     def check(name, ok, detail=""):
         results["checks"].append({"name": name, "ok": bool(ok), "detail": detail})
@@ -270,6 +282,7 @@ def main():
     after = read(idxs, sorted(set(dst_idx.values())))
     results["timing"]["read_wall_s"] = after["_wall_s"]
     results["timing"]["read_sync_s"] = after.get("sync_s")
+    results["timing"]["read_timing"] = after.get("timing")   # batched reader: per-phase ms and RPC counts
     rows = {r["idx"]: r for r in after["rows"]}
     for name, f in sorted(flows.items()):
         r = rows[f["idx"]]
