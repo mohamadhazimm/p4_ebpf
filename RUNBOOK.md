@@ -238,3 +238,147 @@ Results on this VM (2026-11-05, open-p4studio 9.13.4, model + bf_switchd, Python
 - The probe or bench against the Tofino model is slow (seconds per read): the model's
   bf_switchd serves one register entry in milliseconds and a register sync in seconds;
   only the ASIC's numbers count.
+
+## 9. Results on the switch (2026-11-05)
+
+Sections 1 to 6 on the Wedge100BF-32X, run from the control host (PC1), with the batched
+reader in the reference placement (on the switch: SDE 9.6 client, Python 2.7.13). The raw
+logs, JSON and CSVs stay on PC1 in `perf/results/batched_reader_20261105_182414/`
+(git-ignored; its README lists the files).
+
+Setup and deviations from Sections 1 to 6:
+
+- Program `basic_newconn_head`, compiled from this repository's P4 sources (identical to
+  HEAD): 15 registers with `reg_newconn_dst`. The switch ran `basic_fix` (no
+  `reg_newconn_dst`) before the run and was restored to it afterwards.
+- Not run: the host placement (host probe, host bench, `--reader-local`), because PC1 has
+  no Python 3 `bfrt_grpc` client; Section 7, because PC1 has no Tofino model.
+- `--p4-reader`, `--p4-forwarder` and `--hostmon` were passed explicitly: the defaults of
+  `hybrid_collector.py` (and so of `reader_ab.py`) point to `/home/ubuntu/Desktop/p4_ebpf/...`.
+  HostMon is not built on PC1. `--hostmon` named a stand-in that prints no host windows, so
+  the collector CSVs have the P4 columns only.
+- Traffic for Sections 5 and 6: `live_test/make_benign_pcap.py --sessions 2000` (seed 7),
+  35,388 packets, 2,768 flows, 2,100 new connections in 12 `reg_newconn_dst` buckets.
+  Replayed from PC1 with `tcpreplay -i eth1 --multiplier=6.5` (181.5 s, 0 failed packets).
+
+```sh
+# switch: the program with reg_newconn_dst, then ports, forwarding, mirror, CPU netdev
+ssh root@172.168.1.2 'bash /root/hazim_perf/tools/sw_switchd.sh stop && bash /root/hazim_perf/tools/sw_switchd.sh start /root/hazim_perf/build/basic_newconn_head/basic.conf LOG_DIR'
+perf/tools/run_bfrt.sh RUN_DIR setup setup --prog basic --ports 132,140 --fwd 132:140,140:132 --mirror-sid 1
+python3 thesis-hybrid-ebpf-p4/python/program_forwarding.py --ssh root@172.168.1.2 --int-port 132 --ext-port 140 --report-port 192 --mirror-sid 1
+ssh root@172.168.1.2 'ip link set enp5s0 up'
+# Section 5, twice: default order, then --order alternate after reset_registers.py --ssh root@172.168.1.2
+python3 live_test/reader_ab.py --switch-ssh root@172.168.1.2 --cpu-iface enp5s0 --windows 20 --window-sec 10 \
+    --p4-reader thesis-hybrid-ebpf-p4/python/read_registers_with_index.py --out reader_ab_switch.json
+# Section 6, three runs: batched with 0.5 s windows, legacy with 10 s, batched with 10 s
+sudo python3 hybrid_collector.py --mode command --scenario-name NAME --label benign \
+    --command "tcpreplay -i eth1 --multiplier=6.5 ab_mix.pcap" --window-sec 10 --out-csv hybrid_windows.csv \
+    --switch-ssh root@172.168.1.2 --forward-int-port 132 --forward-ext-port 140 --forward-report-port 192 \
+    --cpu-iface enp5s0 --reader batched --reader-timing --reader-timing-file timing_batched.jsonl \
+    --hostmon HOSTMON_STAND_IN --p4-reader thesis-hybrid-ebpf-p4/python/read_registers_with_index.py \
+    --p4-forwarder thesis-hybrid-ebpf-p4/python/program_forwarding.py
+```
+
+| check | result |
+|---|---|
+| unit tests | 65/69 on PC1 as checked out: the 4 tests that need the fast parser fail because no generated `bfruntime_pb2` is importable there. 69/69 with the switch's `tofino/bfrt_grpc/bfruntime_pb2.py` and `tofino/google/rpc/status_pb2.py` copied under `DIR/lib/python3.8/site-packages/tofino/` and `SDE_INSTALL=DIR` |
+| probe (switch) | as expected: 14 tables, `missing: []`, `dst_table: true`, all `Sync`, `fast_equals_safe: true`, `pipes: 2`, bound; one Sync 2.2 ms; connect 0.26 s |
+| known answer (bucket 6886) | one CPU report with `flow_index` 6886; batched = legacy = the values of Section 3, `duration_ns` 989,951,385; `reg_newconn_dst` bucket 55719: 1 |
+| idle clearing | `6886:99`: nothing cleared; `6886:100`: cleared in 1 Write RPC (1.6 ms), all 14 registers 0, bucket 55719 kept; one more packet: a new report, `pkts` 1 in both readers; a clear by the legacy reader reads 0 with the batched reader |
+| `--sync-batched` | known answer exact, with the 15 Syncs in one RPC (26 ms) |
+| live A/B (Section 5), 2 x 20 windows | 30,862 rows identical, `MISMATCH` 0, `only in one` 0; `reader_ab.py` prints FAIL for the dst rows (below) |
+| collector (Section 6), 3 runs | each: 2,768 reports, 0 index mismatches, 0 overruns, retries or errors; the CSV sums of pkts, bytes, pkts_ab, bytes_ab, SYN, ACK, RST equal the capture (35,388; 19,689,510; 17,711; 1,415,529; 4,100; 31,952; 100) |
+
+Timing table (Section 4): medians of 5 windows, each with 14 Syncs, the batched Reads and
+one Write clearing every sampled bucket. The whole table took 11 min 42 s.
+
+| active buckets | sync ms | read ms | clear ms | total ms | us/bucket | fits 0.5 s? |
+|---|---|---|---|---|---|---|
+| 100 | 60.1 | 128.2 | 55.7 | 244.0 | 2439.9 | yes |
+| 500 | 62.2 | 601.2 | 276.8 | 940.3 | 1880.6 | no |
+| 1000 | 58.9 | 1136.6 | 577.9 | 1773.4 | 1773.4 | no |
+| 2000 | 61.8 | 2203.5 | 1349.9 | 3615.3 | 1807.6 | no |
+| 5000 | 58.4 | 5876.0 | 3535.4 | 9469.8 | 1894.0 | no |
+| 10000 | 61.7 | 13388.8 | 7335.7 | 20786.2 | 2078.6 | no |
+| 20000 | 59.0 | 30940.7 | 14991.0 | 45990.7 | 2299.5 | no |
+
+- **Per-bucket cost.** Reads take 1.1-1.55 ms per bucket (80-110 us per register entry),
+  clears 0.55-0.75 ms per bucket, and the 14 Syncs 58-62 ms. Read RPCs are as designed
+  (14 up to 4,096 buckets, 70 at 20,000), and one Write with 280,000 updates succeeded.
+- **`--sync-batched`** (100, 1,000, 2,000 buckets): Syncs 24.8-31.0 ms; reads and clears
+  unchanged.
+- **`--safe-parse`** (100, 1,000 buckets): reads 524.6 and 4,767.1 ms, clears 242.5 and
+  2,541.5 ms. The fast parser is 4.1-4.4x faster.
+- **Bottleneck.** At 2,000 buckets the reader process uses 90% of one core and
+  `bf_switchd` 26% (19-29 us per entry), so the switch's Python 2.7 client limits the
+  reader. Section 7's client cost (5-6 us per entry, Python 3.10 with upb) does not apply
+  to this placement: the 28,000 entries of 2,000 buckets take 2.2 s here, not 0.25 s.
+
+Live A/B (Section 5), 106-938 active buckets per window:
+
+- **Run 1** (`batched-first`): 15,428 rows identical. `dst equal` False in windows 0-17,
+  True in 18 and 19, which came after the replay.
+- **Run 2** (`--order alternate`): before it, `reset_registers.py` cleared the 15 registers
+  in 0.1 s, and a wrapper around `reader_ab.py` logged each read's `dst_rows`.
+  - 15,434 rows identical.
+  - Of 227 dst comparisons, 44 were equal and 183 larger in the later read; none was
+    smaller.
+  - In both readers the last reads of all 12 dst buckets equal the capture's counts, as
+    did an idle read after run 1.
+- **dst rows.** The readers agree on `reg_newconn_dst`. Its buckets count the connections
+  of a whole destination and grow between the two reads. Section 5's "`dst equal True` in
+  every window" therefore holds only if no connection arrives between the reads.
+- **`traffic between` stayed 0.** No flow row changed between the two reads: the replayed
+  flows last under 0.1 s, and a report from the last ~100 ms of a window is taken in the
+  next window. The dst buckets covered the later-is-larger case.
+- **Wall time per window** at ~915 active buckets: batched 1.21 s (Syncs 70 ms, reads
+  1.10 s). Legacy 4.7-5.2 s, of which its own sync and reads take 1.03 s.
+
+Collector (Section 6), same replay; the collector resets the registers at the start:
+
+| run | windows | active buckets, median | wall per window, median (p95) | sync / read / clear / overhead, median ms |
+|---|---|---|---|---|
+| legacy, 10 s | 19 | 608 | 4,643 ms (4,894) | 49.7 / 656.2 / 148.3 / 3,781.6 |
+| batched, 10 s | 20 | 607 | 917 ms (949) | 71.0 / 721.3 / 81.1 / 37.3 |
+| batched, 0.5 s | 363 | 31 | 138 ms (151) | 69.9 / 59.2 / 0.0 / 3.7 |
+
+- **Per-bucket cost.** Reads 1.08 ms (legacy) and 1.21 ms (batched) per active bucket;
+  clears 1.00 ms (legacy) and 0.57 ms (batched) per cleared bucket.
+- **Legacy overhead.** The bfshell session, SSH and the payload printed through the CLI
+  cost 3.8 s at ~600 buckets. That is more than the 1.4-1.5 s session alone and grows with
+  the payload.
+- **CSV-level variant** (the two 10 s runs). Windows 0 and 1 and the totals are equal. The
+  other windows differ by a few flows that fell on different sides of a window boundary in
+  the two replays (cumulative offset -81 to +106 of 35,388 packets).
+
+What this means:
+
+- **Data.** On the switch the batched reader returns the same data as the legacy reader,
+  and the collector's counts with it are exact.
+- **Speed per window.** At 600-900 active buckets it is 4-5x faster (0.9-1.2 s instead of
+  4.6-5.2 s), because it opens no bfshell session.
+- **Speed per bucket.** It is not faster: its reads cost about as much as the legacy
+  reader's (1.1-1.55 ms vs 1.07-1.14 ms), and its clears about half as much.
+- **Capacity.** 0.5 s windows work up to about 350 active buckets with few clears (60 ms of
+  Syncs plus ~1.2 ms per bucket). A 10 s window holds about 5,000 active buckets even if
+  every bucket is cleared.
+
+Open items:
+
+1. The collector default is still `--reader legacy`. Sections 3 to 5 have passed (with the
+   dst point above), which is Section 6's condition for switching; the user decides.
+2. `--sync-batched` is exact on the switch and halves the snapshot. Section 8's reason
+   against it, the server's 5 s wait, applies to the model. It is a candidate default for
+   the switch.
+3. `live_test/reader_ab.py`: classify dst rows like flow rows (the later read >= the
+   earlier one) and keep them in the JSON.
+4. `tests/test_batched_reader.py`: four tests assume the fast parser and fail where
+   `bfruntime_pb2` cannot be imported; skip them there. They are
+   `test_rpc_counts_per_window`, `test_safe_parse_and_chunking_give_the_same_windows`,
+   `test_reads_come_from_the_synced_snapshot` and `test_one_shot_probe_and_bench_modes`.
+5. `batched_reader.py --bench` does not report a window's `errors`, so a failed clear would
+   show as `clear 0.0 ms`.
+6. `ReportCollector` with `ssh_host`: `stop()` ends the local ssh only; the tcpdump on the
+   switch keeps running until it captures the next frame.
+7. The host placement is not measured. From the CPU split, a host client that parses at
+   Section 7's rate could cut the per-bucket cost about 3-4x (an estimate).
