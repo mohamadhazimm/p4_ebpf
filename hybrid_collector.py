@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 
 import argparse
+import collections
 import csv
 import json
 import os
+import queue
+import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
 import re
 from pathlib import Path
@@ -21,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "thesis-hybrid-ebpf-p4"
 sys.path.append("/home/ubuntu/Desktop/p4_ebpf/thesis-hybrid-ebpf-p4/python")
 from listen_cpu_reports import ReportCollector
 from flow_index import compute_newconn_dst_index
+from bfshell_run import DEFAULT_REMOTE_SDE_INSTALL
 
 
 # ============================================================
@@ -32,6 +37,8 @@ DEFAULT_P4_READER = "/home/ubuntu/Desktop/p4_ebpf/thesis-hybrid-ebpf-p4/python/r
 DEFAULT_REPLAY = "/home/ubuntu/Desktop/p4_ebpf/thesis-hybrid-ebpf-p4/python/replay_pcaps_with_index.py"
 DEFAULT_P4_FORWARDER = "/home/ubuntu/Desktop/p4_ebpf/thesis-hybrid-ebpf-p4/python/program_forwarding.py"
 DEFAULT_P4_RESETTER = str(Path(__file__).resolve().parent / "thesis-hybrid-ebpf-p4" / "python" / "reset_registers.py")
+DEFAULT_BATCHED_READER = str(Path(__file__).resolve().parent / "thesis-hybrid-ebpf-p4" / "python" / "batched_reader.py")
+DEFAULT_GRPC_ADDR = "127.0.0.1:50052"
 
 DEFAULT_OUT_CSV = "hybrid_windows.csv"
 
@@ -517,6 +524,215 @@ def read_p4_with_retries(
     raise AssertionError("unreachable")
 
 
+class BatchedReaderProcess:
+    """One long-lived `batched_reader.py --serve` process: a BF Runtime gRPC
+    client that stays connected for the whole run and answers one JSON request
+    per window (read_registers_with_index.py starts a bfshell session per
+    window instead).
+
+    Locally the process runs on this host against --grpc-addr. With switch_ssh
+    the script is copied to the switch and runs there with the SDE's own
+    Python client (the interpreter whose site-packages hold bfrt_grpc, e.g.
+    python2.7 for SDE 9.6), talking to the switch's local gRPC server; SSH
+    carries the request and payload lines.
+
+    read_with_retries() has the semantics of read_p4_with_retries(): a failed
+    or hung request is retried after the process is stopped, and the next
+    request starts a new process (and gRPC connection)."""
+
+    def __init__(self, script: str = DEFAULT_BATCHED_READER, grpc_addr: str = DEFAULT_GRPC_ADDR,
+                 client_id: int = 7, p4_name: str = "basic", switch_ssh: Optional[str] = None,
+                 remote_sde_install: str = DEFAULT_REMOTE_SDE_INSTALL, chunk: int = 4096,
+                 safe_parse: bool = False, strict: bool = False, sync_batched: bool = False,
+                 start_timeout: float = 90.0, extra_args: Optional[List[str]] = None, echo: bool = True):
+        self.script = script
+        self.grpc_addr = grpc_addr
+        self.client_id = client_id
+        self.p4_name = p4_name
+        self.switch_ssh = switch_ssh
+        self.remote_sde_install = remote_sde_install
+        self.chunk = chunk
+        self.safe_parse = safe_parse
+        self.strict = strict
+        self.sync_batched = sync_batched
+        self.start_timeout = start_timeout
+        self.extra_args = list(extra_args or [])
+        self.echo = echo
+        self.ready: Optional[Dict[str, Any]] = None
+        self.starts = 0
+        self._proc: Optional[subprocess.Popen] = None
+        self._lines: "queue.Queue[str]" = queue.Queue()
+        self._stderr: "collections.deque[str]" = collections.deque(maxlen=60)
+
+    def _args(self) -> List[str]:
+        args = ["--serve", "--grpc-addr", self.grpc_addr, "--client-id", str(self.client_id),
+                "--p4-name", self.p4_name, "--chunk", str(self.chunk)]
+        if self.safe_parse:
+            args.append("--safe-parse")
+        if self.sync_batched:
+            args.append("--sync-batched")
+        if self.strict:
+            args.append("--strict-core-registers")
+        return args + self.extra_args
+
+    def _spawn(self) -> subprocess.Popen:
+        if self.switch_ssh is None:
+            cmd = [sys.executable, self.script] + self._args()
+        else:
+            remote_path = f"/tmp/batched_reader_{os.getpid()}.py"
+            copy = subprocess.run(["ssh", "-o", "BatchMode=yes", self.switch_ssh, f"cat > {remote_path}"],
+                                  input=Path(self.script).read_bytes(), stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, timeout=60)
+            if copy.returncode != 0:
+                raise RuntimeError(f"could not copy {self.script} to {self.switch_ssh}: {copy.stdout.decode()}")
+            sde = shlex.quote(self.remote_sde_install)
+            script_args = " ".join(shlex.quote(a) for a in self._args() + ["--sde-install", self.remote_sde_install])
+            remote = (f"SDE_INSTALL={sde}; export SDE_INSTALL; export LD_LIBRARY_PATH=/usr/local/lib:$SDE_INSTALL/lib; "
+                      "py=; for d in \"$SDE_INSTALL\"/lib/python*/site-packages/tofino/bfrt_grpc; do "
+                      "[ -d \"$d\" ] && py=$(basename \"$(dirname \"$(dirname \"$(dirname \"$d\")\")\")\"); done; "
+                      "[ -n \"$py\" ] || py=python3; "
+                      f"$py {remote_path} {script_args}; rc=$?; rm -f {remote_path}; exit $rc")
+            cmd = ["ssh", "-o", "BatchMode=yes", "-T", self.switch_ssh, "bash -c %s" % shlex.quote(remote)]
+        return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, bufsize=1)
+
+    def start(self) -> Dict[str, Any]:
+        self.stop()
+        self._lines = queue.Queue()
+        proc = self._spawn()
+        self._proc = proc
+
+        def pump_stdout():
+            for line in proc.stdout:
+                self._lines.put(line)
+
+        def pump_stderr():
+            for line in proc.stderr:
+                self._stderr.append(line.rstrip())
+                if self.echo:
+                    print(f"[reader] {line.rstrip()}", flush=True)
+
+        threading.Thread(target=pump_stdout, daemon=True).start()
+        threading.Thread(target=pump_stderr, daemon=True).start()
+        ready = json.loads(self._get_line(self.start_timeout))
+        if not ready.get("ready"):
+            self.stop()
+            raise RuntimeError(f"batched reader did not start: {ready}")
+        self.ready = ready
+        self.starts += 1
+        return ready
+
+    def _get_line(self, timeout: Optional[float]) -> str:
+        deadline = None if timeout is None else time.time() + timeout
+        while True:
+            try:
+                return self._lines.get(timeout=0.5 if deadline is None else max(0.0, min(0.5, deadline - time.time())))
+            except queue.Empty:
+                pass
+            proc = self._proc
+            if proc is not None and proc.poll() is not None:
+                try:  # output that arrived just before the exit
+                    return self._lines.get_nowait()
+                except queue.Empty:
+                    tail = "\n".join(list(self._stderr)[-8:])
+                    raise RuntimeError(f"batched reader exited with {proc.returncode}: {tail}")
+            if deadline is not None and time.time() >= deadline:
+                raise subprocess.TimeoutExpired(["batched_reader"], timeout)
+
+    def read(self, indexes: List[int], dst_indexes: Optional[List[int]] = None,
+             clear_if_unchanged: Optional[Dict[int, int]] = None, snapshot: str = "sync",
+             timeout: Optional[float] = None, source: str = "batched gRPC") -> Dict[str, Any]:
+        if self._proc is None or self._proc.poll() is not None:
+            self.start()
+        assert self._proc is not None and self._proc.stdin is not None
+        request = {"indexes": [int(i) for i in indexes], "dst_indexes": [int(i) for i in (dst_indexes or [])],
+                   "clear_if_unchanged": {str(int(k)): int(v) for k, v in (clear_if_unchanged or {}).items()},
+                   "snapshot": snapshot, "source": source}
+        self._proc.stdin.write(json.dumps(request) + "\n")
+        self._proc.stdin.flush()
+        reply = json.loads(self._get_line(timeout))
+        if "error" in reply:
+            raise RuntimeError(f"batched reader: {reply['error']}")
+        return reply
+
+    def read_with_retries(self, indexes: List[int], window: int, retries: int = 0,
+                          timeout: Optional[float] = None, **kwargs: Any) -> Dict[str, Any]:
+        for attempt in range(retries + 1):
+            try:
+                return self.read(indexes, timeout=timeout, **kwargs)
+            except (subprocess.TimeoutExpired, RuntimeError, ValueError, OSError) as error:
+                reason = describe_failure(error)
+                self.stop()
+                if attempt == retries:
+                    raise P4ReadError(f"register read of window {window} failed after {retries + 1} attempt(s): "
+                                      f"{reason}") from error
+                print(f"[WARN] window {window}: register read attempt {attempt + 1} failed ({reason}); "
+                      f"restarting the batched reader and retrying in 2 s")
+                time.sleep(2.0)
+        raise AssertionError("unreachable")
+
+    def stop(self) -> None:
+        proc = self._proc
+        self._proc = None
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None and proc.stdin is not None:
+                proc.stdin.write(json.dumps({"cmd": "quit"}) + "\n")
+                proc.stdin.flush()
+                proc.wait(timeout=3)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        for pipe in (proc.stdin, proc.stdout, proc.stderr):
+            try:
+                if pipe is not None:
+                    pipe.close()
+            except OSError:
+                pass
+
+
+def make_timing_logger(reader_name: str, path: Optional[str] = None) -> Callable[..., None]:
+    """Per window: active-set size and the time spent in the register sync, the
+    reads and the clears (from the reader's payload) next to the wall time of
+    the whole read; the difference is the session/IPC overhead. With path, one
+    JSON object per window is appended to that file."""
+
+    def log(window: int, payload: Dict[str, Any], read_start: float, read_end: float,
+            n_active: int, n_dst: int) -> None:
+        wall_ms = (read_end - read_start) * 1000.0
+        timing = payload.get("timing") or {}
+        sync_s = payload.get("sync_s") or 0.0
+        read_s = payload.get("read_s") or 0.0
+        clear_s = payload.get("clear_s") or 0.0
+        sync_ms = float(timing.get("sync_ms", sync_s * 1000.0))
+        read_ms = float(timing.get("read_ms", max(0.0, read_s - sync_s) * 1000.0))
+        clear_ms = float(timing.get("clear_ms", clear_s * 1000.0))
+        overhead_ms = wall_ms - sync_ms - read_ms - clear_ms
+        rpcs = {k: timing[k] for k in ("sync_rpcs", "read_rpcs", "read_entities", "clear_rpcs") if k in timing}
+        record = {"window": window, "reader": reader_name, "active": n_active, "dst": n_dst,
+                  "snapshot": payload.get("snapshot"), "sync_ms": round(sync_ms, 3), "read_ms": round(read_ms, 3),
+                  "clear_ms": round(clear_ms, 3), "wall_ms": round(wall_ms, 3), "overhead_ms": round(overhead_ms, 3),
+                  "us_per_bucket": round(wall_ms * 1000.0 / n_active, 1) if n_active else None,
+                  "cleared": len(payload.get("cleared") or []), "errors": len(payload.get("errors") or []),
+                  "rpcs": rpcs}
+        print(f"[TIMING] window {window}: reader={reader_name} active={n_active} dst={n_dst} "
+              f"sync={sync_ms:.1f} ms read={read_ms:.1f} ms clear={clear_ms:.1f} ms wall={wall_ms:.1f} ms "
+              f"overhead={overhead_ms:.1f} ms cleared={record['cleared']}"
+              + (f" rpcs={rpcs}" if rpcs else ""), flush=True)
+        if path:
+            with open(path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+
+    return log
+
+
 def run_p4_forwarder(
     forwarder_path: str,
     int_port: int,
@@ -577,9 +793,16 @@ def collect_windows_live(
     read_timeout: Optional[float] = None,
     read_retries: int = 0,
     on_window: Optional[Callable[[Dict[str, object]], None]] = None,
+    read_fn: Optional[Callable[..., Dict[str, Any]]] = None,
+    timing_log: Optional[Callable[..., None]] = None,
 ) -> List[Dict[str, object]]:
     """Per window: the CPU-reported bucket indexes, and the P4 registers of all
     active indexes read at the end of that window.
+
+    The registers are read by read_fn(active_indexes, window, snapshot=...,
+    clear_if_unchanged=..., dst_indexes=...) -> payload, if given (the batched
+    gRPC reader), else by the legacy reader script at reader_path. timing_log,
+    if given, receives every window's payload and read times (make_timing_logger).
 
     A failed register read is retried read_retries times (each attempt
     limited to read_timeout seconds) before P4ReadError ends the collection.
@@ -659,10 +882,16 @@ def collect_windows_live(
             }
 
         read_start = time.time()
-        payload = read_p4_with_retries(reader_path, active_idxs, w, retries=read_retries, timeout=read_timeout,
-                                       switch_ssh=switch_ssh, snapshot=snapshot,
-                                       clear_if_unchanged=clear_candidates, dst_indexes=active_dst_idxs)
+        if read_fn is None:
+            payload = read_p4_with_retries(reader_path, active_idxs, w, retries=read_retries, timeout=read_timeout,
+                                           switch_ssh=switch_ssh, snapshot=snapshot,
+                                           clear_if_unchanged=clear_candidates, dst_indexes=active_dst_idxs)
+        else:
+            payload = read_fn(active_idxs, w, snapshot=snapshot, clear_if_unchanged=clear_candidates,
+                              dst_indexes=active_dst_idxs)
         read_end = time.time()
+        if timing_log is not None:
+            timing_log(w, payload, read_start, read_end, len(active_idxs), len(active_dst_idxs))
 
         for row in payload.get("rows", []):
             idx = safe_int(row.get("idx"))
@@ -1078,6 +1307,32 @@ def main() -> None:
                          "(the reader process itself is stopped 30 s later)")
     ap.add_argument("--p4-read-retries", type=int, default=2,
                     help="retries of a failed register read before the run stops")
+    ap.add_argument("--reader", choices=["legacy", "batched"], default="legacy",
+                    help="register reader: legacy = one bfshell/bfrt_python session per window with one get() per "
+                         "register per bucket (read_registers_with_index.py); batched = one long-lived BF Runtime "
+                         "gRPC client, one Sync and one batched Read per register table per window "
+                         "(batched_reader.py)")
+    ap.add_argument("--batched-reader", default=DEFAULT_BATCHED_READER)
+    ap.add_argument("--grpc-addr", default=DEFAULT_GRPC_ADDR,
+                    help="BF Runtime gRPC server for --reader batched; with --switch-ssh the reader runs on the "
+                         "switch, so this is the address as seen from there")
+    ap.add_argument("--grpc-client-id", type=int, default=7)
+    ap.add_argument("--reader-local", action="store_true",
+                    help="with --switch-ssh: run the batched reader on this host against --grpc-addr (e.g. "
+                         "172.168.1.2:50052 or an SSH tunnel) instead of on the switch; the reports are still "
+                         "captured on the switch")
+    ap.add_argument("--p4-name", default="basic")
+    ap.add_argument("--reader-chunk", type=int, default=4096, help="batched reader: keys per Read request")
+    ap.add_argument("--reader-safe-parse", action="store_true",
+                    help="batched reader: parse responses with the client's to_dict() only (slower)")
+    ap.add_argument("--reader-sync-batched", action="store_true",
+                    help="batched reader: the 14 register Syncs in one Write RPC instead of one per table")
+    ap.add_argument("--remote-sde-install", default=DEFAULT_REMOTE_SDE_INSTALL,
+                    help="SDE install on the switch (--switch-ssh)")
+    ap.add_argument("--reader-timing", action="store_true",
+                    help="print, per window, the active-set size and the time spent in the register sync, the reads "
+                         "and the clears (also enabled by P4_READER_TIMING=1)")
+    ap.add_argument("--reader-timing-file", help="append the per-window timing as JSON lines to this file")
 
     ap.add_argument("--command")
     ap.add_argument("--shell", default="/bin/bash")
@@ -1099,7 +1354,7 @@ def main() -> None:
     if args.mode == "pcap" and not args.pcap:
         ap.error("--pcap is required when --mode pcap")
 
-    for needed in [args.hostmon, args.p4_reader]:
+    for needed in [args.hostmon, args.p4_reader if args.reader == "legacy" else args.batched_reader]:
         if not Path(needed).exists():
             raise FileNotFoundError(f"Required file not found: {needed}")
 
@@ -1115,6 +1370,7 @@ def main() -> None:
     host_proc = None
     workload_proc = None
     report_collector = None
+    batched_reader = None
 
     run_id = f"{args.scenario_name}_{int(time.time())}"
     writer = RunWriter(args.out_csv, run_id)
@@ -1159,6 +1415,22 @@ def main() -> None:
             print(f"[INFO] Clearing the P4 registers via: {args.p4_resetter}")
             run_p4_register_reset(args.p4_resetter, switch_ssh=args.switch_ssh)
 
+        read_fn = None
+        if args.reader == "batched":
+            batched_reader = BatchedReaderProcess(
+                args.batched_reader, grpc_addr=args.grpc_addr, client_id=args.grpc_client_id, p4_name=args.p4_name,
+                switch_ssh=None if args.reader_local else args.switch_ssh,
+                remote_sde_install=args.remote_sde_install, chunk=args.reader_chunk,
+                safe_parse=args.reader_safe_parse, sync_batched=args.reader_sync_batched)
+            ready = batched_reader.start()
+            print(f"[INFO] batched gRPC reader ready: {json.dumps(ready)}")
+
+            def read_fn(idxs, w, **kw):
+                return batched_reader.read_with_retries(idxs, w, retries=args.p4_read_retries,
+                                                        timeout=args.p4_read_timeout, **kw)
+        timing_on = args.reader_timing or args.reader_timing_file or os.environ.get("P4_READER_TIMING") == "1"
+        timing_log = make_timing_logger(args.reader, args.reader_timing_file) if timing_on else None
+
         where = f"{args.switch_ssh}:{args.cpu_iface}" if args.switch_ssh else args.cpu_iface
         print(f"[INFO] Collecting CPU reports on {where}")
         report_collector = ReportCollector(args.cpu_iface, ssh_host=args.switch_ssh).start()
@@ -1191,7 +1463,7 @@ def main() -> None:
             global_t0 = time.time()
             workload_proc = run_scenario_command(args.command, shell=args.shell)
 
-        print("[INFO] Reading P4 registers at the end of every window")
+        print(f"[INFO] Reading P4 registers at the end of every window ({args.reader} reader)")
         collect_windows_live(
             collector=report_collector,
             proc=workload_proc,
@@ -1206,8 +1478,12 @@ def main() -> None:
             read_timeout=args.p4_read_timeout,
             read_retries=args.p4_read_retries,
             on_window=on_window,
+            read_fn=read_fn,
+            timing_log=timing_log,
         )
         report_collector.stop()
+        if batched_reader is not None:
+            batched_reader.stop()
         print(f"[INFO] CPU reports: {sum(w['report_count'] for w in net_windows)} in "
               f"{len(net_windows)} windows; index mismatches: "
               f"{sum(w['index_mismatches'] for w in net_windows)}; idle buckets cleared: "
@@ -1267,6 +1543,9 @@ def main() -> None:
 
         if report_collector is not None:
             report_collector.stop()
+
+        if batched_reader is not None:
+            batched_reader.stop()
 
         if not committed:
             # Keep what was collected; the output CSV only receives complete runs.
