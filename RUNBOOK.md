@@ -960,3 +960,9 @@ Rerun on PC1 (pull first; `--profile switch`, the stand-in captures):
   5,400 buckets. After (c) the occupancy check should find 0 occupied, and (d) should report
   2,768 of 2,768 flows with the CSV sums equal to the truth.
 - (a) and (b) as a regression (Section 11.2's criteria).
+
+The dataset's own captures are now in the repository: `live_test/captures/bulk2000.pcap`
+(heavy benign, for (b)) and `live_test/captures/syn_fan_40k.pcap` (the SYN fan-out, for (c)),
+each with its truth and the replay commands in `live_test/captures/README.md`. Note that the
+dataset's SYN flood is a 0.70 s burst at 57,000 SYNs/s: replay it with `--pps 2000` to compare
+with the stand-in, and at its original timing for the burst.
