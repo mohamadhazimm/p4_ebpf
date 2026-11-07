@@ -591,3 +591,136 @@ sudo python3 hybrid_collector.py --profile switch --mode command --scenario-name
 
 Expect `HOSTMON_READY`, then `HOSTMON_HEALTH {'lost': 0, 'capacity_errors': 0, ...}` at the end,
 and host rows whose `host_window_start_sec` equals the network windows' (the shared origin).
+
+## 12. Results on the switch (2026-11-07): Sections 10 and 11.2-11.3
+
+Run from PC1 with HEAD's P4 (`basic_newconn_head`) and HEAD's `batched_reader.py` on the
+switch. The raw data is in the git-ignored run dir `perf/results/cadence_raw_20261107_102808/`
+(README with every number, logs `NNN_*.txt`, the scripts used in `scripts/`).
+
+Deviations:
+
+- 11.2 (b) and (c): the dataset captures are not on PC1. (b) is Section 9's `ab_mix.pcap`
+  (2,768 flows, exact truth) at x59: 20 s, ~140 new flows/s, ~558 active buckets.
+- (c) is a stand-in: 40,000 single-packet SYN flows to 5,000 addresses and ports 1-1024 in
+  20 s, which touch 29,902 distinct buckets.
+- 11.3 ran on PC1 with `hostmon_agg` built there (clang 10 needs `-fno-common`) on
+  `/sys/fs/cgroup/unified/hazim_collect` (PC1 has the hybrid cgroup layout).
+- 11.1 was not run: no model on PC1.
+
+### 12.1 Section 10: the wire-format route on the switch
+
+- The probe reports `protobuf 3.6.1/cpp`: the switch's client does have the C implementation,
+  so Section 10's `python` column is not the switch.
+- `--raw-wire`: `raw_equals_safe: true`.
+- Timing table, `--raw-wire --sync-batched`, every bucket cleared each window:
+
+  | active | sync ms | read ms | clear ms | total ms | us/bucket |
+  |---|---|---|---|---|---|
+  | 100 | 30.5 | 77.3 | 15.0 | 122.9 | 1229 |
+  | 500 | 30.5 | 311.1 | 44.2 | 385.8 | 772 |
+  | 1,000 | 30.8 | 557.6 | 89.1 | 677.5 | 678 |
+  | 2,000 | 31.7 | 1,076.5 | 177.6 | 1,285.8 | 643 |
+  | 5,000 | 31.2 | 2,638.9 | 418.8 | 3,088.9 | 618 |
+  | 10,000 | 30.4 | 5,032.6 | 836.6 | 5,899.6 | 590 |
+  | 20,000 | 31.1 | 10,655.8 | 1,674.8 | 12,361.7 | 618 |
+
+  - Reads 0.50-0.56 ms per bucket and clears 0.084-0.089 ms. The fast route in the same session
+    gives 1.12-1.19 and 0.58-0.72 ms.
+  - So the raw route is 2.1x cheaper for reads, 6.5-8.6x for clears, 2.6-3.1x in total.
+    Section 10 expected 0.3-0.4 ms reads and 0.3 ms clears.
+  - CPU at 2,000 buckets: client 71% of a core, bf_switchd 44% (fast route: 90% / 26%).
+  - What is left per bucket is about 0.24 ms of client decoding (17 us per entity, measured
+    without a server) and about 0.28 ms of server work.
+  - Capacity: a 0.5 s window holds about 750-880 active buckets, an 800 ms budget about
+    1,240-1,450. Section 10 expected 1,000-1,300 per 0.5 s.
+- Known answer (Section 3) with `--raw-wire`: every field equals the expected value and the
+  legacy reader. Clear with a stale count: nothing. With the right count: cleared in 1 RPC,
+  all zero, dst kept. Re-report: pkts 1, dst 2.
+- Live A/B with `--raw-wire --sync-batched`: **PASS**.
+  - Flow rows: 15,443 identical, 0 mismatches.
+  - dst rows: 54 identical and 173 "later larger", 0 mismatches (the new classification
+    works on hardware).
+  - Wall time at ~915 active: batched 0.60-0.67 s (fast route 1.21 s), legacy 4.5-5.1 s.
+- Collector, 10 s windows, raw route: CSV sums equal the truth. Wall per window: median
+  474 ms (fast route 917).
+- No tcpdump and no `/tmp/batched_reader_*.py` were left on the switch after nine runs
+  (open item 6 holds).
+
+Section 10's condition holds: 1 shows `raw_equals_safe: true` and 2-4 pass, so
+`--reader batched --reader-raw-wire --reader-sync-batched` can be the switch default (as
+`--profile switch` already sets).
+
+### 12.2 Section 11.2: `--profile switch`
+
+| run | windows | active median / max | overload rows | overrun rows | wall median / max | CSV sums |
+|---|---|---|---|---|---|---|
+| (a) ab_mix x6.5 | 182 | 62 / 70 | 0 | 0 | 101 / 135 ms | = truth |
+| (b) ab_mix x59 | 21 | 558 / 569 | 0 | 0 | 445 / 498 ms | = truth |
+| (c) SYN fan-out stand-in | 25 | 5,019 / 6,624 | 24 | **19** | 783 / **953** ms | read buckets only |
+| (d) ab_mix x59 right after (c), `--no-register-reset` | 22 | 296 / 318 | 0 | 0 | 266 / 341 ms | **19,023 of 35,388 packets** |
+
+**(a) and (b)** pass every criterion. `rep_new_flows` equals the report count in every run.
+
+**(c)** shows the overload mode working:
+
+- `net_overload` 1 from the first busy window; ~1,180 buckets read per window once the cost
+  model has converged.
+- `rep_new_flows` 29,902, equal to the capture's distinct buckets.
+- `rep_new_flows_per_sec` up to 1,697 (the replay ran at ~1,730 packets/s).
+- `rep_distinct_dst_ips` up to 1,433 per window.
+
+(c) fails two criteria and shows two design problems:
+
+1. **The budget does not keep the window on time.**
+   - From window 6 on, the reads take 690-870 ms and still end after the next window boundary,
+     so each read starts 250-300 ms late. `wall_ms` > 800 in 9 windows; the lag reaches 1.1 s
+     by window 21.
+   - The late start comes from the collector's own work per window on PC1, which the budget
+     does not count: ~1,500 reports per window (`take()`, two Python CRCs per report for the
+     dst index) and ~1,150 rows to process.
+   - The cost model starts from the fast route's values (70 ms + 1.3 ms per bucket, EMA 0.3), so
+     window 1 read 615 of 1,775 buckets. Windows only reached ~1,180 buckets from window 11.
+   - The per-bucket cost the collector learns, 0.62-0.70 ms, is above the bench's 0.53.
+   - Suggestions:
+     - compute the allowance from the time left until the next boundary, minus the measured
+       per-window processing, instead of a fixed fraction from the read's start;
+     - count the clears and the dst reads in the cost;
+     - start the cost model from the route in use (raw: ~65 ms fixed, 0.62 ms per bucket read,
+       0.09 ms per bucket cleared).
+2. **Under overload no bucket is ever cleared.**
+   - (c) cleared 0 buckets. A bucket is read once, in its report window. After that, newer
+     buckets outrank it, so it never reaches 3 idle reads, and it leaves the active set at its
+     TTL without a clear.
+   - After (c), all 29,902 flood buckets were still occupied (`024_occupancy_after_flood`: 46%
+     of 65,536).
+   - (d) measures the effect. The same benign capture, replayed right after the flood without
+     the register reset, gave 1,493 CPU reports for 2,768 flows (54%; the occupancy predicts
+     1,505), and the CSV holds 54% of its packets.
+   - So until the next register reset the collector misses about half of all new flows: a
+     flood blinds the monitor to the traffic that follows it.
+   - A fix has to clear the buckets that leave the active set unread, for example:
+     - a blind clear on expiry (raw clears cost 0.09 ms per bucket, counted in the budget);
+     - or, under overload, reading and clearing the oldest buckets as well as the newest.
+
+### 12.3 Section 11.3: `hostmon_agg` on PC1 with the switch
+
+Command: `--profile switch --hostmon hostmon_agg --hostmon-cgroup
+/sys/fs/cgroup/unified/hazim_collect`, scenario `benign_workload.sh fanout; tcpreplay ...
+ab_mix.pcap x59`.
+
+- `HOSTMON_READY`, then `HOSTMON_HEALTH {'lost': 0, 'capacity_errors': 0, 'late_events': 0,
+  'failed': 0}`.
+- Host and network window start and end are equal in all 26 rows (the shared origin).
+- The host rows show the fan-out (14-21 processes), then tcpreplay.
+- The network CSV sums equal the truth.
+- The cgroup was created and removed.
+
+Notes:
+
+- On a host with the hybrid cgroup layout the cgroup must be under `/sys/fs/cgroup/unified/`,
+  not the RUNBOOK's `/sys/fs/cgroup/hazim_collect`.
+- `ebpf_perf/build.sh` assumes the workstation's clang 14 and bpftool.
+- `test_agg_equiv` does not build from this repo: it includes
+  `libbpf-bootstrap/examples/c/hostmon.c`, and the committed copy is older than the one the
+  test was written against (no `monotonic_ns`, `capacity_errors`, ...).
