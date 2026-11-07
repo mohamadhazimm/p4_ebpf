@@ -34,12 +34,33 @@ from typing import Union
 FLOW_BUCKETS = 65536
 
 
-def crc16_arc(data: bytes) -> int:
+def crc16_arc_bitwise(data: bytes) -> int:
+    """CRC-16/ARC bit by bit (reflected polynomial 0xA001): the reference for
+    crc16_arc() below, and how the index was computed before 2026-11-07."""
     crc = 0
     for b in data:
         crc ^= b
         for _ in range(8):
             crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+    return crc
+
+
+def _crc16_arc_table() -> tuple:
+    return tuple(crc16_arc_bitwise(bytes([b])) for b in range(256))
+
+
+_CRC16_ARC_TABLE = _crc16_arc_table()
+
+
+def crc16_arc(data: bytes) -> int:
+    """CRC-16/ARC with one table lookup per byte, equal to crc16_arc_bitwise()
+    (tests/test_flow_index.py). The bitwise loop cost ~45 us per key in CPython
+    on PC1, which at flood rates took 130-260 ms of each 1 s window
+    (RUNBOOK.md section 13.2)."""
+    crc = 0
+    table = _CRC16_ARC_TABLE
+    for b in data:
+        crc = (crc >> 8) ^ table[(crc ^ b) & 0xFF]
     return crc
 
 

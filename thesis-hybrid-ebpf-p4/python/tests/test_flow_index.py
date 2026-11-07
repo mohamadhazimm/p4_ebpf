@@ -3,13 +3,24 @@ from __future__ import annotations
 import random
 import unittest
 
-from flow_index import compute_flow_index, compute_flow_index_symmetric, compute_newconn_dst_index, crc16_arc
+from flow_index import (compute_flow_index, compute_flow_index_symmetric, compute_newconn_dst_index, crc16_arc,
+                        crc16_arc_bitwise)
 
 
 class FlowIndexTests(unittest.TestCase):
     def test_crc16_arc_check_value(self):
         # Standard CRC-16/ARC check value for the ASCII string "123456789".
         self.assertEqual(crc16_arc(b"123456789"), 0xBB3D)
+        self.assertEqual(crc16_arc_bitwise(b"123456789"), 0xBB3D)
+
+    def test_the_table_crc_equals_the_bitwise_crc(self):
+        rng = random.Random(7)
+        for n in list(range(0, 20)) + [64, 255]:
+            for _ in range(200):
+                data = bytes(rng.getrandbits(8) for _ in range(n))
+                self.assertEqual(crc16_arc(data), crc16_arc_bitwise(data), data.hex())
+        for b in range(256):
+            self.assertEqual(crc16_arc(bytes([b, 0xFF - b, b])), crc16_arc_bitwise(bytes([b, 0xFF - b, b])))
 
     def test_index_is_symmetric_in_both_directions(self):
         rng = random.Random(1)

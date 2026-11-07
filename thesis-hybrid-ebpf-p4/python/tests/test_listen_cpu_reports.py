@@ -11,7 +11,7 @@ import time
 import unittest
 from pathlib import Path
 
-from flow_index import compute_flow_index
+from flow_index import compute_flow_index, compute_newconn_dst_index
 from listen_cpu_reports import LEGACY_MAGIC, MAGIC, ReportCollector, iter_pcap_stream, parse_cpu_report
 
 PACKET_TAIL = bytes(range(46))  # mirrored copies carry the start of the packet after the report
@@ -34,6 +34,13 @@ class ParseCpuReportTests(unittest.TestCase):
         self.assertEqual(parsed["idx_computed"], expected)
         self.assertEqual((parsed["src_ip"], parsed["sport"], parsed["dst_ip"], parsed["dport"]),
                          ("10.0.0.1", 1234, "10.0.0.2", 80))
+
+    def test_a_tcp_report_carries_its_destination_bucket(self):
+        parsed = parse_cpu_report(report(MAGIC, "10.99.6.1", "10.99.6.2", 40000, 80, 6, idx=1))
+        self.assertEqual(parsed["dst_idx"], compute_newconn_dst_index("10.99.6.1", "10.99.6.2", 80, 6))
+        self.assertEqual(parsed["dst_idx"], 11438)   # the compiled hash's known answer (test_flow_index)
+        udp = parse_cpu_report(report(MAGIC, "10.99.6.1", "10.99.6.2", 40000, 80, 17, idx=1))
+        self.assertIsNone(udp["dst_idx"])
 
     def test_reported_index_wins_over_the_computed_one(self):
         parsed = parse_cpu_report(report(MAGIC, "10.0.0.1", "10.0.0.2", 1234, 80, 6, idx=7))

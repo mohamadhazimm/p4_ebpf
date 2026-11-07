@@ -212,8 +212,13 @@ def alive(pid):
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
-    with open(f"/proc/{pid}/stat") as f:   # a zombie is not running
-        return f.read().split()[2] != "Z"
+    try:
+        with open(f"/proc/{pid}/stat") as f:   # a zombie is not running
+            return f.read().split()[2] != "Z"
+    except (FileNotFoundError, ProcessLookupError):
+        # Reaped between the two checks: FileNotFoundError before the open,
+        # ProcessLookupError (ESRCH) between the open and the read.
+        return False
 
 
 class HostmonStopTests(unittest.TestCase):

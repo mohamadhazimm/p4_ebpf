@@ -25,7 +25,7 @@ import threading
 import time
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
-from flow_index import compute_flow_index
+from flow_index import compute_flow_index, compute_newconn_dst_index
 
 MAGIC = 0xBEF1          # cpu_report_t with flow_index
 LEGACY_MAGIC = 0xBEEF   # cpu_report_t without flow_index
@@ -44,6 +44,10 @@ def parse_cpu_report(raw: bytes) -> Optional[Dict[str, object]]:
     if magic not in (MAGIC, LEGACY_MAGIC):
         return None
     computed = compute_flow_index(src_ip_raw, dst_ip_raw, sport, dport, proto)
+    # The reg_newconn_dst bucket of a TCP report, computed here in the capture
+    # thread as the report arrives, so that hybrid_collector.py's window loop
+    # does not compute it at the window boundary (RUNBOOK.md section 13.3).
+    dst_idx = compute_newconn_dst_index(src_ip_raw, dst_ip_raw, dport, proto) if proto == 6 else None
     if magic == MAGIC:
         if len(raw) < REPORT_LEN:
             return None
@@ -62,6 +66,7 @@ def parse_cpu_report(raw: bytes) -> Optional[Dict[str, object]]:
         "idx": idx,
         "idx_source": source,
         "idx_computed": computed,
+        "dst_idx": dst_idx,
     }
 
 
