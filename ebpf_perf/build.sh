@@ -64,6 +64,7 @@ cc -std=gnu11 -O2 -g -Wall -Wno-unused-function -Wno-stringop-truncation -I"$OUT
 
 (cd "$OUT" && sha256sum hostmon.bpf.c hostmon.c hostmon.h hostmon.bpf.o hostmon bench_load \
     "${AGG_SRC[@]}" hostmon_agg.bpf.o hostmon_agg > sha256.txt)
-"$BPFTOOL" --version | head -1 > "$OUT/bpftool-version.txt"
-"$CLANG" --version | head -1 > "$OUT/clang-version.txt"
+# sed reads to the end: with head the writer can get SIGPIPE, and pipefail ends the script (exit 141).
+"$BPFTOOL" --version | sed -n 1p > "$OUT/bpftool-version.txt"
+"$CLANG" --version | sed -n 1p > "$OUT/clang-version.txt"
 echo "built: $OUT/hostmon $OUT/hostmon_agg $OUT/bench_load"
