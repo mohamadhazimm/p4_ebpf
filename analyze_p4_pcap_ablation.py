@@ -60,7 +60,12 @@ P4_FEATURES = [
     "net_syn_delta",
     "net_ack_delta",
     "net_rst_delta",
-    "net_new_conn_dst_max",
+    # net_new_conn_dst_max IS computed by derive_p4_features, but is deliberately kept OUT
+    # of this canonical list: prepare() reads these as per-window telemetry.csv columns, and
+    # the frozen .21 captures predate the feature, so including it here breaks prepare() and
+    # would move revision5/aggregate off the frozen 145-wide contract. It is scoped to the
+    # flood/network evaluation (PCAP-derived) only. Do not re-add here without regenerating
+    # the stored per-window telemetry from PCAPs.
     "net_flows_with_ab",
     "net_flows_with_ba",
     "net_dir_valid_count",
@@ -198,7 +203,14 @@ def derive_p4_features(
     telemetry_rows: list[dict[str, str]],
     run_metadata: dict,
     active_ttl_windows: int = 3,
+    *,
+    byte_layer: str = "ipv4",
+    rate_window: str = "recorded",
 ) -> tuple[dict[str, float], list[dict[str, float]], dict[str, int | float | str]]:
+    if byte_layer not in {"ipv4", "ethernet"}:
+        raise ValueError("byte_layer must explicitly select ipv4 or ethernet")
+    if rate_window not in {"recorded", "nominal"}:
+        raise ValueError("rate_window must explicitly select recorded or nominal")
     if not telemetry_rows:
         raise ValueError(f"No telemetry windows found for {pcap_path}")
 
@@ -247,7 +259,10 @@ def derive_p4_features(
         source = (ip_layer.src, int(transport.sport))
         destination = (ip_layer.dst, int(transport.dport))
         key = (int(ip_layer.proto), *sorted((source, destination)))
-        packet_length = len(packet)
+        packet_length = (
+            len(packet) if byte_layer == "ethernet"
+            else int(ip_layer.len) if ip_layer.len is not None else len(bytes(ip_layer))
+        )
         first_source = first_source_by_flow.setdefault(key, source)
         direction = "ab" if source == first_source else "ba"
         if packet.haslayer(TCP):
@@ -359,7 +374,12 @@ def derive_p4_features(
         ab_bytes = summary["net_bytes_ab_delta"]
         ba_packets = summary["net_pkts_ba_delta"]
         ba_bytes = summary["net_bytes_ba_delta"]
-        duration = window_seconds
+        telemetry_window = telemetry_rows[window_index]
+        duration = (
+            utc_timestamp(telemetry_window["window_end_utc"]) - utc_timestamp(telemetry_window["window_start_utc"])
+            if rate_window == "recorded" and telemetry_window.get("window_start_utc") and telemetry_window.get("window_end_utc")
+            else window_seconds
+        )
         summary.update(
             {
                 "net_min_len_mean": statistics.mean(min_lengths) if min_lengths else 0.0,
@@ -408,6 +428,9 @@ def derive_p4_features(
     )
     diagnostics = {
         **alignment,
+        "p4_feature_schema": f"2026-10-19.2-{byte_layer}-bytes-{rate_window}-rates",
+        "p4_byte_layer": "ipv4.totalLen" if byte_layer == "ipv4" else "legacy-captured-ethernet",
+        "p4_rate_window": rate_window,
         "pcap_frame_count": pcap_frame_count,
         "pcap_frames_in_windows": pcap_frames_in_windows,
         "pcap_frames_outside_windows": pcap_frame_count - pcap_frames_in_windows,
