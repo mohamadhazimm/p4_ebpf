@@ -1,0 +1,49 @@
+{
+ "source": {
+  "file": "syn_fan_40k.pcap",
+  "sha256": "787dac854e76ad6c42263ce4a30f401e0f0c739a363ce204568112147057265d",
+  "bytes": 3607940
+ },
+ "frames": 40212,
+ "packets": 39863,
+ "packets_int_side": 39861,
+ "flow_count": 39857,
+ "flows_listed": false,
+ "flows": [],
+ "newconn_dst": [],
+ "newconn_dst_summary": {
+  "keys": 29888,
+  "syn_without_ack": 39857,
+  "dst_buckets": 29888
+ },
+ "totals": {
+  "pkts": 39863,
+  "bytes": 2391748,
+  "pkts_ab": 39861,
+  "bytes_ab": 2391628,
+  "syn": 39859,
+  "ack": 6,
+  "rst": 2,
+  "frame_bytes": 2949830
+ },
+ "totals_bucket_model": {
+  "pkts_ab": 39862,
+  "bytes_ab": 2391688
+ },
+ "buckets": {
+  "distinct": 29843,
+  "shared": 8163,
+  "flows_in_shared": 18177,
+  "max_flows_in_one": 6
+ },
+ "per_1s_window": {
+  "windows": 24,
+  "new_buckets_max": 28501,
+  "new_buckets_median": 0,
+  "active_buckets_max": 29843,
+  "active_buckets_median": 0,
+  "ttl_windows": 3
+ },
+ "duration_s": 23.337743997573853,
+ "capture_duration_s": 23.338052988052368
+}
