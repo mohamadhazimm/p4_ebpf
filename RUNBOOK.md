@@ -1287,3 +1287,71 @@ the scripts in `scripts/`). Unit tests: 118 OK, with and without SDE 9.6's `bfru
   - per-window results from those runs should not be used as window-exact.
 - **Note:** with immediate mode a burst window's `cpu_indexes` CSV field reaches ~150 KB, so
   readers using Python's `csv` module need `csv.field_size_limit()` raised.
+
+## 19. For the VM side: how to run the end-to-end evaluation (decision needed, 2026-11-07)
+
+Written on PC1 after Section 18 for the agent and the user on the VM, where `hybrid_collector.py`
+runs with HostMon (eBPF) and the Tofino model (`--profile model`). Nothing is decided yet; the
+answers to 19.3 decide it. Paths in `dataset-construction/` are in the dataset repository.
+
+### 19.1 What limits the choice
+
+- **The model only manages 60 s windows** (`--profile model`; its 15 syncs take 45-140 s, sync
+  plus read 52-232 s per window). The hardware switch reads exactly every 1 s (Sections 15-18).
+- **The trained detection model uses 0.5 s windows and ~20 s samples:**
+  - `dataset-construction/scripts/vbox_malware_batch.sh:64` `WINDOW_SEC="0.5"`, the default,
+    to be confirmed from the cohort's run metadata;
+  - `:63` `TIMEOUT="20"`, the per-sample runner timeout;
+  - the two cohort captures in `live_test/captures/` last 22.2 s and 23.3 s.
+- **The inference statistics** are mean, max, sum, std and active_windows over a sample's
+  windows (`dataset-construction/src/live_arm_inference.py:12`). 7 of the 9 network metrics are
+  per-window totals; only `net_bytes_per_second` and `net_packets_per_second` are rates
+  (`thesis-hybrid-ebpf-p4/python/live_feature_export.py:64-74`).
+- **So at 60 s windows a 20 s sample is one partial window:** mean = max = sum, std = 0,
+  active_windows = 1. That input is outside what the model was trained on, whatever the
+  values. Retraining at 60 s cannot fix it, because a sample is shorter than one window.
+- **Host metrics:**
+  - the counts (`host_exec_total`, `host_connect_total`, `host_file_events_total`) can be
+    summed from 0.5 s windows into longer ones;
+  - `host_active_processes`, `host_entropy_mean/max`, `host_avg_run_length_mean/max` and
+    `host_cpu_percent` cannot.
+- **The live network values also differ from the training ones**, at any window length.
+  Training measured in the guest (`dataset-construction/src/malware_runner.py`):
+  - two unidirectional flows per connection, against one symmetric bucket on the switch;
+  - whole frames, against the IPv4 length;
+  - all frames, against IPv4 TCP/UDP only;
+  - the guest's send and receive, against the direction of the bucket's first packet.
+
+### 19.2 Options
+
+| | how | gives | costs |
+|---|---|---|---|
+| **A** (recommended from PC1) | Compute the 9 network metrics of every cohort sample from its packet capture with the switch's rules at 0.5 s windows and retrain. Check the extractor by replaying cohort captures through the Wedge100BF at `--window-sec 0.5`, window by window. For detection, run inference on the switch's windows plus the same sample's recorded eBPF windows. Run the VM + model once live as a demonstration. | Detection results from the real P4 program on hardware, comparable to training; no malware on NETLAB (only packets are replayed) | the extractor and a retrain; a 0.5 s capacity run on the switch; the host side comes from recordings |
+| **B** | Live on the VM + model at 60 s | The whole pipeline running with live malware | No comparable detection numbers (19.1) |
+| **C** | Retrain at 1 s, the switch's measured cadence | The hardware at its proven cadence | Exact host features at 1 s only if each sample's raw eBPF events were kept (19.1) |
+| **D** | On the VM, compute the 9 network metrics in software from the live packets with the switch's rules, at 0.5 s; the model cannot keep up, so it stays out of the feature path | Live malware runs with features comparable to training | The P4 program is not in the loop for the numbers; the software rules need A's hardware check |
+
+### 19.3 Questions for the VM side
+
+1. Which window length and sample length did the trained model use? A cohort run's
+   `window_seconds` and observation length would tell.
+2. Are each sample's raw eBPF events kept, or only its 0.5 s windows? This decides C.
+3. Does `analyze_p4_pcap_ablation.py` (after 0b64bef) already follow the switch's rules? Those
+   are: IPv4 length, one symmetric bucket per CRC16 index with collisions merged, IPv4 TCP/UDP
+   only, direction from the bucket's first packet. If it does, A's extractor is mostly done.
+4. What must the thesis show:
+   - that the pipeline runs live (B or D);
+   - that live detection matches offline detection (A);
+   - or both (A + B)?
+
+### 19.4 What PC1 can do once decided
+
+- **The 0.5 s capacity run on the switch:** bulk2000 and the flood at `--window-sec 0.5`. It is
+  not measured yet; the estimate:
+  - the allowance would be 0.7 x 500 = 350 ms;
+  - at 65 + 23 ms per read and 0.56 ms per bucket, that holds roughly 430 buckets next to ~60
+    clears;
+  - bulk2000 had at most 456 active buckets at 1 s windows (3 s TTL), so about 250-300 are
+    expected at 0.5 s (1.5 s TTL).
+- **Replays through the switch** of any cohort capture added to the repository, compared window
+  by window with an offline extractor.
