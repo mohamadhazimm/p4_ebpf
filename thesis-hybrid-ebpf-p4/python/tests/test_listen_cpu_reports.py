@@ -26,6 +26,10 @@ def report(magic, src, dst, sport, dport, proto, idx=None):
 
 
 class TakeTests(unittest.TestCase):
+    def test_not_ready_before_the_capture_listens(self):
+        rc = ReportCollector("veth5")
+        self.assertFalse(rc.wait_ready(0.05))
+
     def test_take_and_take_after(self):
         rc = ReportCollector("veth5")
         rc._reports.extend([(1.0, {"idx": 1}), (2.0, {"idx": 2}), (3.0, {"idx": 3})])
@@ -92,6 +96,9 @@ class RemoteCaptureTests(unittest.TestCase):
             import os, struct, sys, time
             frame = bytes.fromhex(%r)
             out = sys.stdout.buffer
+            time.sleep(0.3)                     # tcpdump takes a while to open the device
+            sys.stderr.write("tcpdump: listening on enp5s0, link-type EN10MB (Ethernet), capture size 128 bytes\\n")
+            sys.stderr.flush()
             out.write(struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 262144, 1))
             out.write(struct.pack("<IIII", 1, 0, len(frame), len(frame)) + frame)
             out.flush()
@@ -114,6 +121,9 @@ class RemoteCaptureTests(unittest.TestCase):
         os.environ["PATH"] = str(d) + os.pathsep + saved_path
         try:
             rc = ReportCollector("enp5s0", ssh_host="root@switch").start()
+            self.assertTrue(rc.wait_ready(10))                 # the workload may start now (RUNBOOK 18)
+            self.assertEqual(rc.capture_messages, ["tcpdump: listening on enp5s0, link-type EN10MB (Ethernet), "
+                                                   "capture size 128 bytes"])
             deadline = time.time() + 10
             while time.time() < deadline and not pidfile.exists():
                 time.sleep(0.05)

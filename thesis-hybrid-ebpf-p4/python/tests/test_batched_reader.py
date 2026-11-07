@@ -346,6 +346,29 @@ class UnconditionalClearTests(unittest.TestCase):
         self.assertEqual(again["rows"][0]["pkts"], 0)
         self.assertGreater(again["timing"]["sync_rpcs"], 0)
 
+    @unittest.skipUnless(HAS_PB2, "the one-Write clear routes need the generated bfruntime_pb2")
+    def test_a_clear_zeroes_each_bucket_in_consecutive_updates_direction_reference_first(self):
+        # RUNBOOK 18: ordered register by register, a bucket's 14 registers were zeroed up to the whole Write
+        # apart, and a packet in between left it torn (reg_dir_valid 0, pkts 1, no CPU report).
+        for route, kw in (("raw", {"raw": True}), ("fast", {"fast": True})):
+            sw = bfrt_mock.MockSwitch()
+            play_known_answer(sw)
+            other = (KNOWN_IDX + 1) % 65536 or 1
+            sw.packet(other, 0, 100, 40000, 80)
+            reader = make_batched(sw, **kw)
+            order, write = [], sw.write
+            sw.write = lambda name, idx, value: (order.append((name, idx)), write(name, idx, value))[1]
+            payload = run_batched(reader, [], clear_indexes=[KNOWN_IDX, other])
+            n = len(reader.flow_tables)
+            self.assertEqual(sorted(payload["cleared"]), sorted([KNOWN_IDX, other]), route)
+            self.assertEqual([i for _, i in order], [KNOWN_IDX] * n + [other] * n, route)
+            for bucket in (order[:n], order[n:]):
+                names = [name for name, _ in bucket]
+                self.assertEqual(names[:3], batched_reader.CLEAR_FIRST, route)
+                self.assertEqual(sorted(names), sorted(t.name for t in reader.flow_tables), route)
+            for reg in batched_reader.REG_NAMES:
+                self.assertFalse(any(sw.hw[reg].get(KNOWN_IDX, [])) or any(sw.hw[reg].get(other, [])), (route, reg))
+
     def test_idle_and_unconditional_clears_travel_together_and_are_not_double_counted(self):
         sw = bfrt_mock.MockSwitch()
         play_known_answer(sw)

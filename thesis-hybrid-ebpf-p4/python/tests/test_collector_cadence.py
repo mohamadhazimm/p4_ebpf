@@ -250,14 +250,14 @@ class ReadBudgetTests(unittest.TestCase):
 
     def test_a_one_bucket_first_window_does_not_overload_the_benign_windows_after_it(self):
         class RequestCostReader(FakeReader):
-            """The raw route's measured shape: a read 23 ms plus 0.56 ms per unit, a clear 3 ms plus 0.088 per bucket."""
+            """The raw route's measured shape: a read 23 ms plus 0.56 ms per unit, a clear 3 ms plus 0.105 per bucket."""
 
             def __call__(self, indexes, w, **kw):
                 payload = super().__call__(indexes, w, **kw)
                 units = len(indexes) + hc.ReadCostModel.DST_WEIGHT * len(kw.get("dst_indexes") or [])
                 n_clear = len(payload["cleared"])
                 payload["timing"]["read_ms"] = 23.0 + 0.56 * units if units else 0.0
-                payload["timing"]["clear_ms"] = 3.0 + 0.088 * n_clear if n_clear else 0.0
+                payload["timing"]["clear_ms"] = 3.0 + 0.105 * n_clear if n_clear else 0.0
                 return payload
 
         reports = {0: [report(0, proto=17)]}                                         # the connection probe alone
@@ -398,17 +398,17 @@ class HelperTests(unittest.TestCase):
     def test_cost_model_routes_dst_weight_and_clears(self):
         raw = hc.ReadCostModel.for_route("raw")
         self.assertEqual((raw.route, raw.fixed_ms, raw.read_fixed_ms, raw.read_ms_per_bucket, raw.clear_fixed_ms,
-                          raw.clear_ms_per_bucket, raw.min_rate_units), ("raw", 65.0, 23.0, 0.56, 3.0, 0.088, 20.0))
+                          raw.clear_ms_per_bucket, raw.min_rate_units), ("raw", 65.0, 23.0, 0.56, 3.0, 0.105, 20.0))
         for route in hc.ROUTE_COSTS:
             self.assertEqual(hc.ReadCostModel.for_route(route).route, route)
         # 1 s window, 70%: the raw route fits (700 - 65 - 23) // 0.56 buckets; 200 clears (their Write and
-        # 0.088 ms each) and 100 dst reads take their share
+        # 0.105 ms each) and 100 dst reads take their share
         self.assertEqual(raw.buckets_within(700.0), int((700 - 65 - 23) // 0.56))
         self.assertEqual(raw.buckets_within(700.0, n_cleared=200, n_dst=100),
-                         int((700 - 65 - 23 - 3 - 200 * 0.088 - 100 * hc.ReadCostModel.DST_WEIGHT * 0.56) // 0.56))
-        self.assertEqual(raw.clears_within(100.0), int(100 // 0.088))
+                         int((700 - 65 - 23 - 3 - 200 * 0.105 - 100 * hc.ReadCostModel.DST_WEIGHT * 0.56) // 0.56))
+        self.assertEqual(raw.clears_within(100.0), int(100 // 0.105))
         self.assertEqual(raw.clears_within(0.0), 0)
-        self.assertAlmostEqual(raw.predict_ms(100, n_cleared=10, n_dst=20), 65 + 23 + 103 * 0.56 + 3 + 10 * 0.088)
+        self.assertAlmostEqual(raw.predict_ms(100, n_cleared=10, n_dst=20), 65 + 23 + 103 * 0.56 + 3 + 10 * 0.105)
         self.assertAlmostEqual(raw.predict_ms(0), 65.0)                              # nothing read or cleared
         # the per-bucket read cost is fitted per flow-bucket unit, a dst read counting DST_WEIGHT of one
         m = hc.ReadCostModel(fixed_ms=10.0, read_ms_per_bucket=1.0, clear_ms_per_bucket=1.0, alpha=1.0)
@@ -432,7 +432,7 @@ class HelperTests(unittest.TestCase):
         # request overhead. Learned per bucket, that was 18.6 ms, and five benign windows were then overloaded.
         raw = hc.ReadCostModel.for_route("raw")
         raw.update(1, 1, {"sync_ms": 33.0, "read_ms": 21.0, "clear_ms": 3.0, "overhead_ms": 2.0}, n_dst=1)
-        self.assertEqual((raw.read_ms_per_bucket, raw.clear_ms_per_bucket), (0.56, 0.088))
+        self.assertEqual((raw.read_ms_per_bucket, raw.clear_ms_per_bucket), (0.56, 0.105))
         # a large read moves the per-bucket costs, with the per-request parts taken off first
         m = hc.ReadCostModel.for_route("raw", alpha=1.0)
         m.update(1016, 1600, {"sync_ms": 33.0, "read_ms": 612.0, "clear_ms": 144.0, "overhead_ms": 43.0}, n_dst=256)

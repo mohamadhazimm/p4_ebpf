@@ -107,6 +107,10 @@ class ReportCollector:
         self.on_report = on_report
         self._reports: List[Tuple[float, Dict[str, object]]] = []
         self._lock = threading.Lock()
+        # Set once the capture is listening (remote: tcpdump has printed "listening on"); a report
+        # sent before that reaches nobody, and its bucket stays occupied and unknown (RUNBOOK 18).
+        self._ready = threading.Event()
+        self.capture_messages: List[str] = []   # the remote tcpdump's stderr lines after its PID
         self._sniffer = None
         self._proc = None
         self._thread = None
@@ -129,8 +133,12 @@ class ReportCollector:
             # stop() can kill it: without a terminal, sshd does not end the
             # command when the local ssh is terminated, and tcpdump would run on
             # until its next write to the closed pipe, i.e. the next report.
-            cmd = "echo $$ >&2; exec tcpdump -i %s -U -s 128 -w - %s" % (shlex.quote(self.iface),
-                                                                          shlex.quote(TCPDUMP_FILTER))
+            # --immediate-mode: without it libpcap hands the captured reports over in blocks, at the
+            # latest when its 1 s buffer timeout expires, so they reached the collector in one burst
+            # per ~1.016 s. The burst drifted across a window boundary: one window got no reports and
+            # every later one the previous window's (RUNBOOK 18). -U then flushes each one at once.
+            cmd = "echo $$ >&2; exec tcpdump -i %s --immediate-mode -U -s 128 -w - %s" % (
+                shlex.quote(self.iface), shlex.quote(TCPDUMP_FILTER))
             proc = subprocess.Popen(["ssh", "-o", "BatchMode=yes", self.ssh_host, cmd],
                                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             self._proc = proc
@@ -142,12 +150,18 @@ class ReportCollector:
             def pump_stderr():
                 first = True
                 for line in proc.stderr:
+                    text = line.decode("ascii", "replace").strip()
                     if first:
                         first = False
                         try:
-                            self.remote_pid = int(line.decode("ascii", "replace").strip())
+                            self.remote_pid = int(text)
+                            continue
                         except ValueError:
                             pass
+                    if len(self.capture_messages) < 50:
+                        self.capture_messages.append(text)
+                    if "listening on" in text:
+                        self._ready.set()
             self._thread = threading.Thread(target=pump, daemon=True)
             self._thread.start()
             threading.Thread(target=pump_stderr, daemon=True).start()
@@ -156,7 +170,13 @@ class ReportCollector:
             self._sniffer = AsyncSniffer(iface=self.iface, store=False,
                                          prn=lambda pkt: self._add(bytes(pkt)))
             self._sniffer.start()
+            self._ready.set()
         return self
+
+    def wait_ready(self, timeout: float) -> bool:
+        """True once the capture is listening (for a remote capture: once tcpdump
+        has printed "listening on"), False if it is not within timeout seconds."""
+        return self._ready.wait(timeout)
 
     def stop(self) -> None:
         if self._sniffer is not None:
