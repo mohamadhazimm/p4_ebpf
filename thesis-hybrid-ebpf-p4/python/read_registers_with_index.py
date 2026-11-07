@@ -30,6 +30,9 @@ session, the 14 registers of every listed bucket whose pkts still equals PKTS
 again, so the next packet that lands in it sends a new first-seen CPU report.
 The payload lists the cleared buckets under "cleared". reg_newconn_dst is never
 cleared; its rows ("dst_rows") are cumulative counts.
+--clear-indexes IDX,... clears these buckets unconditionally after the read;
+they need not be read (the collector's expired buckets, which would otherwise
+stay occupied and send no CPU report for the next flow that lands in them).
 """
 import argparse
 import json
@@ -239,6 +242,18 @@ def _read_registers_main():
             cleared.append(idx)
         except Exception as error:
             errors.append("clear %d: %s" % (idx, error))
+    # Buckets the caller clears unconditionally (they left its active set unread
+    # and would otherwise stay occupied); they need not be in the read set.
+    for idx in PARAMS.get("clear_indexes", []):
+        idx = int(idx)
+        if idx in cleared:
+            continue
+        try:
+            for name, reg in regs.items():
+                reg.mod(REGISTER_INDEX=idx, f1=0)
+            cleared.append(idx)
+        except Exception as error:
+            errors.append("clear %d: %s" % (idx, error))
     if cleared:
         try:
             bfrt.complete_operations()
@@ -298,11 +313,12 @@ _read_registers_main()
 
 
 def build_inner_script(indexes, source: str, out_format: str, strict: bool, snapshot: str,
-                       clear_if_unchanged=None, dst_indexes=None) -> str:
+                       clear_if_unchanged=None, dst_indexes=None, clear_indexes=None) -> str:
     params = {"indexes": [int(i) for i in indexes], "source": source, "format": out_format,
               "strict": bool(strict), "snapshot": snapshot,
               "dst_indexes": [int(i) for i in (dst_indexes or [])],
-              "clear_if_unchanged": {str(int(k)): int(v) for k, v in (clear_if_unchanged or {}).items()}}
+              "clear_if_unchanged": {str(int(k)): int(v) for k, v in (clear_if_unchanged or {}).items()},
+              "clear_indexes": [int(i) for i in (clear_indexes or [])]}
     return INNER_TEMPLATE.replace("__PARAMS__", repr(json.dumps(params)))
 
 
@@ -333,6 +349,8 @@ def main():
     ap.add_argument("--snapshot", choices=["sync", "hw"], default="sync")
     ap.add_argument("--clear-if-unchanged", default="",
                     help="IDX:PKTS,... clear these buckets after the read if pkts is still PKTS")
+    ap.add_argument("--clear-indexes", default="",
+                    help="comma-separated buckets to clear unconditionally after the read (they need not be read)")
     ap.add_argument("--timeout", type=float, default=600)
     ap.add_argument(
         "--strict-core-registers",
@@ -378,8 +396,15 @@ def main():
     if unread:
         print(f"[ERROR] --clear-if-unchanged lists buckets that are not read: {unread}", file=sys.stderr)
         sys.exit(1)
+    unconditional = []
+    for i in (int(x) for x in args.clear_indexes.split(",") if x.strip()):
+        if not 0 <= i < FLOW_BUCKETS:
+            print(f"[ERROR] --clear-indexes: index {i} outside [0, {FLOW_BUCKETS})", file=sys.stderr)
+            sys.exit(1)
+        if i not in unconditional:
+            unconditional.append(i)
     script = build_inner_script(idxs, source, args.format, args.strict_core_registers, args.snapshot,
-                                clear_if_unchanged=clear, dst_indexes=dst_idxs)
+                                clear_if_unchanged=clear, dst_indexes=dst_idxs, clear_indexes=unconditional)
     out = run_bfshell_script(script, bfshell=args.bfshell, port=args.bf_port, ssh_host=args.ssh,
                              remote_sde_install=args.remote_sde_install, timeout=args.timeout)
     if args.format != "json":

@@ -507,8 +507,9 @@ def run_p4_reader_json(
     clear_if_unchanged: Optional[Dict[int, int]] = None,
     dst_indexes: Optional[List[int]] = None,
     timeout: Optional[float] = None,
+    clear_indexes: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
-    if not indexes and not dst_indexes:
+    if not indexes and not dst_indexes and not clear_indexes:
         return {"source": "empty", "flow_count": 0, "dst_rows": [], "cleared": [], "rows": []}
 
     index_arg = ",".join(str(x) for x in indexes)
@@ -525,6 +526,8 @@ def run_p4_reader_json(
         cmd += ["--ssh", switch_ssh]
     if clear_if_unchanged:
         cmd += ["--clear-if-unchanged", ",".join(f"{i}:{p}" for i, p in sorted(clear_if_unchanged.items()))]
+    if clear_indexes:
+        cmd += ["--clear-indexes", ",".join(str(x) for x in clear_indexes)]
     if dst_indexes:
         cmd += ["--dst-indexes", ",".join(str(x) for x in dst_indexes)]
     if timeout is not None:
@@ -735,12 +738,14 @@ class BatchedReaderProcess:
 
     def read(self, indexes: List[int], dst_indexes: Optional[List[int]] = None,
              clear_if_unchanged: Optional[Dict[int, int]] = None, snapshot: str = "sync",
-             timeout: Optional[float] = None, source: str = "batched gRPC") -> Dict[str, Any]:
+             timeout: Optional[float] = None, source: str = "batched gRPC",
+             clear_indexes: Optional[List[int]] = None) -> Dict[str, Any]:
         if self._proc is None or self._proc.poll() is not None:
             self.start()
         assert self._proc is not None and self._proc.stdin is not None
         request = {"indexes": [int(i) for i in indexes], "dst_indexes": [int(i) for i in (dst_indexes or [])],
                    "clear_if_unchanged": {str(int(k)): int(v) for k, v in (clear_if_unchanged or {}).items()},
+                   "clear_indexes": [int(i) for i in (clear_indexes or [])],
                    "snapshot": snapshot, "source": source}
         self._proc.stdin.write(json.dumps(request) + "\n")
         self._proc.stdin.flush()
@@ -851,8 +856,17 @@ REPORT_ZERO = {
     "net_buckets_skipped": 0,
     "net_dst_buckets_skipped": 0,
     "net_read_budget_ms": 0.0,
+    "net_read_allow_ms": 0.0,      # this window's allowance: the budget, or less when the read starts late
+    "net_read_late_ms": 0.0,       # how long after the window boundary the read was decided
     "net_read_overrun": 0,
+    "net_buckets_cleared": 0,      # idle (compare-and-clear) + expired (unconditional) clears in this read
+    "net_clear_backlog": 0,        # expired buckets still waiting for their clear after this read
 }
+
+# A read may use the time left until the next window boundary minus this margin.
+DEADLINE_SAFETY_MS = 5.0
+# An expired bucket whose unconditional clear fails this many times is given up.
+CLEAR_ATTEMPTS = 3
 
 # Recommended option bundles. "switch": the Wedge100BF-32X with the batched
 # reader on its wire-format route (RUNBOOK sections 9-10): 1 s windows, the
@@ -870,10 +884,29 @@ REPORT_ZERO = {
 PROFILES: Dict[str, Dict[str, Any]] = {
     "switch": {"window_sec": 1.0, "active_ttl_windows": 3, "clear_idle_windows": 3, "reader": "batched",
                "reader_raw_wire": True, "reader_sync_batched": True, "p4_snapshot": "sync",
-               "read_budget_frac": 0.8, "max_dst_reads": 256, "forward_report_port": 192},
+               "read_budget_frac": 0.8, "max_dst_reads": 256, "forward_report_port": 192,
+               "clear_expired": 1, "clear_budget_frac": 0.5},
     "model": {"window_sec": 60.0, "active_ttl_windows": 3, "clear_idle_windows": 0, "reader": "batched",
               "p4_snapshot": "sync", "p4_read_timeout": 600.0, "read_budget_frac": 0.0, "max_dst_reads": 0,
-              "forward_report_port": 2},
+              "forward_report_port": 2, "clear_expired": 0},
+}
+
+# Starting costs of one register read per reader route, in milliseconds. From
+# the Wedge100BF-32X (RUNBOOK sections 9, 10 and 12.1) and the Tofino model
+# (live_test/RESULTS.md, 2026-11-07). A run's model keeps learning from every
+# window, so these only decide how well the first windows fit the budget.
+ROUTE_COSTS: Dict[str, Dict[str, float]] = {
+    # --reader batched --reader-raw-wire: the 14 syncs in one RPC 30-31 ms plus client/IPC overhead,
+    # reads 0.50-0.56 ms per bucket on the bench and 0.62-0.70 ms in a live run (which also reads
+    # reg_newconn_dst buckets), clears 0.084-0.089 ms per bucket.
+    "raw": {"fixed_ms": 65.0, "read_ms_per_bucket": 0.62, "clear_ms_per_bucket": 0.09},
+    # --reader batched with the protobuf classes: syncs 58-70 ms, reads 1.1-1.55 ms, clears 0.55-0.75 ms.
+    "fast": {"fixed_ms": 70.0, "read_ms_per_bucket": 1.3, "clear_ms_per_bucket": 0.7},
+    # --reader legacy: one bfshell session per window (1.4-1.5 s) and 14 reg.get() calls per bucket
+    # (4.5-5.1 s at ~915 active buckets).
+    "legacy": {"fixed_ms": 1500.0, "read_ms_per_bucket": 3.6, "clear_ms_per_bucket": 1.5},
+    # the Tofino software model with the batched reader: 15 syncs 45-140 s, ~2.1 s per bucket, a clear ~3 s.
+    "model": {"fixed_ms": 99000.0, "read_ms_per_bucket": 2100.0, "clear_ms_per_bucket": 3000.0},
 }
 
 
@@ -893,48 +926,80 @@ def payload_timing_ms(payload: Dict[str, Any], wall_ms: float) -> Dict[str, floa
 
 class ReadCostModel:
     """What one register read costs on this control plane: a fixed part per
-    window (the register syncs and the RPC/IPC overhead) plus a part per bucket
-    read and per bucket cleared.
+    window (the register syncs and the RPC/IPC overhead), a part per flow bucket
+    read, a part per reg_newconn_dst bucket read (DST_WEIGHT of a flow bucket:
+    one register entity instead of fourteen) and a part per bucket cleared.
+    It also tracks the collector's own work around the read (prep_ms before it:
+    taking the reports and computing the indexes; post_ms after it: the rows,
+    the state and the CSV), which the deadline rule of collect_windows_live
+    subtracts from the time left in the window.
 
-    The starting values are the Wedge100BF-32X measurements with the batched
-    reader (RUNBOOK section 9: 14 syncs 58-70 ms, reads 1.1-1.55 ms per bucket,
-    clears 0.55-0.75 ms per bucket). Every measured window moves them with an
-    exponential average, so the budget follows the reader route and the switch
-    CPU actually in use (on the Tofino model the per-bucket cost is ~200x
-    larger and the model learns that within a few windows)."""
+    The starting values are ROUTE_COSTS[route] (for_route()). Every measured
+    window moves them with an exponential average, so the budget follows the
+    reader route and the control plane actually in use."""
+
+    DST_WEIGHT = 0.15
 
     def __init__(self, fixed_ms: float = 70.0, read_ms_per_bucket: float = 1.3,
-                 clear_ms_per_bucket: float = 0.7, alpha: float = 0.3):
+                 clear_ms_per_bucket: float = 0.7, alpha: float = 0.3, route: str = "fast"):
         self.fixed_ms = fixed_ms
         self.read_ms_per_bucket = read_ms_per_bucket
         self.clear_ms_per_bucket = clear_ms_per_bucket
         self.alpha = alpha
+        self.route = route
+        self.prep_ms = 0.0
+        self.post_ms = 0.0
         self.windows_seen = 0
 
-    def _ema(self, old: float, new: float) -> float:
-        return old + self.alpha * (new - old)
+    @classmethod
+    def for_route(cls, route: str, alpha: float = 0.3) -> "ReadCostModel":
+        return cls(alpha=alpha, route=route, **ROUTE_COSTS[route])
 
-    def update(self, n_read: int, n_cleared: int, timing: Dict[str, float]) -> None:
+    def _ema(self, old: float, new: float, alpha: Optional[float] = None) -> float:
+        a = self.alpha if alpha is None else alpha
+        return old + a * (new - old)
+
+    def update(self, n_read: int, n_cleared: int, timing: Dict[str, float], n_dst: int = 0) -> None:
         self.windows_seen += 1
         self.fixed_ms = self._ema(self.fixed_ms, timing["sync_ms"] + timing["overhead_ms"])
-        if n_read > 0:
-            self.read_ms_per_bucket = self._ema(self.read_ms_per_bucket, timing["read_ms"] / n_read)
+        units = n_read + self.DST_WEIGHT * n_dst
+        if units > 0:
+            self.read_ms_per_bucket = self._ema(self.read_ms_per_bucket, timing["read_ms"] / units)
         if n_cleared > 0:
             self.clear_ms_per_bucket = self._ema(self.clear_ms_per_bucket, timing["clear_ms"] / n_cleared)
 
-    def predict_ms(self, n_read: int, n_cleared: int = 0) -> float:
-        return self.fixed_ms + n_read * self.read_ms_per_bucket + n_cleared * self.clear_ms_per_bucket
+    def update_processing(self, prep_ms: float, post_ms: float) -> None:
+        """The collector's own time before and after the read (faster average: it
+        changes with the report rate, not with the switch)."""
+        self.prep_ms = self._ema(self.prep_ms, max(0.0, prep_ms), alpha=0.5)
+        self.post_ms = self._ema(self.post_ms, max(0.0, post_ms), alpha=0.5)
 
-    def buckets_within(self, budget_ms: float, n_cleared: int = 0) -> int:
-        """How many buckets a read can cover inside budget_ms."""
-        available = budget_ms - self.fixed_ms - n_cleared * self.clear_ms_per_bucket
+    def predict_ms(self, n_read: int, n_cleared: int = 0, n_dst: int = 0) -> float:
+        return (self.fixed_ms + (n_read + self.DST_WEIGHT * n_dst) * self.read_ms_per_bucket
+                + n_cleared * self.clear_ms_per_bucket)
+
+    def buckets_within(self, budget_ms: float, n_cleared: int = 0, n_dst: int = 0) -> int:
+        """How many flow buckets a read can cover inside budget_ms, next to
+        n_cleared clears and n_dst reg_newconn_dst reads."""
+        available = (budget_ms - self.fixed_ms - n_cleared * self.clear_ms_per_bucket
+                     - n_dst * self.DST_WEIGHT * self.read_ms_per_bucket)
         if available <= 0 or self.read_ms_per_bucket <= 0:
             return 0
         return int(available // self.read_ms_per_bucket)
 
+    def clears_within(self, ms: float) -> int:
+        """How many buckets can be cleared in ms (no fixed part: the clears travel
+        in the window's read)."""
+        if ms <= 0 or self.clear_ms_per_bucket <= 0:
+            return 0
+        return int(ms // self.clear_ms_per_bucket)
+
     def as_dict(self) -> Dict[str, float]:
-        return {"fixed_ms": round(self.fixed_ms, 2), "read_ms_per_bucket": round(self.read_ms_per_bucket, 4),
-                "clear_ms_per_bucket": round(self.clear_ms_per_bucket, 4), "windows_seen": self.windows_seen}
+        return {"route": self.route, "fixed_ms": round(self.fixed_ms, 2),
+                "read_ms_per_bucket": round(self.read_ms_per_bucket, 4),
+                "clear_ms_per_bucket": round(self.clear_ms_per_bucket, 4),
+                "prep_ms": round(self.prep_ms, 2), "post_ms": round(self.post_ms, 2),
+                "windows_seen": self.windows_seen}
 
 
 def report_aggregates(reports: List[Dict[str, object]], window_sec: float) -> Dict[str, object]:
@@ -1038,13 +1103,20 @@ def collect_windows_live(
     max_read_buckets: int = 0,
     max_dst_reads: int = 0,
     cost_model: Optional[ReadCostModel] = None,
+    clear_expired: bool = False,
+    clear_budget_frac: float = 0.5,
+    clock: Any = None,
 ) -> List[Dict[str, object]]:
     """Per window: the CPU-reported bucket indexes, and the P4 registers of all
     active indexes read at the end of that window.
 
     Read budget (read_budget_frac > 0): a read may take at most that fraction of
-    the window. From the cost model's running estimate (ReadCostModel, updated
-    from every window's measured timing) the collector computes how many
+    the window, and never more than the time left until the next window
+    boundary minus the collector's measured post-read work (so a read that
+    started late shrinks instead of pushing every later window; the deadline
+    rule). From the cost model's running estimate (ReadCostModel, updated from
+    every window's measured timing; it counts the flow bucket reads, the
+    reg_newconn_dst reads and the clears) the collector computes how many
     buckets fit and, when the active set is larger, reads only the most
     recently reported or changed ones (select_within_budget); the rest are
     skipped and counted (window["net_buckets_skipped"], window["overload"]).
@@ -1055,10 +1127,23 @@ def collect_windows_live(
     which need no register read and so survive an overload. With the budget
     off (the default) the behaviour is unchanged.
 
+    clear_expired: a bucket that leaves the active set (active_ttl_windows after
+    its last report or change) without having been cleared is still occupied on
+    the switch, and an occupied bucket sends no CPU report for the next flow
+    that lands in it (RUNBOOK section 12.2: a flood left 46% of the table
+    occupied and the next capture lost half of its flows). With clear_expired
+    those buckets are cleared unconditionally in a later read, oldest first, at
+    most clear_budget_frac of the window's allowance (after the fixed cost) per
+    window; the rest wait (window["report_aggregates"]["net_clear_backlog"]).
+    A bucket whose clear fails CLEAR_ATTEMPTS times is given up; one that
+    reports again meanwhile is live and leaves the queue.
+
     The registers are read by read_fn(active_indexes, window, snapshot=...,
-    clear_if_unchanged=..., dst_indexes=...) -> payload, if given (the batched
-    gRPC reader), else by the legacy reader script at reader_path. timing_log,
-    if given, receives every window's payload and read times (make_timing_logger).
+    clear_if_unchanged=..., dst_indexes=..., [clear_indexes=...]) -> payload,
+    if given (the batched gRPC reader), else by the legacy reader script at
+    reader_path; clear_indexes is passed only when there is something to clear
+    unconditionally. timing_log, if given, receives every window's payload and
+    read times (make_timing_logger). clock (tests) replaces the time module.
 
     A failed register read is retried read_retries times (each attempt
     limited to read_timeout seconds) before P4ReadError ends the collection.
@@ -1089,6 +1174,12 @@ def collect_windows_live(
     cost = cost_model if cost_model is not None else ReadCostModel()
     budget_ms = read_budget_frac * window_sec * 1000.0 if read_budget_frac > 0 else None
     overruns = 0
+    clk = clock if clock is not None else time
+    # expired buckets waiting for an unconditional clear, oldest first -> failed attempts
+    pending_clear: "collections.OrderedDict[int, int]" = collections.OrderedDict()
+    expired_total = 0
+    expired_cleared_total = 0
+    dropped_clears = 0
 
     w = 0
     proc_done = False
@@ -1101,12 +1192,13 @@ def collect_windows_live(
         win_start_abs = global_t0 + win_start_rel
         win_end_abs = global_t0 + win_end_rel
 
-        now = time.time()
+        now = clk.time()
         if now < win_end_abs:
-            time.sleep(win_end_abs - now)
+            clk.sleep(win_end_abs - now)
         elif now > win_end_abs + 1.0:
             print(f"[WARN] window {w}: register read of the previous window overran by "
                   f"{now - win_end_abs:.1f} s")
+        t_iter_start = clk.time()
 
         reports = collector.take(win_start_abs, win_end_abs)
         idxs = sorted({safe_int(r["idx"]) for r in reports})
@@ -1119,11 +1211,23 @@ def collect_windows_live(
 
         for idx in idxs:
             active_idx_last_seen[idx] = w
+            pending_clear.pop(idx, None)     # it reports again, so it is live: not to be cleared
+        expired = sorted(
+            idx for idx, last_seen in active_idx_last_seen.items()
+            if (w - last_seen) > active_ttl_windows
+        )
         active_idxs = sorted(
             idx for idx, last_seen in active_idx_last_seen.items()
             if (w - last_seen) <= active_ttl_windows
         )
         active_idx_last_seen = {idx: active_idx_last_seen[idx] for idx in active_idxs}
+        # A bucket cleared by the idle rule left the active set at its clear; what
+        # expires here was read too seldom (or never) to be cleared and is still
+        # occupied on the switch.
+        expired_total += len(expired)
+        if clear_expired:
+            for idx in expired:
+                pending_clear.setdefault(idx, 0)
 
         for r in reports:
             if safe_int(r["proto"]) == 6:
@@ -1138,22 +1242,45 @@ def collect_windows_live(
         active_dst_last_seen = {idx: active_dst_last_seen[idx] for idx in active_dst_idxs}
         dst_report_counts = {idx: dst_report_counts[idx] for idx in active_dst_idxs if idx in dst_report_counts}
 
-        # Which buckets fit the read budget of this window.
+        # The allowance of this window's read: the budget, or the time left until
+        # the next window boundary minus the measured post-read work when the
+        # read is decided late (the previous read overran, or the reports took
+        # long to process). A late window shrinks its own read; it does not
+        # delay the next one.
         agg = report_aggregates(reports, window_sec)
-        allowed = len(active_idxs)
+        t_decide = clk.time()
+        late_ms = max(0.0, (t_decide - win_end_abs) * 1000.0)
+        allow_ms: Optional[float] = None
         if budget_ms is not None:
-            allowed = min(allowed, cost.buckets_within(budget_ms))
-        if max_read_buckets > 0:
-            allowed = min(allowed, max_read_buckets)
-        read_idxs, skipped_idxs = select_within_budget(active_idxs, active_idx_last_seen, allowed)
+            time_left_ms = (win_end_abs + window_sec - t_decide) * 1000.0 - cost.post_ms - DEADLINE_SAFETY_MS
+            allow_ms = max(0.0, min(budget_ms, time_left_ms))
         if max_dst_reads > 0 and len(active_dst_idxs) > max_dst_reads:
             ranked_dst = sorted(active_dst_idxs, key=lambda idx: (-dst_report_counts.get(idx, 0),
                                                                   -active_dst_last_seen.get(idx, -1), idx))
             read_dst_idxs = sorted(ranked_dst[:max_dst_reads])
         else:
             read_dst_idxs = active_dst_idxs
+        # Expired buckets cleared in this read, oldest first, within their share
+        # of the allowance that is left after the fixed cost.
+        clear_now: List[int] = []
+        if pending_clear:
+            n_clear = len(pending_clear)
+            if allow_ms is not None:
+                n_clear = min(n_clear, cost.clears_within(max(0.0, allow_ms - cost.fixed_ms) * clear_budget_frac))
+            clear_now = list(pending_clear)[:n_clear]
+        idle_estimate = 0
+        if clear_idle_windows > 0:
+            idle_estimate = sum(1 for idx in active_idxs
+                                if idx in last_pkts and idle_reads.get(idx, 0) + 1 >= clear_idle_windows)
+        allowed = len(active_idxs)
+        if allow_ms is not None:
+            allowed = min(allowed, cost.buckets_within(allow_ms, n_cleared=len(clear_now) + idle_estimate,
+                                                       n_dst=len(read_dst_idxs)))
+        if max_read_buckets > 0:
+            allowed = min(allowed, max_read_buckets)
+        read_idxs, skipped_idxs = select_within_budget(active_idxs, active_idx_last_seen, allowed)
         if skipped_idxs and not windows:
-            limit = f"read budget {budget_ms:.0f} ms" if budget_ms is not None else f"cap of {max_read_buckets} reads"
+            limit = f"read allowance {allow_ms:.0f} ms" if allow_ms is not None else f"cap of {max_read_buckets} reads"
             print(f"[WARN] window {w}: the {limit} fits {allowed} of {len(active_idxs)} active buckets "
                   f"(cost estimate {cost.as_dict()}); the rest are skipped and counted")
 
@@ -1165,28 +1292,33 @@ def collect_windows_live(
                 if idx in last_pkts and idle_reads.get(idx, 0) + 1 >= clear_idle_windows
             }
 
-        read_start = time.time()
+        extra: Dict[str, Any] = {"clear_indexes": clear_now} if clear_now else {}
+        read_start = clk.time()
         if read_fn is None:
             payload = read_p4_with_retries(reader_path, read_idxs, w, retries=read_retries, timeout=read_timeout,
                                            switch_ssh=switch_ssh, snapshot=snapshot,
-                                           clear_if_unchanged=clear_candidates, dst_indexes=read_dst_idxs)
+                                           clear_if_unchanged=clear_candidates, dst_indexes=read_dst_idxs, **extra)
         else:
             payload = read_fn(read_idxs, w, snapshot=snapshot, clear_if_unchanged=clear_candidates,
-                              dst_indexes=read_dst_idxs)
-        read_end = time.time()
+                              dst_indexes=read_dst_idxs, **extra)
+        read_end = clk.time()
         if timing_log is not None:
             timing_log(w, payload, read_start, read_end, len(read_idxs), len(read_dst_idxs))
         wall_ms = (read_end - read_start) * 1000.0
-        cost.update(len(read_idxs), len(payload.get("cleared") or []), payload_timing_ms(payload, wall_ms))
+        cost.update(len(read_idxs), len(payload.get("cleared") or []), payload_timing_ms(payload, wall_ms),
+                    n_dst=len(read_dst_idxs))
         overrun = read_end > win_end_abs + window_sec
         overruns += int(overrun)
         agg.update({
-            "net_overload": int(bool(skipped_idxs) or len(read_dst_idxs) < len(active_dst_idxs)),
+            "net_overload": int(bool(skipped_idxs) or len(read_dst_idxs) < len(active_dst_idxs)
+                                or len(clear_now) < len(pending_clear)),
             "net_buckets_active": len(active_idxs),
             "net_buckets_read": len(read_idxs),
             "net_buckets_skipped": len(skipped_idxs),
             "net_dst_buckets_skipped": len(active_dst_idxs) - len(read_dst_idxs),
             "net_read_budget_ms": round(budget_ms, 1) if budget_ms is not None else 0.0,
+            "net_read_allow_ms": round(allow_ms, 1) if allow_ms is not None else 0.0,
+            "net_read_late_ms": round(late_ms, 1),
             "net_read_overrun": int(overrun),
         })
 
@@ -1208,10 +1340,23 @@ def collect_windows_live(
             last_new_conn[idx] = new_conn
 
         cleared = sorted(safe_int(x) for x in payload.get("cleared", []))
+        cleared_set = set(cleared)
         for idx in cleared:
             active_idx_last_seen.pop(idx, None)
             last_pkts.pop(idx, None)
             idle_reads.pop(idx, None)
+        expired_cleared = [idx for idx in clear_now if idx in cleared_set]
+        expired_cleared_total += len(expired_cleared)
+        for idx in clear_now:
+            if idx in cleared_set:
+                pending_clear.pop(idx, None)
+            else:
+                pending_clear[idx] = pending_clear.get(idx, 0) + 1
+                if pending_clear[idx] >= CLEAR_ATTEMPTS:
+                    pending_clear.pop(idx, None)
+                    dropped_clears += 1
+        agg["net_buckets_cleared"] = len(cleared)
+        agg["net_clear_backlog"] = len(pending_clear)
 
         windows.append({
             "net_window_id": w,
@@ -1232,6 +1377,8 @@ def collect_windows_live(
             "read_dst_indexes": read_dst_idxs,
             "dst_rows": payload.get("dst_rows", []),
             "cleared_indexes": cleared,
+            "expired_indexes": expired,
+            "expired_cleared_indexes": expired_cleared,
             "p4_snapshot": payload.get("snapshot"),
             "p4_read_start_sec": round(read_start - global_t0, 3),
             "p4_read_sec": round(read_end - read_start, 3),
@@ -1242,7 +1389,10 @@ def collect_windows_live(
 
         if not proc_done and proc.poll() is not None:
             proc_done = True
-            proc_end_rel = time.time() - global_t0
+            proc_end_rel = clk.time() - global_t0
+
+        post_end = clk.time()
+        cost.update_processing((read_start - t_iter_start) * 1000.0, (post_end - read_end) * 1000.0)
 
         if proc_done and proc_end_rel is not None:
             if win_end_rel >= proc_end_rel + drain_seconds:
@@ -1257,6 +1407,12 @@ def collect_windows_live(
     if skipped_total:
         print(f"[INFO] read budget: {skipped_total} bucket reads skipped over {sum(1 for win in windows if win['overload'])} "
               f"overloaded window(s); final cost estimate {cost.as_dict()}")
+    if expired_total:
+        print(f"[INFO] {expired_total} bucket(s) left the active set without an idle clear; "
+              + (f"{expired_cleared_total} cleared unconditionally, {len(pending_clear)} still waiting, "
+                 f"{dropped_clears} given up after {CLEAR_ATTEMPTS} failed clears"
+                 if clear_expired else "they stay occupied on the switch until the next register reset "
+                 "(--clear-expired 1 clears them)"))
     return windows
 
 
@@ -1680,6 +1836,14 @@ def build_arg_parser(profile: Optional[str] = None) -> argparse.ArgumentParser:
                     help="hard cap on flow buckets read per window (0 = none)")
     ap.add_argument("--max-dst-reads", type=int, default=0,
                     help="cap on reg_newconn_dst buckets read per window, most reported destinations first (0 = none)")
+    ap.add_argument("--clear-expired", type=int, default=0,
+                    help="1: a bucket that leaves the active set without having been cleared (skipped under the read "
+                         "budget, so never idle-read) is cleared unconditionally in a later read, oldest first, so a "
+                         "flood does not leave the switch's table occupied (an occupied bucket sends no CPU report "
+                         "for the next flow that lands in it). 0 = only the compare-and-clear of idle buckets")
+    ap.add_argument("--clear-budget-frac", type=float, default=0.5,
+                    help="share of a window's read allowance (after the fixed sync cost) that --clear-expired may "
+                         "spend; the rest of the backlog waits for the next window")
     ap.add_argument("--hostmon-cgroup",
                     help="run the in-kernel monitor (ebpf_perf/hostmon_agg, given with --hostmon) on this cgroup-v2 "
                          "directory (created if missing): the scenario command is started inside it at a shared "
@@ -1842,8 +2006,17 @@ def main() -> None:
             global_t0 = time.time()
             workload_proc = launch()
 
-        print(f"[INFO] Reading P4 registers at the end of every window ({args.reader} reader"
-              + (f", budget {args.read_budget_frac:.0%} of the window" if args.read_budget_frac > 0 else "") + ")")
+        if getattr(args, "profile", None) == "model":
+            route = "model"
+        elif args.reader == "batched":
+            route = "raw" if args.reader_raw_wire else "fast"
+        else:
+            route = "legacy"
+        cost_model = ReadCostModel.for_route(route)
+        print(f"[INFO] Reading P4 registers at the end of every window ({args.reader} reader, cost model "
+              f"{cost_model.as_dict()}"
+              + (f", budget {args.read_budget_frac:.0%} of the window" if args.read_budget_frac > 0 else "")
+              + (", expired buckets cleared unconditionally" if args.clear_expired else "") + ")")
         collect_windows_live(
             collector=report_collector,
             proc=workload_proc,
@@ -1863,14 +2036,20 @@ def main() -> None:
             read_budget_frac=args.read_budget_frac,
             max_read_buckets=args.max_read_buckets,
             max_dst_reads=args.max_dst_reads,
+            cost_model=cost_model,
+            clear_expired=bool(args.clear_expired),
+            clear_budget_frac=args.clear_budget_frac,
         )
         report_collector.stop()
         if batched_reader is not None:
             batched_reader.stop()
         print(f"[INFO] CPU reports: {sum(w['report_count'] for w in net_windows)} in "
               f"{len(net_windows)} windows; index mismatches: "
-              f"{sum(w['index_mismatches'] for w in net_windows)}; idle buckets cleared: "
-              f"{sum(len(w['cleared_indexes']) for w in net_windows)}")
+              f"{sum(w['index_mismatches'] for w in net_windows)}; buckets cleared: "
+              f"{sum(len(w['cleared_indexes']) for w in net_windows)} "
+              f"({sum(len(w.get('expired_cleared_indexes') or []) for w in net_windows)} of them expired, "
+              f"unconditionally); clear backlog at the end: "
+              f"{net_windows[-1]['report_aggregates']['net_clear_backlog'] if net_windows else 0}")
 
         workload_proc.wait()
         workload_rc = workload_proc.returncode

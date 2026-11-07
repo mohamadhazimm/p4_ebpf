@@ -62,27 +62,61 @@ def report(idx, src="10.0.0.1", dst="10.0.0.2", dport=80, proto=6):
             "sport": 1000 + idx, "dport": dport, "proto": proto}
 
 
+class FakeClock:
+    """A clock for collect_windows_live: sleep() and advance() move it, nothing else does."""
+
+    def __init__(self, t=1000.0):
+        self.t = t
+
+    def time(self):
+        return self.t
+
+    def sleep(self, seconds):
+        self.t += max(0.0, seconds)
+
+    def advance(self, seconds):
+        self.t += seconds
+
+
 class FakeReader:
-    """Register reader whose payload carries a timing block: fixed sync 10 ms, 5 ms per bucket read."""
+    """Register reader whose payload carries a timing block: fixed sync 10 ms, 5 ms per bucket read, clear_ms per
+    bucket cleared. A compare-and-clear succeeds when the caller's count equals the fake's current count; an
+    unconditional clear (clear_indexes) always succeeds unless fail_clears. With a FakeClock the read also takes
+    that long, or durations[w] seconds for the windows listed there (its timing block then reports the extra time
+    as read time)."""
 
-    def __init__(self):
-        self.calls = []
+    SYNC_MS, READ_MS = 10.0, 5.0
 
-    def __call__(self, indexes, w, snapshot="sync", clear_if_unchanged=None, dst_indexes=None):
+    def __init__(self, clock=None, durations=None, fail_clears=False, clear_ms=1.0):
+        self.calls, self.clock, self.durations, self.fail_clears, self.clear_ms = [], clock, durations or {}, fail_clears, clear_ms
+
+    def __call__(self, indexes, w, snapshot="sync", clear_if_unchanged=None, dst_indexes=None, clear_indexes=None):
+        pkts = 10 * (w + 1)
+        cleared = [i for i, p in (clear_if_unchanged or {}).items() if p == pkts]
+        if not self.fail_clears:
+            cleared += [i for i in (clear_indexes or []) if i not in cleared]
         self.calls.append({"w": w, "indexes": list(indexes), "dst": list(dst_indexes or []),
-                           "clear": dict(clear_if_unchanged or {})})
-        return {"rows": [mkrow(i, 10 * (w + 1)) for i in indexes],
-                "dst_rows": [{"idx": i, "new_conn": 3} for i in (dst_indexes or [])], "cleared": [],
-                "snapshot": snapshot, "timing": {"sync_ms": 10.0, "read_ms": 5.0 * len(indexes), "clear_ms": 0.0}}
+                           "clear": dict(clear_if_unchanged or {}), "clear_indexes": list(clear_indexes or [])})
+        read_ms, clear_ms = self.READ_MS * len(indexes), self.clear_ms * len(cleared)
+        if self.clock is not None:
+            duration = self.durations.get(w, (self.SYNC_MS + read_ms + clear_ms) / 1000.0)
+            self.clock.advance(duration)
+            read_ms = duration * 1000.0 - self.SYNC_MS - clear_ms
+        return {"rows": [mkrow(i, pkts) for i in indexes],
+                "dst_rows": [{"idx": i, "new_conn": 3} for i in (dst_indexes or [])], "cleared": sorted(cleared),
+                "snapshot": snapshot, "timing": {"sync_ms": self.SYNC_MS, "read_ms": read_ms, "clear_ms": clear_ms}}
 
 
 class ReadBudgetTests(unittest.TestCase):
-    def run_live(self, reports, n_windows, **kw):
-        reader = FakeReader()
-        window_sec, t0 = 0.05, time.time()
+    def run_live(self, reports, n_windows, window_sec=0.05, clock=None, reader=None, **kw):
+        # A fake clock by default: the allowances asserted below are exact, and a real 50 ms window would make
+        # them depend on scheduling jitter. The reads take no time unless the test gives the reader the clock.
+        clock = clock if clock is not None else FakeClock()
+        reader = reader if reader is not None else FakeReader()
+        t0 = clock.time()
         windows = hc.collect_windows_live(FakeCollector(reports, t0, window_sec), FakeProc(n_windows), window_sec, 0.0,
                                           t0, "reader.py", active_ttl_windows=3, clear_idle_windows=0, read_fn=reader,
-                                          **kw)
+                                          clock=clock, **kw)
         return windows, reader
 
     def test_without_a_budget_every_active_bucket_is_read_and_aggregates_are_present(self):
@@ -95,12 +129,15 @@ class ReadBudgetTests(unittest.TestCase):
         self.assertAlmostEqual(agg["rep_new_flows_per_sec"], 10 / 0.05)
         self.assertEqual(agg["net_buckets_read"], 10)
         self.assertEqual(agg["net_overload"], 0)
+        self.assertEqual((agg["net_buckets_cleared"], agg["net_clear_backlog"], agg["net_read_allow_ms"]), (0, 0, 0.0))
         self.assertEqual(set(hc.REPORT_ZERO), set(agg))
+        self.assertEqual(reader.calls[0]["clear_indexes"], [])
 
     def test_the_budget_limits_the_read_to_the_most_recent_buckets(self):
-        # 50 ms window, 80% budget = 40 ms; fixed 10 ms + 5 ms per bucket -> 6 buckets fit.
+        # 50 ms window, 80% budget = 40 ms; fixed 10 ms + 5 ms per bucket -> 6 buckets fit (UDP flows: no
+        # reg_newconn_dst reads, which would take their share of the allowance too).
         cost = hc.ReadCostModel(fixed_ms=10.0, read_ms_per_bucket=5.0, clear_ms_per_bucket=1.0)
-        reports = {0: [report(i) for i in range(10)], 1: [report(10), report(11)]}
+        reports = {0: [report(i, proto=17) for i in range(10)], 1: [report(10, proto=17), report(11, proto=17)]}
         windows, reader = self.run_live(reports, 3, read_budget_frac=0.8, cost_model=cost)
         self.assertEqual(reader.calls[0]["indexes"], [0, 1, 2, 3, 4, 5])          # ties by index
         self.assertEqual(windows[0]["skipped_count"], 4)
@@ -110,9 +147,105 @@ class ReadBudgetTests(unittest.TestCase):
         # window 1: the two new buckets (last seen 1) come first, then the oldest indexes of window 0
         self.assertEqual(reader.calls[1]["indexes"], [0, 1, 2, 3, 10, 11])
         self.assertEqual(windows[1]["report_aggregates"]["net_read_budget_ms"], 40.0)
+        self.assertEqual(windows[1]["report_aggregates"]["net_read_allow_ms"], 40.0)   # on time: the whole budget
         # the cost model followed the fake reader's 5 ms per bucket and its 10 ms sync (+ IPC overhead)
         self.assertAlmostEqual(cost.read_ms_per_bucket, 5.0, places=6)
         self.assertGreaterEqual(cost.fixed_ms, 10.0)
+
+    def test_expired_buckets_are_cleared_unconditionally_in_one_request(self):
+        # 20 flows reported in window 0; 6 fit the 40 ms allowance and are read every window (their counters
+        # change, so they stay the most recent). The 14 skipped ones are never read, expire after the 3-window
+        # TTL (window 4) and, with clear_expired, are all cleared there: (40 - 10) x 0.5 = 15 ms at 0.5 ms each.
+        cost = hc.ReadCostModel(fixed_ms=10.0, read_ms_per_bucket=5.0, clear_ms_per_bucket=0.5)
+        reports = {0: [report(i, proto=17) for i in range(20)]}
+        windows, reader = self.run_live(reports, 7, read_budget_frac=0.8, cost_model=cost, clear_expired=True)
+        self.assertEqual([c["clear_indexes"] for c in reader.calls[:4]], [[], [], [], []])
+        self.assertEqual(reader.calls[4]["clear_indexes"], list(range(6, 20)))
+        self.assertEqual(windows[4]["expired_indexes"], list(range(6, 20)))
+        self.assertEqual(windows[4]["expired_cleared_indexes"], list(range(6, 20)))
+        self.assertEqual(windows[4]["cleared_indexes"], list(range(6, 20)))
+        agg = windows[4]["report_aggregates"]
+        self.assertEqual((agg["net_buckets_cleared"], agg["net_clear_backlog"]), (14, 0))
+        # the 14 clears (7 ms) came out of the read allowance: (40 - 10 - 7) // 5 = 4 of the 6 active were read
+        self.assertEqual((agg["net_buckets_read"], agg["net_buckets_skipped"], agg["net_overload"]), (4, 2, 1))
+        self.assertTrue(all(c["clear_indexes"] == [] for c in reader.calls[5:7]))
+        self.assertEqual(windows[6]["report_aggregates"]["net_buckets_read"], 6)      # back to the full set
+
+    def test_without_clear_expired_the_buckets_just_expire(self):
+        cost = hc.ReadCostModel(fixed_ms=10.0, read_ms_per_bucket=5.0, clear_ms_per_bucket=0.5)
+        windows, reader = self.run_live({0: [report(i, proto=17) for i in range(20)]}, 6,
+                                        read_budget_frac=0.8, cost_model=cost)
+        self.assertEqual(windows[4]["expired_indexes"], list(range(6, 20)))
+        self.assertEqual(windows[4]["expired_cleared_indexes"], [])
+        self.assertTrue(all(c["clear_indexes"] == [] for c in reader.calls))
+        self.assertEqual(windows[4]["report_aggregates"]["net_clear_backlog"], 0)
+
+    def test_the_clear_backlog_is_bounded_per_window_and_drains_oldest_first(self):
+        # clears cost 5 ms (the fake reports the same, so the model keeps it): (40 - 10) x 0.5 = 15 ms -> 3 per window
+        cost = hc.ReadCostModel(fixed_ms=10.0, read_ms_per_bucket=5.0, clear_ms_per_bucket=5.0)
+        reader = FakeReader(clear_ms=5.0)
+        windows, reader = self.run_live({0: [report(i, proto=17) for i in range(20)]}, 12, reader=reader,
+                                        read_budget_frac=0.8, cost_model=cost, clear_expired=True)
+        backlog = [w["report_aggregates"]["net_clear_backlog"] for w in windows]
+        # The three clears (15 ms) leave (40 - 10 - 15) // 5 = 3 bucket reads, so only 3 of the 6 live buckets
+        # are read from window 4 on ([0, 1, 2]: ties by index); [3, 4, 5] change but are never read again,
+        # expire at window 7 and join the queue: the price of a blind clear under an overload is that a live
+        # flow the budget could not read is split, not that it is lost.
+        self.assertEqual(backlog[3:11], [0, 11, 8, 5, 5, 2, 0, 0])
+        self.assertEqual([c["clear_indexes"] for c in reader.calls[4:10]], [[6, 7, 8], [9, 10, 11], [12, 13, 14],
+                                                                            [15, 16, 17], [18, 19, 3], [4, 5]])
+        self.assertEqual(windows[7]["expired_indexes"], [3, 4, 5])
+        self.assertTrue(all(w["overload"] for w in windows[4:9]))      # a deferred clear is an overload
+        self.assertEqual(windows[4]["report_aggregates"]["net_buckets_read"], 3)
+        self.assertAlmostEqual(cost.clear_ms_per_bucket, 5.0, places=6)
+
+    def test_a_bucket_that_reports_again_leaves_the_clear_queue(self):
+        cost = hc.ReadCostModel(fixed_ms=10.0, read_ms_per_bucket=5.0, clear_ms_per_bucket=5.0)
+        reader = FakeReader(clear_ms=5.0)
+        reports = {0: [report(i, proto=17) for i in range(20)], 5: [report(19, proto=17)]}
+        windows, reader = self.run_live(reports, 10, reader=reader, read_budget_frac=0.8, cost_model=cost,
+                                        clear_expired=True)
+        self.assertIn(19, windows[4]["expired_indexes"])
+        self.assertIn(19, windows[5]["active_indexes"])
+        self.assertTrue(all(19 not in c["clear_indexes"] for c in reader.calls))
+        # window 5: 19 leaves the queue (10 left, 3 cleared); window 7: the 3 unread live buckets join it
+        self.assertEqual([w["report_aggregates"]["net_clear_backlog"] for w in windows[4:8]], [11, 7, 4, 4])
+
+    def test_a_failed_unconditional_clear_is_retried_then_given_up(self):
+        cost = hc.ReadCostModel(fixed_ms=10.0, read_ms_per_bucket=5.0, clear_ms_per_bucket=0.5)
+        reader = FakeReader(fail_clears=True)
+        windows, reader = self.run_live({0: [report(i, proto=17) for i in range(20)]}, 10, reader=reader,
+                                        read_budget_frac=0.8, cost_model=cost, clear_expired=True)
+        asked = [c["clear_indexes"] for c in reader.calls]
+        self.assertEqual(asked[4], list(range(6, 20)))
+        self.assertEqual(asked[4], asked[5])
+        self.assertEqual(asked[5], asked[6])
+        # given up after three failed attempts; the two live buckets the 4-read budget never reaches ([4, 5])
+        # expire at window 7 and go through the same three attempts
+        self.assertEqual(asked[7:10], [[4, 5], [4, 5], [4, 5]])
+        self.assertEqual([w["report_aggregates"]["net_clear_backlog"] for w in windows[4:10]], [14, 14, 0, 2, 2, 0])
+        self.assertTrue(all(w["expired_cleared_indexes"] == [] for w in windows))
+
+    def test_a_late_read_shrinks_the_next_allowance_and_the_schedule_recovers(self):
+        clock = FakeClock(1000.0)
+        cost = hc.ReadCostModel(fixed_ms=10.0, read_ms_per_bucket=5.0, clear_ms_per_bucket=1.0)
+        reader = FakeReader(clock=clock, durations={0: 1.3})      # window 0's read takes 1.3 s of a 1 s window
+        reports = {0: [report(i, proto=17) for i in range(200)]}
+        windows, reader = self.run_live(reports, 4, window_sec=1.0, clock=clock, reader=reader,
+                                        read_budget_frac=0.8, cost_model=cost)
+        a0, a1, a2 = (w["report_aggregates"] for w in windows[:3])
+        self.assertEqual((a0["net_read_allow_ms"], a0["net_buckets_read"], a0["net_read_late_ms"]), (800.0, 158, 0.0))
+        self.assertTrue(windows[0]["p4_read_overrun"])
+        # window 1 is decided 300 ms after its boundary: 700 ms are left, minus the 5 ms margin
+        self.assertAlmostEqual(a1["net_read_late_ms"], 300.0, delta=0.1)
+        self.assertAlmostEqual(a1["net_read_allow_ms"], 695.0, delta=0.1)
+        self.assertLess(a1["net_buckets_read"], 158)
+        self.assertFalse(windows[1]["p4_read_overrun"])          # it ended before the next boundary ...
+        self.assertEqual((a2["net_read_late_ms"], a2["net_read_allow_ms"]), (0.0, 800.0))   # ... so window 2 is on time
+        # window 0's slow read raised the per-bucket estimate; it is still coming back down in window 2
+        self.assertGreater(a2["net_buckets_read"], a1["net_buckets_read"])
+        self.assertLessEqual(a2["net_buckets_read"], 158)
+        self.assertGreaterEqual(cost.windows_seen, 4)
 
     def test_a_hard_cap_applies_without_a_budget(self):
         windows, reader = self.run_live({0: [report(i) for i in range(10)]}, 2, max_read_buckets=3)
@@ -164,6 +297,28 @@ class HelperTests(unittest.TestCase):
         self.assertAlmostEqual(cost.clear_ms_per_bucket, 30.0, delta=0.01)
         self.assertAlmostEqual(cost.fixed_ms, 2100.0, delta=0.1)
 
+    def test_cost_model_routes_dst_weight_and_clears(self):
+        raw = hc.ReadCostModel.for_route("raw")
+        self.assertEqual((raw.route, raw.fixed_ms, raw.read_ms_per_bucket, raw.clear_ms_per_bucket),
+                         ("raw", 65.0, 0.62, 0.09))
+        for route in hc.ROUTE_COSTS:
+            self.assertEqual(hc.ReadCostModel.for_route(route).route, route)
+        # 1 s window, 80%: the raw route fits (800 - 65) // 0.62 buckets; 200 clears and 100 dst reads take their share
+        self.assertEqual(raw.buckets_within(800.0), int((800 - 65) // 0.62))
+        self.assertEqual(raw.buckets_within(800.0, n_cleared=200, n_dst=100),
+                         int((800 - 65 - 200 * 0.09 - 100 * hc.ReadCostModel.DST_WEIGHT * 0.62) // 0.62))
+        self.assertEqual(raw.clears_within(100.0), int(100 // 0.09))
+        self.assertEqual(raw.clears_within(0.0), 0)
+        self.assertAlmostEqual(raw.predict_ms(100, n_cleared=10, n_dst=20), 65 + 103 * 0.62 + 0.9)
+        # the per-bucket read cost is fitted per flow-bucket unit, a dst read counting DST_WEIGHT of one
+        m = hc.ReadCostModel(fixed_ms=10.0, read_ms_per_bucket=1.0, clear_ms_per_bucket=1.0, alpha=1.0)
+        m.update(100, 0, {"sync_ms": 10.0, "read_ms": 115.0, "clear_ms": 0.0, "overhead_ms": 0.0}, n_dst=100)
+        self.assertAlmostEqual(m.read_ms_per_bucket, 1.0)
+        m.update_processing(20.0, 40.0)
+        m.update_processing(0.0, 0.0)
+        self.assertEqual((m.prep_ms, m.post_ms), (5.0, 10.0))
+        self.assertEqual(m.as_dict()["route"], "fast")
+
     def test_payload_timing_falls_back_to_the_legacy_fields(self):
         t = hc.payload_timing_ms({"sync_s": 0.04, "read_s": 0.14, "clear_s": 0.01}, 220.0)
         self.assertEqual((t["sync_ms"], t["read_ms"], t["clear_ms"]), (40.0, 100.0, 10.0))
@@ -178,6 +333,7 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual((args.window_sec, args.active_ttl_windows, args.clear_idle_windows), (1.0, 3, 3))
         self.assertEqual((args.reader, args.reader_raw_wire, args.reader_sync_batched), ("batched", True, True))
         self.assertEqual((args.read_budget_frac, args.max_dst_reads, args.forward_report_port), (0.8, 256, 192))
+        self.assertEqual((args.clear_expired, args.clear_budget_frac), (1, 0.5))
 
     def test_explicit_options_override_the_profile(self):
         args = hc.build_arg_parser("switch").parse_args(self.BASE + ["--profile", "switch", "--window-sec", "2",
@@ -187,10 +343,11 @@ class ProfileTests(unittest.TestCase):
     def test_the_model_profile_and_the_unchanged_defaults(self):
         args = hc.build_arg_parser("model").parse_args(self.BASE + ["--profile", "model"])
         self.assertEqual((args.window_sec, args.p4_snapshot, args.p4_read_timeout, args.clear_idle_windows,
-                          args.read_budget_frac), (60.0, "sync", 600.0, 0, 0.0))
+                          args.read_budget_frac, args.clear_expired), (60.0, "sync", 600.0, 0, 0.0, 0))
         plain = hc.build_arg_parser().parse_args(self.BASE)
         self.assertEqual((plain.window_sec, plain.active_ttl_windows, plain.reader, plain.read_budget_frac,
-                          plain.p4_snapshot, plain.p4_read_timeout), (10.0, 5, "legacy", 0.0, "sync", 120.0))
+                          plain.p4_snapshot, plain.p4_read_timeout, plain.clear_expired),
+                         (10.0, 5, "legacy", 0.0, "sync", 120.0, 0))
 
     def test_every_profile_key_is_an_option(self):
         dests = {a.dest for a in hc.build_arg_parser()._actions}

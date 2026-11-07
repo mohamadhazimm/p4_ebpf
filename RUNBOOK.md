@@ -493,21 +493,31 @@ What changed in `hybrid_collector.py`:
 
 - `--profile switch`: 1 s windows, `--active-ttl-windows 3` (the dataset model's TTL),
   `--clear-idle-windows 3`, `--reader batched --reader-raw-wire --reader-sync-batched`,
-  `--p4-snapshot sync`, `--read-budget-frac 0.8`, `--max-dst-reads 256`,
+  `--p4-snapshot sync`, `--read-budget-frac 0.8`, `--max-dst-reads 256`, `--clear-expired 1`,
+  `--clear-budget-frac 0.5` (Section 11.4),
   `--forward-report-port 192`. `--profile model`: 60 s windows, batched reader,
   `--p4-snapshot sync`, `--p4-read-timeout 600`, `--clear-idle-windows 0`, no budget (the
   model's syncs alone take 45-140 s), report port 2. (Until 2026-11-07 it had
   `--p4-snapshot hw` and the default 120 s timeout: the batched reader's hardware reads cost
   ~0.47 s per register entry on the model, so 18 buckets took 118 s and larger active sets timed
   out; see `live_test/RESULTS.md`.) Explicit options override the profile.
-- `--read-budget-frac F`: a read may take F of the window. A running cost model (`ReadCostModel`:
-  fixed ms per window for the syncs and the RPC overhead, ms per bucket read, ms per bucket
-  cleared; initial values from Section 9, updated from every window's measured timing) says how
-  many buckets fit. When the active set is larger, the most recently reported or changed buckets
-  are read and the rest skipped; the window carries `net_overload`, `net_buckets_active`,
-  `net_buckets_read`, `net_buckets_skipped`, `net_read_budget_ms`, `net_read_overrun`.
-  `--max-read-buckets N` is a hard cap; `--max-dst-reads N` caps the `reg_newconn_dst` buckets
-  read (the most reported destinations first).
+- `--read-budget-frac F`: a read may take F of the window, and never more than the time left
+  until the next window boundary minus the collector's measured post-read work (the deadline
+  rule, Section 11.4: a read that is decided late shrinks instead of pushing every later
+  window). A running cost model (`ReadCostModel`: fixed ms per window for the syncs and the RPC
+  overhead, ms per flow bucket read, ms per `reg_newconn_dst` bucket read, ms per bucket
+  cleared; initial values for the reader route in use from Sections 9, 10 and 12.1 and from the
+  model's runs, `ROUTE_COSTS`; updated from every window's measured timing) says how many
+  buckets fit next to that window's clears and destination reads. When the active set is
+  larger, the most recently reported or changed buckets are read and the rest skipped; the
+  window carries `net_overload`, `net_buckets_active`, `net_buckets_read`,
+  `net_buckets_skipped`, `net_read_budget_ms`, `net_read_allow_ms`, `net_read_late_ms`,
+  `net_read_overrun`. `--max-read-buckets N` is a hard cap; `--max-dst-reads N` caps the
+  `reg_newconn_dst` buckets read (the most reported destinations first).
+- `--clear-expired 1` (on in `--profile switch`): a bucket that leaves the active set without
+  having been cleared is cleared unconditionally in a later read, oldest first, within
+  `--clear-budget-frac` of the window's allowance (Section 11.4); the window carries
+  `net_buckets_cleared` and `net_clear_backlog`.
 - Report-only columns `rep_*` in every row, from the CPU reports alone (no register read):
   `rep_new_flows`, `rep_new_flows_per_sec`, `rep_distinct_src_ips`, `rep_distinct_dst_ips`,
   `rep_distinct_dst_ports`, `rep_tcp_share`, `rep_max_flows_to_one_dst`,
@@ -620,6 +630,57 @@ sudo python3 hybrid_collector.py --profile model --window-sec 120 --mode command
 Expect `HOSTMON_READY`, then `HOSTMON_HEALTH {'lost': 0, 'capacity_errors': 0, ...}` at the end,
 and host rows whose `host_window_start_sec` equals the network windows' (the shared origin).
 On the model (2026-11-07): health all 0, equal starts in both rows, the cgroup removed afterwards.
+
+### 11.4 Changes after the 2026-11-07 runs (Section 12.2), and what to rerun
+
+Section 12.2 (c) found two design problems in the budget as first committed; both are fixed in
+`hybrid_collector.py`, `batched_reader.py` and `read_registers_with_index.py` (tests in
+`test_collector_cadence.py` and `test_batched_reader.py`), with no change to any default except
+the two new keys of `--profile switch`.
+
+1. **The budget did not keep the window on time.** The allowance was a fixed fraction of the
+   window counted from the read's start, the collector's own work per window (taking ~1,500
+   reports, two CRCs per report, ~1,150 rows) was not counted, and the cost model started from
+   the protobuf route's values. Now:
+   - the allowance of a window is `min(F x window, time left until the next window boundary -
+     measured post-read work - 5 ms)`, measured when the read is decided, so a read that starts
+     late (`net_read_late_ms` > 0) shrinks and the schedule recovers in the next window instead
+     of lagging by 250-300 ms per window;
+   - the clears and the `reg_newconn_dst` reads are counted in the cost (`ReadCostModel`:
+     a destination read costs 0.15 of a flow bucket read, one register entity instead of
+     fourteen; the estimate is fitted per unit);
+   - the model starts from the route in use (`ROUTE_COSTS`: raw 65 ms fixed, 0.62 ms per
+     bucket read, 0.09 ms per bucket cleared; fast 70 / 1.3 / 0.7; legacy 1.5 s / 3.6 / 1.5;
+     model 99 s / 2.1 s / 3 s) and the printed cost estimate names it.
+2. **Under overload no bucket was ever cleared.** A bucket is read once, in its report window,
+   newer buckets outrank it afterwards, so it never reached three idle reads and left the
+   active set at its TTL still occupied on the switch (46% of the table after (c); the next
+   capture lost 54% of its flows). Now, with `--clear-expired 1`, a bucket that leaves the
+   active set without a clear goes into a queue and is cleared unconditionally in a later read
+   (`clear_indexes` in the reader request: one Write RPC together with the idle clears, no read
+   of the bucket, 0.09 ms per bucket on the raw route), oldest first, at most
+   `--clear-budget-frac` (0.5) of the allowance left after the fixed cost per window; the rest
+   waits (`net_clear_backlog`). A bucket that reports again meanwhile is live and leaves the
+   queue; one whose clear fails three times is given up (counted at the end of the run). What
+   this costs: a live flow the budget never read is split in two when its bucket is cleared,
+   not lost. Without `--clear-expired` the behaviour is as before, and the end-of-run summary
+   says how many buckets stayed occupied.
+3. A window with nothing to read (no active flow bucket and no destination bucket) is no longer
+   synced by the batched reader (a clear needs no snapshot): the 15 syncs the model's overloaded
+   windows still ran (RESULTS.md 2026-11-07, problem 4), 30 ms on the switch.
+
+What to rerun on the switch (PC1, `--profile switch`, the Section 12.2 stand-ins are fine):
+
+- (c) the SYN fan-out again, with `--reader-timing-file`. Expect `net_read_late_ms` to stay
+  small (median well under 100 ms, no growth over the run), `wall_ms` at or under
+  `net_read_allow_ms` in nearly every window, `net_buckets_cleared` > 0 from the first windows
+  after the buckets' TTL (window 4-5 on) with `net_clear_backlog` bounded, and the printed
+  cost estimate starting at the raw route's values. After the run the occupancy check
+  (`024_occupancy_after_flood`) should show the flood buckets cleared, not 46% of the table.
+- (d) the benign capture right after (c) with `--no-register-reset`: the CPU reports should be
+  close to the capture's 2,768 flows and the CSV sums equal the truth (not 54%).
+- (a)/(b) once more as a regression (same criteria as 11.2; `net_buckets_cleared` now also
+  counts their idle clears).
 
 ## 12. Results on the switch (2026-11-07): Sections 10 and 11.2-11.3
 

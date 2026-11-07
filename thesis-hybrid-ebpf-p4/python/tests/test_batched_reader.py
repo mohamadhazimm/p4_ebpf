@@ -50,10 +50,12 @@ HAS_PB2 = bfrt_mock.bfruntime_pb2 is not None
 SELF_CHECK_RPCS = 2 if HAS_PB2 else 0
 
 
-def run_legacy(switch, indexes, dst_indexes=(), clear_if_unchanged=None, snapshot="sync", strict=True):
+def run_legacy(switch, indexes, dst_indexes=(), clear_if_unchanged=None, snapshot="sync", strict=True,
+               clear_indexes=None):
     """The legacy reader's bfrt_python script on the mock, as bfshell would run it."""
     script = build_inner_script(indexes, "indices from CLI", "json", strict, snapshot,
-                                clear_if_unchanged=clear_if_unchanged or {}, dst_indexes=list(dst_indexes))
+                                clear_if_unchanged=clear_if_unchanged or {}, dst_indexes=list(dst_indexes),
+                                clear_indexes=list(clear_indexes or []))
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         exec(compile(script, "inner.py", "exec"),
@@ -71,8 +73,9 @@ def make_batched(switch, fast=True, chunk=4096, strict=True, addr="mock:1", sync
                                                 p4_name_in_requests=not bound, raw=raw)
 
 
-def run_batched(reader, indexes, dst_indexes=(), clear_if_unchanged=None, snapshot="sync"):
-    payload = reader.read_window(indexes, list(dst_indexes), clear_if_unchanged or {}, snapshot)
+def run_batched(reader, indexes, dst_indexes=(), clear_if_unchanged=None, snapshot="sync", clear_indexes=None):
+    payload = reader.read_window(indexes, list(dst_indexes), clear_if_unchanged or {}, snapshot,
+                                 "batched gRPC", list(clear_indexes or []))
     return json.loads(json.dumps(payload))  # as the collector receives it
 
 
@@ -313,6 +316,53 @@ class SourceIdentityTests(unittest.TestCase):
         self.assertEqual(list(batched)[-1], "rows")  # hybrid_collector's fallback parser needs this
 
 
+class UnconditionalClearTests(unittest.TestCase):
+    """clear_indexes: the collector's expired buckets, cleared without being read (RUNBOOK 12.2: under a
+    flood the compare-and-clear never reaches them and they stay occupied)."""
+
+    def test_both_readers_clear_an_unread_bucket(self):
+        for name, run in (("batched", lambda sw: run_batched(make_batched(sw), [], clear_indexes=[KNOWN_IDX])),
+                          ("legacy", lambda sw: run_legacy(sw, [], clear_indexes=[KNOWN_IDX]))):
+            sw = bfrt_mock.MockSwitch()
+            play_known_answer(sw)
+            dst_before = copy.deepcopy(sw.hw["reg_newconn_dst"])
+            self.assertTrue(any(sw.hw["reg_pkts"][KNOWN_IDX]), name)
+            payload = run(sw)
+            self.assertEqual(payload["cleared"], [KNOWN_IDX], name)
+            self.assertEqual((payload["rows"], payload["errors"], payload["flow_count"]), ([], [], 0), name)
+            for reg in ("reg_pkts", "reg_bytes", "reg_pkts_ab", "reg_dir_valid", "reg_first_ts"):
+                self.assertFalse(any(sw.hw[reg].get(KNOWN_IDX, [])), (name, reg))
+            self.assertEqual(sw.hw["reg_newconn_dst"], dst_before, name)   # never cleared
+
+    def test_the_batched_reader_skips_the_sync_when_nothing_is_read(self):
+        sw = bfrt_mock.MockSwitch()
+        play_known_answer(sw)
+        payload = run_batched(make_batched(sw), [], clear_indexes=[KNOWN_IDX])
+        self.assertEqual((payload["timing"]["sync_rpcs"], payload["sync_s"], payload["snapshot"]), (0, 0.0, "sync"))
+        self.assertEqual(payload["timing"]["cleared_unconditional"], 1)
+        self.assertEqual(payload["timing"]["cleared"], 1)
+        # a read of the same bucket afterwards starts from zero and syncs as usual
+        again = run_batched(make_batched(sw), [KNOWN_IDX])
+        self.assertEqual(again["rows"][0]["pkts"], 0)
+        self.assertGreater(again["timing"]["sync_rpcs"], 0)
+
+    def test_idle_and_unconditional_clears_travel_together_and_are_not_double_counted(self):
+        sw = bfrt_mock.MockSwitch()
+        play_known_answer(sw)
+        other = (KNOWN_IDX + 1) % 65536 or 1
+        sw.packet(other, 0, 100, 40000, 80)
+        reader = make_batched(sw)
+        payload = run_batched(reader, [KNOWN_IDX], clear_if_unchanged={KNOWN_IDX: 100},
+                              clear_indexes=[other, KNOWN_IDX])
+        self.assertEqual(sorted(payload["cleared"]), sorted([KNOWN_IDX, other]))
+        self.assertEqual(payload["timing"]["cleared_unconditional"], 1)      # KNOWN_IDX was an idle clear already
+        self.assertEqual(payload["timing"]["cleared"], 2)
+        self.assertFalse(any(sw.hw["reg_pkts"][KNOWN_IDX]))
+        self.assertFalse(any(sw.hw["reg_pkts"][other]))
+        legacy = run_legacy(bfrt_mock.MockSwitch(), [], clear_indexes=[])
+        self.assertEqual(legacy["cleared"], [])
+
+
 class KnownAnswerTests(unittest.TestCase):
     def check_row(self, row):
         for key, value in KNOWN_ROW.items():
@@ -402,17 +452,20 @@ class EquivalenceTests(unittest.TestCase):
         windows_with_dst = sum(1 for w in win_l if w["active_dst_indexes"])
         self.assertEqual(sw_l.stats["legacy_syncs"], 14 * len(win_l) + windows_with_dst)
         self.assertEqual(sw_l.stats["legacy_mods"], 14 * sum(len(w["cleared_indexes"]) for w in win_l))
-        # Batched: one Sync write per table, 14 (+1) Reads, one clear write per window.
+        # Batched: one Sync write per table, 14 (+1) Reads, one clear write per window. A window with nothing
+        # to read (no active flow bucket, no destination bucket) is not synced at all.
         windows_with_active = sum(1 for w in win_b if w["active_indexes"])
+        windows_with_sync = sum(1 for w in win_b if w["active_indexes"] or w["active_dst_indexes"])
         windows_with_clears = sum(1 for w in win_b if w["cleared_indexes"])
+        self.assertLess(windows_with_sync, len(win_b), "the scenario has idle windows")
         self.assertEqual(sw_b.stats["read_rpcs"], 14 * windows_with_active + windows_with_dst + SELF_CHECK_RPCS)
         first_active = next(len(w["active_indexes"]) for w in win_b if w["active_indexes"])
         self.assertEqual(sw_b.stats["read_entities"],
                          14 * active_cells + dst_cells + SELF_CHECK_RPCS * min(4, first_active))
-        self.assertEqual(sw_b.stats["sync_ops"], 14 * len(win_b) + windows_with_dst)
+        self.assertEqual(sw_b.stats["sync_ops"], 14 * windows_with_sync + windows_with_dst)
         # One clear Write per window on the fast route; the safe route's entry_mod() makes one per table.
         clear_writes = windows_with_clears if HAS_PB2 else 14 * windows_with_clears
-        self.assertEqual(sw_b.stats["write_rpcs"], 14 * len(win_b) + windows_with_dst + clear_writes)
+        self.assertEqual(sw_b.stats["write_rpcs"], 14 * windows_with_sync + windows_with_dst + clear_writes)
         self.assertEqual(sw_b.stats["write_updates"], 14 * sum(len(w["cleared_indexes"]) for w in win_b))
         self.assertEqual(sw_b.stats["read_from_hw"], 0)
         # --sync-batched: the 14 (+1) Syncs of a window in one Write (it needs the protobuf module).
@@ -603,6 +656,18 @@ class ServeProtocolTests(unittest.TestCase):
             payload = proc.read_with_retries([KNOWN_IDX], 1, retries=0, timeout=30,
                                              clear_if_unchanged={KNOWN_IDX: 100}, dst_indexes=[], snapshot="sync")
             self.assertEqual(payload["cleared"], [KNOWN_IDX])
+            self.assertEqual(proc.read([KNOWN_IDX], timeout=30)["rows"][0]["pkts"], 0)
+            self.assertEqual(proc.starts, 1)
+        finally:
+            proc.stop()
+
+    def test_the_serve_protocol_clears_unconditionally_without_a_read(self):
+        proc = hc.BatchedReaderProcess(self.script, grpc_addr="mock:serve", echo=False,
+                                       extra_args=["--mock-cells", self.cells])
+        try:
+            proc.start()
+            payload = proc.read([], clear_indexes=[KNOWN_IDX], timeout=30)
+            self.assertEqual((payload["cleared"], payload["rows"], payload["timing"]["sync_rpcs"]), ([KNOWN_IDX], [], 0))
             self.assertEqual(proc.read([KNOWN_IDX], timeout=30)["rows"][0]["pkts"], 0)
             self.assertEqual(proc.starts, 1)
         finally:
