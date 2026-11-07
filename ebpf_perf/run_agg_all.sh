@@ -14,6 +14,12 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE"
 [[ $EUID -eq 0 ]] || { echo "run as root: sudo $0" >&2; exit 1; }
+# Hold a sleep/idle block lock for the whole run; it is released when this script exits.
+if [[ -z ${HOSTMON_SLEEP_LOCK:-} ]]; then
+  export HOSTMON_SLEEP_LOCK=1
+  exec systemd-inhibit --what=sleep:idle:handle-lid-switch:handle-suspend-key --mode=block \
+    --who="hostmon benchmark" --why="run_agg_all.sh in progress" "$HERE/run_agg_all.sh" "$@"
+fi
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 LOG="results/agg-all-$TS.log"
 STATUS="results/agg-all.status"

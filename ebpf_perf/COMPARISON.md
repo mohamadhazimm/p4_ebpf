@@ -5,6 +5,9 @@ against the published numbers collected in [LITERATURE.md](LITERATURE.md). Raw r
 `results/macro-lit-*`; the combined summary is `results/literature-summary-20261026.{md,json}`
 (produced by `analyze_macro.py`).
 
+Sections 1–6 are the original HostMon. Section 7 repeats the same suite with `hostmon_agg`
+(in-kernel aggregation, [hostmon_agg/README.md](hostmon_agg/README.md)) on 2026-10-27.
+
 ## Setup
 
 - HostMon as built by `build.sh` from the unchanged `libbpf-bootstrap/examples/c/hostmon*`
@@ -129,3 +132,100 @@ measures that ceiling more than a typical server load.
   and eAudit are the closer comparisons.
 - In 12-task runs and the kernel build, HostMon shares a physical core with one benchmark thread.
 - eAudit's Fig. 20 core count and configuration are not reproduced exactly.
+
+## 7. After optimization: hostmon_agg (2026-10-27)
+
+Same suite, settings, cores and repetitions as sections 1–6 (`sudo ./run_agg_all.sh`, which runs
+`TUNE=1 TAG=agg HOSTMON_BIN=build/hostmon_agg ./run_literature.sh`). Raw results are in
+`results/macro-lit-agg-*`, the summary in `results/literature-agg-summary-20261027.{md,json}`.
+All 354 runs exited 0 and every collector exited 0. All 192 monitored runs report
+`HOSTMON_HEALTH,0,0,0,0`: no lost events, no capacity errors, no late events. The suite took
+2 h 09 min, against 2 h 47 min for the original collector. Every overhead below is relative to
+the same day's `base` runs.
+
+### 7.1 Per-syscall microbenchmarks, µs added (base → monitored)
+
+| Test | hostmon | hostmon_agg | Unmonitored process (hostmon → agg) | ebpH | SysComb |
+|---|---|---|---|---|---|
+| null syscall | +0.295 (+379%) | **+0.049 (+63%)** | +74% → +18% | +0.36 | +0.13 |
+| read | +0.363 (+206%) | **+0.045 (+26%)** | +33% → +8% | +0.35 | – |
+| write | +0.363 (+294%) | **+0.047 (+38%)** | +48% → +11% | +0.36 | – |
+| stat | +0.539 (+123%) | **+0.074 (+17%)** | +20% → +5% | +0.39 | – |
+| fstat | +0.350 (+196%) | **+0.050 (+28%)** | +34% → +9% | +0.36 | – |
+| open/close | +1.675 (+176%) | **+0.136 (+16%)** | +24% → +5% | +0.79 | – |
+| pipe | +2.20 (+54%) | **+0.14 (+3%)** | +6% → +5% | +1.26 | – |
+| AF_UNIX | +5.50 (+87%) | **+0.62 (+8%)** | +29% → +8% | +1.70 | – |
+| fork+/bin/sh | +123 (+25%) | **+13.9 (+3%)** | +11% → +5% | +153 | – |
+| file create 0k / 10k | +22% / +28% | **+4% / +1%** | | | |
+| file delete 0k / 10k | +38% / +21% | **+2% / −3%** | | | |
+
+fork+exit and fork+exec stay within the ±8% repeat-to-repeat noise for both collectors.
+
+### 7.2 Linux kernel build (defconfig, `make -j12`)
+
+| | hostmon | hostmon_agg |
+|---|---|---|
+| Wall time, base → monitored | 74.08 → 78.84 s (**+6.4%**) | 73.66 → 74.13 s (**+0.6%**) |
+| Unmonitored | +0.6% | +0.2% |
+| Benchmark CPU time | +4.6% | +0.4% |
+| Events not attributed to a process | 77% | **0%** |
+
+The five hostmon_agg base builds range from 73.52 to 74.54 s. The 0.47 s difference is
+inside that spread, so at 5 repeats hostmon_agg's kernel-build overhead is under 1% and not
+resolved further. Published: ebpH +0.97%, bpfbox passive +1.33%, CamFlow +2%, ProvBPF +5%.
+
+### 7.3 eAudit benchmark suite (wall time)
+
+| Benchmark | 1 task | 4 tasks | 12 tasks | events/s at 12 tasks |
+|---|---|---|---|---|
+| shbm | +12.3% → **+1.8%** | +9.0% → **+1.8%** | +23.7% → **+3.6%** | 1.47 M → 1.71 M |
+| httperf | +19.7% → **+1.2%** | +16.2% → **+1.7%** | +20.3% → **+1.1%** | 1.60 M → 2.27 M |
+| postmark | +50.7% → **+4.0%** | +38.7% → **+3.1%** | +82.9% → **+1.3%** | 2.68 M → 4.88 M |
+| find | +94.1% → **+11.1%** | +208.7% → **+10.3%** | +673.4% → **+10.0%** | 2.77 M → 19.8 M |
+| tar | +93.7% → **+7.9%** | +153.4% → **+6.8%** | +467.0% → **+10.7%** | 2.76 M → 14.2 M |
+| rdwr | +159.8% → **+22.3%** | +485.0% → **+21.7%** | +1561.3% → **+24.2%** | 2.80 M → 35.6 M |
+
+Mean over the 18 cells: hostmon_agg **+8.0%**, or **+2.2%** without find, tar and rdwr.
+eAudit reports about +18% and +5.8% respectively. The 12-task overhead is now about the same
+as the 1-task overhead, because there is no shared ring buffer or consumer to saturate.
+
+Agent CPU as a fraction of benchmark CPU, 1 task (eAudit Fig. 20 metric):
+
+| | postmark | shbm |
+|---|---|---|
+| hostmon | 59% | 21% |
+| **hostmon_agg** | **<0.1%** | **1.1%** |
+| eAudit | 4% | 5% |
+
+shbm's events not attributed to a process: 72–76% → 0% at 1, 4 and 12 tasks.
+
+### 7.4 Servers
+
+| | Web server throughput | Redis SET / GET |
+|---|---|---|
+| hostmon | nginx + wrk −62% | −35% / −36% |
+| **hostmon_agg** | **nginx + wrk −6.8%** (504,105 → 469,635 req/s; unmonitored −1.3%) | **−5.2% / −4.8%** (unmonitored −1.5% / −1.4%) |
+| ProvBPF | Apache −8% | −10% / −11% |
+| CamFlow | Apache −12% | −4% / −12% |
+
+The monitored nginx run recorded 6.93 M events/s, against hostmon's 2.53 M ceiling. The nginx
+base rate was 443,697 req/s on 2026-10-26 and 504,105 req/s on 2026-10-27, although `base` loads
+no collector. The cause was not investigated; each day's overhead uses that day's base.
+
+### 7.5 What changed and what remains
+
+- Per-syscall cost dropped from ~0.30–0.36 µs to ~0.045–0.050 µs, below ebpH (+0.36 µs) and
+  SysComb (+0.13 µs). open/close costs a sixth of ebpH's.
+- The ~2.5–2.8 M events/s ceiling is gone: find, tar, rdwr and nginx no longer collapse with
+  more tasks (rdwr at 12 tasks: 35.6 M events/s, no loss).
+- No events are dropped for lack of a process slot (kernel build and shbm: 77% → 0%).
+- Collector CPU is near zero: user space wakes once per window. Its peak memory (VmHWM) is
+  13.5 MiB in most runs (hostmon: 34.5 MiB) and grows with the number of processes per window
+  (125.6 MiB in shbm at 12 tasks, 25.9 MiB in the kernel build).
+- rdwr is still +22–24%. It is a loop of one-byte read/write pairs (25 M pairs in 12.8 s at
+  1 task, about 250 ns per call including the loop), so the fixed ~50 ns per call is a large
+  share. Lowering it further needs a cheaper per-call update, for
+  example per-CPU entries without the per-process lock.
+- Unmonitored processes still pay about 14 ns per syscall (+18% on a null syscall, +5.5–7% on
+  rdwr): the hook runs for every process and the cgroup check is inside the program.
+- The comparability limits of section 6 still apply.
