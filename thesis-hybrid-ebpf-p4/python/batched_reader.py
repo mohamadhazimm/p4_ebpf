@@ -22,7 +22,13 @@ gRPC client and a fixed number of RPCs per window:
      (from_hw=False); the per-pipe values of each entry are merged with
      combine() below;
   3. one Write RPC that zeroes the 14 registers of every bucket to clear
-     (one update per register per bucket, all in one batch).
+     (one update per register per bucket, all in one batch): the idle buckets
+     whose packet count still equals the caller's previous read
+     (clear_if_unchanged) and the buckets the caller clears unconditionally
+     (clear_indexes: buckets that left its active set unread, which would
+     otherwise stay occupied and send no CPU report for the next flow).
+     With nothing to read (no indexes and no dst_indexes) the syncs are
+     skipped: a clear needs no snapshot.
 
 combine() and make_row() are copies of the legacy reader's closures (the test
 suite checks them textually against read_registers_with_index.INNER_TEMPLATE),
@@ -66,7 +72,7 @@ Modes:
                        (used by hybrid_collector.py --reader batched)
     --indexes 1,2,3    one read, payload printed as the last line (same flags
                        as the legacy reader: --dst-indexes, --clear-if-unchanged,
-                       --snapshot, --format json)
+                       --clear-indexes, --snapshot, --format json)
     --probe            connect, list the register tables, read one cell both
                        ways, time one Sync: the client/server compatibility check
     --bench 100,500    timing table: sync / read / clear per window for the
@@ -780,23 +786,28 @@ class BatchedRegisterReader(object):
     # ---------------------------------------------------------------- window
 
     def read_window(self, indexes, dst_indexes=None, clear_if_unchanged=None, snapshot="sync",
-                    source="batched gRPC"):
+                    source="batched gRPC", clear_indexes=None):
         """snapshot: "sync" (register sync, then shadow reads), "hw" (hardware
-        reads, no sync) or "shadow" (shadow reads without a sync; benchmarks)."""
+        reads, no sync) or "shadow" (shadow reads without a sync; benchmarks).
+        clear_indexes: buckets cleared unconditionally after the read (they need
+        not be read; one Write RPC with the clear_if_unchanged clears)."""
         indexes = [int(i) for i in indexes]
         dst_indexes = [int(i) for i in (dst_indexes or [])]
         clear_if_unchanged = clear_if_unchanged or {}
+        clear_indexes = [int(i) for i in (clear_indexes or [])]
         timing = OrderedDict([("active", len(indexes)), ("dst", len(dst_indexes)),
                               ("sync_ms", 0.0), ("sync_rpcs", 0), ("read_ms", 0.0), ("read_rpcs", 0),
                               ("read_entities", 0), ("clear_ms", 0.0), ("clear_rpcs", 0),
-                              ("cleared", 0), ("parser", self.route())])
+                              ("cleared", 0), ("cleared_unconditional", 0), ("parser", self.route())])
         t_start = time.time()
         errors = []
         sync_s = None
         sync_tables = list(self.flow_tables)
         if dst_indexes and self.dst_table is not None:
             sync_tables.append(self.dst_table)
-        if snapshot == "sync":
+        if snapshot == "sync" and not indexes and not dst_indexes:
+            sync_s = 0.0          # nothing to read: a clear needs no snapshot
+        elif snapshot == "sync":
             try:
                 self._sync_all(sync_tables, timing)
                 ok = True
@@ -850,7 +861,8 @@ class BatchedRegisterReader(object):
         timing["read_ms"] = round((time.time() - t_read) * 1000.0, 3)
         read_s = round(time.time() - t_start, 4)
 
-        # Clear idle buckets whose packet count is still what the caller saw.
+        # Clear idle buckets whose packet count is still what the caller saw,
+        # and the buckets the caller clears unconditionally, in one Write.
         cleared = []
         pkts_now = dict((r["idx"], r["pkts"]) for r in rows)
         to_clear = []
@@ -859,10 +871,18 @@ class BatchedRegisterReader(object):
             if pkts_now.get(idx) != int(prev_pkts):
                 continue
             to_clear.append(idx)
+        seen = set(to_clear)
+        unconditional = []
+        for idx in clear_indexes:
+            if idx not in seen:
+                seen.add(idx)
+                to_clear.append(idx)
+                unconditional.append(idx)
         if to_clear:
             try:
                 self._clear(to_clear, timing)
                 cleared = list(to_clear)
+                timing["cleared_unconditional"] = len(unconditional)
             except Exception as error:
                 errors.append("clear %s: %s" % (to_clear, error))
         timing["cleared"] = len(cleared)
@@ -971,7 +991,7 @@ def serve(args):
         try:
             payload = reader.read_window(req.get("indexes") or [], req.get("dst_indexes") or [],
                                          req.get("clear_if_unchanged") or {}, req.get("snapshot", "sync"),
-                                         req.get("source", "batched gRPC"))
+                                         req.get("source", "batched gRPC"), req.get("clear_indexes") or [])
             out = json.dumps(payload)
         except Exception as error:
             out = json.dumps({"error": "%s: %s" % (type(error).__name__, error)})
@@ -996,7 +1016,13 @@ def one_shot(args):
     unread = sorted(set(clear) - set(idxs))
     if unread:
         sys.exit("[ERROR] --clear-if-unchanged lists buckets that are not read: %s" % unread)
-    payload = reader.read_window(idxs, dst, clear, args.snapshot, "indices from CLI (batched gRPC)")
+    unconditional = []
+    for i in parse_int_list(args.clear_indexes):
+        if not 0 <= i < FLOW_BUCKETS:
+            sys.exit("[ERROR] --clear-indexes: index %d outside [0, %d)" % (i, FLOW_BUCKETS))
+        if i not in unconditional:
+            unconditional.append(i)
+    payload = reader.read_window(idxs, dst, clear, args.snapshot, "indices from CLI (batched gRPC)", unconditional)
     reader.close()
     if args.format == "json":
         print(json.dumps(payload))
@@ -1141,6 +1167,8 @@ def main():
     ap.add_argument("--index-mode", choices=["cli"], default="cli", help="(legacy reader compatibility)")
     ap.add_argument("--dst-indexes", default="")
     ap.add_argument("--clear-if-unchanged", default="")
+    ap.add_argument("--clear-indexes", default="",
+                    help="comma-separated buckets to clear unconditionally after the read (they need not be read)")
     ap.add_argument("--snapshot", choices=["sync", "hw"], default="sync")
     ap.add_argument("--format", choices=["summary", "json"], default="json")
     args = ap.parse_args()
