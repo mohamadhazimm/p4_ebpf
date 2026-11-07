@@ -158,7 +158,8 @@ class ReadBudgetTests(unittest.TestCase):
         # TTL (window 4) and, with clear_expired, are all cleared there: (40 - 10) x 0.5 = 15 ms at 0.5 ms each.
         cost = hc.ReadCostModel(fixed_ms=10.0, read_ms_per_bucket=5.0, clear_ms_per_bucket=0.5)
         reports = {0: [report(i, proto=17) for i in range(20)]}
-        windows, reader = self.run_live(reports, 7, read_budget_frac=0.8, cost_model=cost, clear_expired=True)
+        windows, reader = self.run_live(reports, 7, reader=FakeReader(clear_ms=0.5), read_budget_frac=0.8,
+                                        cost_model=cost, clear_expired=True)
         self.assertEqual([c["clear_indexes"] for c in reader.calls[:4]], [[], [], [], []])
         self.assertEqual(reader.calls[4]["clear_indexes"], list(range(6, 20)))
         self.assertEqual(windows[4]["expired_indexes"], list(range(6, 20)))
@@ -170,6 +171,82 @@ class ReadBudgetTests(unittest.TestCase):
         self.assertEqual((agg["net_buckets_read"], agg["net_buckets_skipped"], agg["net_overload"]), (4, 2, 1))
         self.assertTrue(all(c["clear_indexes"] == [] for c in reader.calls[5:7]))
         self.assertEqual(windows[6]["report_aggregates"]["net_buckets_read"], 6)      # back to the full set
+        # End of the run: one more request clears the six live buckets without reading anything.
+        self.assertEqual(len(reader.calls), len(windows) + 1)
+        self.assertEqual((reader.calls[-1]["indexes"], reader.calls[-1]["dst"], reader.calls[-1]["clear_indexes"]),
+                         ([], [], list(range(6))))
+        self.assertEqual(windows[-1]["final_cleared_indexes"], list(range(6)))
+
+    def test_the_end_of_run_clear_takes_the_backlog_too_and_only_with_clear_expired(self):
+        # Clears cost 5 ms (3 per window), so the run ends with buckets still waiting in the queue.
+        cost = hc.ReadCostModel(fixed_ms=10.0, read_ms_per_bucket=5.0, clear_ms_per_bucket=5.0)
+        windows, reader = self.run_live({0: [report(i, proto=17) for i in range(20)]}, 6,
+                                        reader=FakeReader(clear_ms=5.0), read_budget_frac=0.8, cost_model=cost,
+                                        clear_expired=True)
+        backlog = windows[-1]["report_aggregates"]["net_clear_backlog"]
+        self.assertGreater(backlog, 0)
+        final = reader.calls[-1]["clear_indexes"]
+        self.assertEqual(len(final), len(windows[-1]["active_indexes"]) + backlog)
+        self.assertEqual(windows[-1]["final_cleared_indexes"], sorted(final))
+        # without --clear-expired: no end-of-run request
+        windows, reader = self.run_live({0: [report(i, proto=17) for i in range(20)]}, 6,
+                                        reader=FakeReader(clear_ms=5.0), read_budget_frac=0.8,
+                                        cost_model=hc.ReadCostModel(fixed_ms=10.0, read_ms_per_bucket=5.0,
+                                                                    clear_ms_per_bucket=5.0))
+        self.assertEqual(len(reader.calls), len(windows))
+        self.assertNotIn("final_cleared_indexes", windows[-1])
+
+    def test_a_failed_end_of_run_clear_does_not_end_the_run_with_an_error(self):
+        class FailingAtTheEnd(FakeReader):
+            def __call__(self, indexes, w, **kw):
+                if not indexes and kw.get("clear_indexes"):
+                    raise hc.P4ReadError("switch gone")
+                return super().__call__(indexes, w, **kw)
+
+        cost = hc.ReadCostModel(fixed_ms=10.0, read_ms_per_bucket=5.0, clear_ms_per_bucket=0.5)
+        windows, _ = self.run_live({0: [report(i, proto=17) for i in range(4)]}, 3, reader=FailingAtTheEnd(),
+                                   read_budget_frac=0.8, cost_model=cost, clear_expired=True)
+        self.assertEqual(windows[-1]["final_cleared_indexes"], [])
+
+    def test_the_reported_destination_bucket_is_used_without_a_crc(self):
+        saved = hc.compute_newconn_dst_index
+
+        def no_crc(*_a, **_k):
+            raise AssertionError("the collector computed a CRC for a report that carries dst_idx")
+
+        hc.compute_newconn_dst_index = no_crc
+        try:
+            reports = {0: [dict(report(1), dst_idx=4242), dict(report(2), dst_idx=4242), dict(report(3), dst_idx=7)]}
+            windows, reader = self.run_live(reports, 2)
+        finally:
+            hc.compute_newconn_dst_index = saved
+        self.assertEqual(windows[0]["dst_indexes"], [7, 4242])
+        self.assertEqual(reader.calls[0]["dst"], [7, 4242])
+        # a report without dst_idx (an older capture path) still gets its bucket computed
+        windows, _ = self.run_live({0: [report(1)]}, 2)
+        self.assertEqual(windows[0]["dst_indexes"], [hc.compute_newconn_dst_index("10.0.0.1", "10.0.0.2", 80, 6)])
+
+    def test_the_measured_selection_time_is_taken_off_the_allowance(self):
+        cost = hc.ReadCostModel(fixed_ms=10.0, read_ms_per_bucket=5.0, clear_ms_per_bucket=1.0)
+        cost.select_ms, cost.post_ms = 300.0, 100.0
+        windows, _ = self.run_live({0: [report(i, proto=17) for i in range(400)]}, 3, window_sec=1.0,
+                                   read_budget_frac=0.8, cost_model=cost)
+        a0 = windows[0]["report_aggregates"]
+        # decided on time: 1000 - 300 (selection) - 100 (post-read work) - 5 (margin) = 595 ms < the 800 ms budget
+        self.assertEqual(a0["net_read_allow_ms"], 595.0)
+        self.assertEqual(a0["net_buckets_read"], (595 - 10) // 5)
+        # this fake clock takes no time for the selection, so the averages come down window by window
+        self.assertGreater(windows[1]["report_aggregates"]["net_read_allow_ms"], 595.0)
+
+    def test_reads_that_overrun_their_prediction_raise_the_margin(self):
+        clock = FakeClock(1000.0)
+        cost = hc.ReadCostModel(fixed_ms=10.0, read_ms_per_bucket=5.0, clear_ms_per_bucket=1.0)
+        reader = FakeReader(clock=clock, durations={0: 0.9})      # predicted 10 + 158 x 5 = 800 ms, took 900
+        windows, _ = self.run_live({0: [report(i, proto=17) for i in range(200)]}, 3, window_sec=1.0, clock=clock,
+                                   reader=reader, read_budget_frac=0.8, cost_model=cost)
+        self.assertEqual(windows[0]["report_aggregates"]["net_buckets_read"], 158)
+        self.assertGreater(cost.margin_ms, 0.0)
+        self.assertLess(windows[1]["report_aggregates"]["net_buckets_read"], 158)
 
     def test_without_clear_expired_the_buckets_just_expire(self):
         cost = hc.ReadCostModel(fixed_ms=10.0, read_ms_per_bucket=5.0, clear_ms_per_bucket=0.5)
@@ -207,7 +284,7 @@ class ReadBudgetTests(unittest.TestCase):
                                         clear_expired=True)
         self.assertIn(19, windows[4]["expired_indexes"])
         self.assertIn(19, windows[5]["active_indexes"])
-        self.assertTrue(all(19 not in c["clear_indexes"] for c in reader.calls))
+        self.assertTrue(all(19 not in c["clear_indexes"] for c in reader.calls[:len(windows)]))
         # window 5: 19 leaves the queue (10 left, 3 cleared); window 7: the 3 unread live buckets join it
         self.assertEqual([w["report_aggregates"]["net_clear_backlog"] for w in windows[4:8]], [11, 7, 4, 4])
 
@@ -314,10 +391,18 @@ class HelperTests(unittest.TestCase):
         m = hc.ReadCostModel(fixed_ms=10.0, read_ms_per_bucket=1.0, clear_ms_per_bucket=1.0, alpha=1.0)
         m.update(100, 0, {"sync_ms": 10.0, "read_ms": 115.0, "clear_ms": 0.0, "overhead_ms": 0.0}, n_dst=100)
         self.assertAlmostEqual(m.read_ms_per_bucket, 1.0)
-        m.update_processing(20.0, 40.0)
+        m.update_processing(20.0, 40.0, select_ms=8.0)
         m.update_processing(0.0, 0.0)
-        self.assertEqual((m.prep_ms, m.post_ms), (5.0, 10.0))
+        self.assertEqual((m.prep_ms, m.post_ms, m.select_ms), (5.0, 10.0, 2.0))
         self.assertEqual(m.as_dict()["route"], "fast")
+        # margin: only overshoots of the prediction count, and buckets_within keeps the margin free
+        m = hc.ReadCostModel(fixed_ms=10.0, read_ms_per_bucket=1.0, clear_ms_per_bucket=1.0, alpha=0.5)
+        m.update(100, 0, {"sync_ms": 10.0, "read_ms": 80.0, "clear_ms": 0.0, "overhead_ms": 0.0})   # faster
+        self.assertEqual(m.margin_ms, 0.0)
+        m = hc.ReadCostModel(fixed_ms=10.0, read_ms_per_bucket=1.0, clear_ms_per_bucket=1.0, alpha=0.5)
+        m.update(100, 0, {"sync_ms": 10.0, "read_ms": 140.0, "clear_ms": 0.0, "overhead_ms": 0.0})  # 40 ms over
+        self.assertEqual(m.margin_ms, 20.0)
+        self.assertEqual(m.buckets_within(200.0), int((200 - m.fixed_ms - 20.0) // m.read_ms_per_bucket))
 
     def test_payload_timing_falls_back_to_the_legacy_fields(self):
         t = hc.payload_timing_ms({"sync_s": 0.04, "read_s": 0.14, "clear_s": 0.01}, 220.0)

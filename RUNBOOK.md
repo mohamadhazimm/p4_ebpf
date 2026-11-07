@@ -917,3 +917,46 @@ that still reads dst buckets.
    raw route), or allow `--drain-seconds` in `--mode command`.
 4. Make the `alive()` helper in `test_collector_robustness.py` treat a missing `/proc/<pid>/stat`
    as not alive.
+
+### 13.4 What changed after 13.3, and what to rerun
+
+All four suggestions are in `hybrid_collector.py`, `listen_cpu_reports.py`, `flow_index.py` and
+the tests; no option or default changed.
+
+1. **The dst index is computed in the capture thread, with a table-driven CRC.**
+   `listen_cpu_reports.parse_cpu_report()` adds `dst_idx` to every TCP report as it arrives (`None`
+   for other protocols), from the report's raw address integers. The window loop uses it and
+   computes the index itself only for a report without it. `flow_index.crc16_arc()` does one table
+   lookup per byte; `crc16_arc_bitwise()` is the old loop, kept as the reference, and the two agree
+   on 4,000+ random keys (`test_flow_index`). On the lab workstation the bitwise CRC takes 5.1 us
+   per 13-byte key and the table 0.93 us, and `parse_cpu_report()` with both indexes 3.6 us per
+   report; PC1 measured 44.5 us for the bitwise `compute_newconn_dst_index`. The window loop no
+   longer computes any CRC for a captured report.
+2. **The work between the decision and the read is taken off the allowance, and so are the
+   reads' prediction errors.** The cost model measures the selection (decision to read start,
+   `select_ms`) and subtracts it, with `post_ms`, from the time left until the next boundary.
+   It also keeps `margin_ms`, an average of how much the reads took longer than predicted (only
+   overshoots count, so it decays to 0 while the predictions hold), and plans the read with that
+   much time free. Both are in the printed cost estimate.
+3. **With `--clear-expired`, the end of a run clears what is still occupied.** After the last
+   window one more request clears the last windows' active set and the clear backlog
+   unconditionally (nothing is read, and the batched reader does not sync), printed as
+   `end of run: cleared N of the M buckets still occupied`. A failure there only prints a
+   warning. `--drain-seconds` in `--mode command` is unchanged.
+4. **`alive()`** in `test_collector_robustness.py` counts a process reaped between its two checks as
+   not alive: `FileNotFoundError` before the open of `/proc/<pid>/stat`, and `ProcessLookupError`
+   between the open and the read (the form seen on the lab workstation). The full suite, 111
+   tests, passed 4 of 4 runs.
+
+Not changed: `on_window()` re-reads the whole monitor log every window to write the ready host
+rows. That is negligible for these runs, but it grows with the run's length, so an hours-long
+run needs an incremental reader there.
+
+Rerun on PC1 (pull first; `--profile switch`, the stand-in captures):
+
+- (c), then (d) right after it with `--no-register-reset`, without the `; sleep 6` of (c').
+  Expect `net_read_late_ms` with a median well under 100 ms, `wall_ms` at or under
+  `net_read_allow_ms` in nearly every window, 0-1 overruns, and the end-of-run line clearing about
+  5,400 buckets. After (c) the occupancy check should find 0 occupied, and (d) should report
+  2,768 of 2,768 flows with the CSV sums equal to the truth.
+- (a) and (b) as a regression (Section 11.2's criteria).
