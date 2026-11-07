@@ -401,7 +401,97 @@ def read_host_windows(path: str) -> List[Dict[str, object]]:
     return parse_host_windows(p.read_text(errors="replace")) if p.exists() else []
 
 
-def run_scenario_command(cmd: str, shell: str = "/bin/bash") -> subprocess.Popen:
+# ------------------------------------------------------------
+# In-kernel monitor (ebpf_perf/hostmon_agg): cgroup + shared start time
+# ------------------------------------------------------------
+
+def cgroup_wrapped_command(cmd: str, cgroup: str, shell: str = "/bin/bash") -> List[str]:
+    """argv that moves the scenario's shell into `cgroup` before it runs the
+    command, so every process of the scenario is in the cgroup from its first
+    system call (hostmon_agg filters on it). `$0` is the cgroup, `$1` the shell,
+    `$2` the command."""
+    return ["/bin/bash", "-c", 'echo $$ > "$0/cgroup.procs" && exec "$1" -c "$2"', cgroup, shell, cmd]
+
+
+def ensure_cgroup(path: str) -> "tuple[Path, bool]":
+    """(cgroup directory, created now). A cgroup-v2 directory is created by mkdir."""
+    p = Path(path)
+    created = False
+    if not p.exists():
+        p.mkdir(parents=True)
+        created = True
+    if not (p / "cgroup.procs").exists():
+        raise RuntimeError(f"{p} is not a cgroup-v2 directory (no cgroup.procs)")
+    return p, created
+
+
+def cleanup_cgroup(p: Path, created: bool) -> None:
+    """Kill what the scenario left in the cgroup; remove it if this run made it."""
+    try:
+        if (p / "cgroup.procs").read_text().split():
+            (p / "cgroup.kill").write_text("1")
+            time.sleep(0.2)
+        if created:
+            p.rmdir()
+    except OSError as error:
+        print(f"[WARN] cgroup {p} not cleaned up: {error}")
+
+
+def wait_for_line(path: str, token: str, timeout: float, proc: Optional[subprocess.Popen] = None) -> str:
+    """The first line of `path` starting with `token`, within `timeout` seconds."""
+    deadline = time.time() + timeout
+    while True:
+        p = Path(path)
+        if p.exists():
+            for line in p.read_text(errors="replace").splitlines():
+                if line.startswith(token):
+                    return line
+        exited = proc is not None and proc.poll() is not None
+        if exited or time.time() >= deadline:
+            tail = p.read_text(errors="replace")[-400:] if p.exists() else ""
+            raise RuntimeError(f"{token} not seen in {path} within {timeout:.0f} s"
+                               + (f"; the monitor exited with {proc.returncode}" if exited else "")
+                               + (f"; output: {tail!r}" if tail else ""))
+        time.sleep(0.05)
+
+
+def start_hostmon_agg(hostmon_path: str, output_path: str, window_sec: float, cgroup: Path,
+                      use_sudo: Optional[bool] = None) -> subprocess.Popen:
+    """Start the in-kernel monitor on `cgroup`. It prints HOSTMON_READY, then
+    waits for the shared monotonic start time on stdin (send_hostmon_start);
+    its windows are anchored at that instant, like the collector's."""
+    fout = open(output_path, "w")
+    if use_sudo is None:
+        use_sudo = os.geteuid() != 0
+    cmd = (["sudo"] if use_sudo else []) + [hostmon_path, repr(float(window_sec)), str(cgroup)]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=fout, stderr=subprocess.STDOUT, text=True,
+                            start_new_session=True)
+    proc._collector_file = fout
+    return proc
+
+
+def send_hostmon_start(proc: subprocess.Popen, start_monotonic: float) -> None:
+    assert proc.stdin is not None
+    proc.stdin.write(repr(float(start_monotonic)) + "\n")
+    proc.stdin.flush()
+    proc.stdin.close()
+
+
+def hostmon_health(path: str) -> Optional[Dict[str, int]]:
+    """The monitor's HOSTMON_HEALTH,<lost>,<capacity errors>,<late>,<failed> line, if printed."""
+    p = Path(path)
+    if not p.exists():
+        return None
+    for line in reversed(p.read_text(errors="replace").splitlines()):
+        if line.startswith("HOSTMON_HEALTH,"):
+            values = [safe_int(x) for x in line.split(",")[1:5]]
+            return dict(zip(("lost", "capacity_errors", "late_events", "failed"), values))
+    return None
+
+
+def run_scenario_command(cmd: str, shell: str = "/bin/bash", cgroup: Optional[str] = None) -> subprocess.Popen:
+    if cgroup is not None:
+        return subprocess.Popen(cgroup_wrapped_command(cmd, cgroup, shell), text=True)
     return subprocess.Popen([shell, "-lc", cmd])
 
 
@@ -739,6 +829,142 @@ def make_timing_logger(reader_name: str, path: Optional[str] = None) -> Callable
     return log
 
 
+# ============================================================
+# READ CADENCE: cost model, read budget, report-only aggregates
+# ============================================================
+
+# Columns computed from the CPU reports alone, with no register read. They are
+# the flood-path signal (new flows per second, destination fan-out, protocol
+# mix) and stay available when the active set is too large to read.
+REPORT_ZERO = {
+    "rep_new_flows": 0,
+    "rep_new_flows_per_sec": 0.0,
+    "rep_distinct_src_ips": 0,
+    "rep_distinct_dst_ips": 0,
+    "rep_distinct_dst_ports": 0,
+    "rep_tcp_share": 0.0,
+    "rep_max_flows_to_one_dst": 0,
+    "rep_max_flows_to_one_dst_port": 0,
+    "net_overload": 0,
+    "net_buckets_active": 0,
+    "net_buckets_read": 0,
+    "net_buckets_skipped": 0,
+    "net_dst_buckets_skipped": 0,
+    "net_read_budget_ms": 0.0,
+    "net_read_overrun": 0,
+}
+
+# Recommended option bundles. "switch": the Wedge100BF-32X with the batched
+# reader on its wire-format route (RUNBOOK sections 9-10): 1 s windows, the
+# dataset's 3-window idle TTL, syncs in one RPC, and a read budget of 80% of the
+# window. "model": the Tofino software model, whose register sync takes seconds
+# and whose direct reads take ~0.27 s per bucket (live_test/RESULTS.md), so long
+# windows, hardware reads, no idle clearing, and no budget (the model's reads
+# would never fit one). Explicit options override the profile.
+PROFILES: Dict[str, Dict[str, Any]] = {
+    "switch": {"window_sec": 1.0, "active_ttl_windows": 3, "clear_idle_windows": 3, "reader": "batched",
+               "reader_raw_wire": True, "reader_sync_batched": True, "p4_snapshot": "sync",
+               "read_budget_frac": 0.8, "max_dst_reads": 256, "forward_report_port": 192},
+    "model": {"window_sec": 60.0, "active_ttl_windows": 3, "clear_idle_windows": 0, "reader": "batched",
+              "p4_snapshot": "hw", "read_budget_frac": 0.0, "max_dst_reads": 0, "forward_report_port": 2},
+}
+
+
+def payload_timing_ms(payload: Dict[str, Any], wall_ms: float) -> Dict[str, float]:
+    """sync / read / clear / overhead milliseconds of one register read, from
+    the reader's payload (the same fields make_timing_logger prints)."""
+    timing = payload.get("timing") or {}
+    sync_s = payload.get("sync_s") or 0.0
+    read_s = payload.get("read_s") or 0.0
+    clear_s = payload.get("clear_s") or 0.0
+    sync_ms = float(timing.get("sync_ms", sync_s * 1000.0))
+    read_ms = float(timing.get("read_ms", max(0.0, read_s - sync_s) * 1000.0))
+    clear_ms = float(timing.get("clear_ms", clear_s * 1000.0))
+    return {"sync_ms": sync_ms, "read_ms": read_ms, "clear_ms": clear_ms,
+            "overhead_ms": max(0.0, wall_ms - sync_ms - read_ms - clear_ms)}
+
+
+class ReadCostModel:
+    """What one register read costs on this control plane: a fixed part per
+    window (the register syncs and the RPC/IPC overhead) plus a part per bucket
+    read and per bucket cleared.
+
+    The starting values are the Wedge100BF-32X measurements with the batched
+    reader (RUNBOOK section 9: 14 syncs 58-70 ms, reads 1.1-1.55 ms per bucket,
+    clears 0.55-0.75 ms per bucket). Every measured window moves them with an
+    exponential average, so the budget follows the reader route and the switch
+    CPU actually in use (on the Tofino model the per-bucket cost is ~200x
+    larger and the model learns that within a few windows)."""
+
+    def __init__(self, fixed_ms: float = 70.0, read_ms_per_bucket: float = 1.3,
+                 clear_ms_per_bucket: float = 0.7, alpha: float = 0.3):
+        self.fixed_ms = fixed_ms
+        self.read_ms_per_bucket = read_ms_per_bucket
+        self.clear_ms_per_bucket = clear_ms_per_bucket
+        self.alpha = alpha
+        self.windows_seen = 0
+
+    def _ema(self, old: float, new: float) -> float:
+        return old + self.alpha * (new - old)
+
+    def update(self, n_read: int, n_cleared: int, timing: Dict[str, float]) -> None:
+        self.windows_seen += 1
+        self.fixed_ms = self._ema(self.fixed_ms, timing["sync_ms"] + timing["overhead_ms"])
+        if n_read > 0:
+            self.read_ms_per_bucket = self._ema(self.read_ms_per_bucket, timing["read_ms"] / n_read)
+        if n_cleared > 0:
+            self.clear_ms_per_bucket = self._ema(self.clear_ms_per_bucket, timing["clear_ms"] / n_cleared)
+
+    def predict_ms(self, n_read: int, n_cleared: int = 0) -> float:
+        return self.fixed_ms + n_read * self.read_ms_per_bucket + n_cleared * self.clear_ms_per_bucket
+
+    def buckets_within(self, budget_ms: float, n_cleared: int = 0) -> int:
+        """How many buckets a read can cover inside budget_ms."""
+        available = budget_ms - self.fixed_ms - n_cleared * self.clear_ms_per_bucket
+        if available <= 0 or self.read_ms_per_bucket <= 0:
+            return 0
+        return int(available // self.read_ms_per_bucket)
+
+    def as_dict(self) -> Dict[str, float]:
+        return {"fixed_ms": round(self.fixed_ms, 2), "read_ms_per_bucket": round(self.read_ms_per_bucket, 4),
+                "clear_ms_per_bucket": round(self.clear_ms_per_bucket, 4), "windows_seen": self.windows_seen}
+
+
+def report_aggregates(reports: List[Dict[str, object]], window_sec: float) -> Dict[str, object]:
+    """The REPORT_ZERO columns of one window from its CPU reports (one report per
+    new bucket, carrying the 5-tuple). No register is read for these."""
+    agg: Dict[str, object] = dict(REPORT_ZERO)
+    n = len(reports)
+    agg["rep_new_flows"] = n
+    agg["rep_new_flows_per_sec"] = safe_div(n, window_sec)
+    if n == 0:
+        return agg
+    src_ips = collections.Counter(str(r.get("src_ip")) for r in reports)
+    dst_ips = collections.Counter(str(r.get("dst_ip")) for r in reports)
+    dst_ports = collections.Counter(safe_int(r.get("dport")) for r in reports)
+    dst_ip_ports = collections.Counter((str(r.get("dst_ip")), safe_int(r.get("dport"))) for r in reports)
+    agg["rep_distinct_src_ips"] = len(src_ips)
+    agg["rep_distinct_dst_ips"] = len(dst_ips)
+    agg["rep_distinct_dst_ports"] = len(dst_ports)
+    agg["rep_tcp_share"] = safe_div(sum(1 for r in reports if safe_int(r.get("proto")) == 6), n)
+    agg["rep_max_flows_to_one_dst"] = max(dst_ips.values())
+    agg["rep_max_flows_to_one_dst_port"] = max(dst_ip_ports.values())
+    return agg
+
+
+def select_within_budget(active: List[int], last_seen: Dict[int, int], allowed: int) -> "tuple[List[int], List[int]]":
+    """The buckets to read when only `allowed` of the active ones fit: the most
+    recently reported or changed first (their deltas describe the current
+    window), ties by index. Returns (read, skipped), both sorted by index."""
+    if allowed >= len(active):
+        return sorted(active), []
+    if allowed <= 0:
+        return [], sorted(active)
+    ranked = sorted(active, key=lambda idx: (-last_seen.get(idx, -1), idx))
+    chosen = set(ranked[:allowed])
+    return sorted(chosen), sorted(idx for idx in active if idx not in chosen)
+
+
 def run_p4_forwarder(
     forwarder_path: str,
     int_port: int,
@@ -801,9 +1027,26 @@ def collect_windows_live(
     on_window: Optional[Callable[[Dict[str, object]], None]] = None,
     read_fn: Optional[Callable[..., Dict[str, Any]]] = None,
     timing_log: Optional[Callable[..., None]] = None,
+    read_budget_frac: float = 0.0,
+    max_read_buckets: int = 0,
+    max_dst_reads: int = 0,
+    cost_model: Optional[ReadCostModel] = None,
 ) -> List[Dict[str, object]]:
     """Per window: the CPU-reported bucket indexes, and the P4 registers of all
     active indexes read at the end of that window.
+
+    Read budget (read_budget_frac > 0): a read may take at most that fraction of
+    the window. From the cost model's running estimate (ReadCostModel, updated
+    from every window's measured timing) the collector computes how many
+    buckets fit and, when the active set is larger, reads only the most
+    recently reported or changed ones (select_within_budget); the rest are
+    skipped and counted (window["net_buckets_skipped"], window["overload"]).
+    max_read_buckets caps the buckets read per window regardless of the budget;
+    max_dst_reads caps the reg_newconn_dst buckets read (the most reported
+    destinations first). Every window also carries report_aggregates(): the
+    new-flow rate, destination fan-out and protocol mix from the reports alone,
+    which need no register read and so survive an overload. With the budget
+    off (the default) the behaviour is unchanged.
 
     The registers are read by read_fn(active_indexes, window, snapshot=...,
     clear_if_unchanged=..., dst_indexes=...) -> payload, if given (the batched
@@ -835,6 +1078,10 @@ def collect_windows_live(
     idle_reads: Dict[int, int] = {}
     active_dst_last_seen: Dict[int, int] = {}
     last_new_conn: Dict[int, int] = {}
+    dst_report_counts: Dict[int, int] = {}
+    cost = cost_model if cost_model is not None else ReadCostModel()
+    budget_ms = read_budget_frac * window_sec * 1000.0 if read_budget_frac > 0 else None
+    overruns = 0
 
     w = 0
     proc_done = False
@@ -871,6 +1118,10 @@ def collect_windows_live(
         )
         active_idx_last_seen = {idx: active_idx_last_seen[idx] for idx in active_idxs}
 
+        for r in reports:
+            if safe_int(r["proto"]) == 6:
+                d = compute_newconn_dst_index(r["src_ip"], r["dst_ip"], safe_int(r["dport"]), 6)
+                dst_report_counts[d] = dst_report_counts.get(d, 0) + 1
         for idx in dst_idxs:
             active_dst_last_seen[idx] = w
         active_dst_idxs = sorted(
@@ -878,26 +1129,59 @@ def collect_windows_live(
             if (w - last_seen) <= active_ttl_windows
         )
         active_dst_last_seen = {idx: active_dst_last_seen[idx] for idx in active_dst_idxs}
+        dst_report_counts = {idx: dst_report_counts[idx] for idx in active_dst_idxs if idx in dst_report_counts}
+
+        # Which buckets fit the read budget of this window.
+        agg = report_aggregates(reports, window_sec)
+        allowed = len(active_idxs)
+        if budget_ms is not None:
+            allowed = min(allowed, cost.buckets_within(budget_ms))
+        if max_read_buckets > 0:
+            allowed = min(allowed, max_read_buckets)
+        read_idxs, skipped_idxs = select_within_budget(active_idxs, active_idx_last_seen, allowed)
+        if max_dst_reads > 0 and len(active_dst_idxs) > max_dst_reads:
+            ranked_dst = sorted(active_dst_idxs, key=lambda idx: (-dst_report_counts.get(idx, 0),
+                                                                  -active_dst_last_seen.get(idx, -1), idx))
+            read_dst_idxs = sorted(ranked_dst[:max_dst_reads])
+        else:
+            read_dst_idxs = active_dst_idxs
+        if skipped_idxs and not windows:
+            limit = f"read budget {budget_ms:.0f} ms" if budget_ms is not None else f"cap of {max_read_buckets} reads"
+            print(f"[WARN] window {w}: the {limit} fits {allowed} of {len(active_idxs)} active buckets "
+                  f"(cost estimate {cost.as_dict()}); the rest are skipped and counted")
 
         # Buckets that would complete clear_idle_windows idle reads with this read.
         clear_candidates = {}
         if clear_idle_windows > 0:
             clear_candidates = {
-                idx: last_pkts[idx] for idx in active_idxs
+                idx: last_pkts[idx] for idx in read_idxs
                 if idx in last_pkts and idle_reads.get(idx, 0) + 1 >= clear_idle_windows
             }
 
         read_start = time.time()
         if read_fn is None:
-            payload = read_p4_with_retries(reader_path, active_idxs, w, retries=read_retries, timeout=read_timeout,
+            payload = read_p4_with_retries(reader_path, read_idxs, w, retries=read_retries, timeout=read_timeout,
                                            switch_ssh=switch_ssh, snapshot=snapshot,
-                                           clear_if_unchanged=clear_candidates, dst_indexes=active_dst_idxs)
+                                           clear_if_unchanged=clear_candidates, dst_indexes=read_dst_idxs)
         else:
-            payload = read_fn(active_idxs, w, snapshot=snapshot, clear_if_unchanged=clear_candidates,
-                              dst_indexes=active_dst_idxs)
+            payload = read_fn(read_idxs, w, snapshot=snapshot, clear_if_unchanged=clear_candidates,
+                              dst_indexes=read_dst_idxs)
         read_end = time.time()
         if timing_log is not None:
-            timing_log(w, payload, read_start, read_end, len(active_idxs), len(active_dst_idxs))
+            timing_log(w, payload, read_start, read_end, len(read_idxs), len(read_dst_idxs))
+        wall_ms = (read_end - read_start) * 1000.0
+        cost.update(len(read_idxs), len(payload.get("cleared") or []), payload_timing_ms(payload, wall_ms))
+        overrun = read_end > win_end_abs + window_sec
+        overruns += int(overrun)
+        agg.update({
+            "net_overload": int(bool(skipped_idxs) or len(read_dst_idxs) < len(active_dst_idxs)),
+            "net_buckets_active": len(active_idxs),
+            "net_buckets_read": len(read_idxs),
+            "net_buckets_skipped": len(skipped_idxs),
+            "net_dst_buckets_skipped": len(active_dst_idxs) - len(read_dst_idxs),
+            "net_read_budget_ms": round(budget_ms, 1) if budget_ms is not None else 0.0,
+            "net_read_overrun": int(overrun),
+        })
 
         for row in payload.get("rows", []):
             idx = safe_int(row.get("idx"))
@@ -929,16 +1213,22 @@ def collect_windows_live(
             "net_window_duration_sec": round(window_sec, 3),
             "indexes": idxs,
             "active_indexes": active_idxs,
+            "read_indexes": read_idxs,
+            "skipped_count": len(skipped_idxs),
+            "overload": bool(agg["net_overload"]),
             "report_count": len(reports),
+            "report_aggregates": agg,
             "index_mismatches": mismatches,
             "rows": payload.get("rows", []),
             "dst_indexes": dst_idxs,
             "active_dst_indexes": active_dst_idxs,
+            "read_dst_indexes": read_dst_idxs,
             "dst_rows": payload.get("dst_rows", []),
             "cleared_indexes": cleared,
             "p4_snapshot": payload.get("snapshot"),
             "p4_read_start_sec": round(read_start - global_t0, 3),
             "p4_read_sec": round(read_end - read_start, 3),
+            "p4_read_overrun": overrun,
         })
         if on_window is not None:
             on_window(windows[-1])
@@ -953,6 +1243,13 @@ def collect_windows_live(
 
         w += 1
 
+    if overruns:
+        print(f"[WARN] {overruns} of {len(windows)} register reads ended after the next window boundary; "
+              f"use a longer window or a read budget (--read-budget-frac)")
+    skipped_total = sum(int(win["skipped_count"]) for win in windows)
+    if skipped_total:
+        print(f"[INFO] read budget: {skipped_total} bucket reads skipped over {sum(1 for win in windows if win['overload'])} "
+              f"overloaded window(s); final cost estimate {cost.as_dict()}")
     return windows
 
 
@@ -1147,9 +1444,17 @@ def append_csv_rows(path: str, rows: List[Dict[str, object]]) -> None:
 
     p = Path(path)
     write_header = not p.exists() or p.stat().st_size == 0
+    fieldnames = list(rows[0].keys())
+    if not write_header:
+        with open(path, newline="") as f:
+            existing = next(csv.reader(f), [])
+        if existing != fieldnames:
+            raise ValueError(f"{path} has a different column set ({len(existing)} columns, this run has "
+                             f"{len(fieldnames)}; the report-aggregate columns were added on 2026-11-07): write "
+                             f"this run to a new --out-csv")
 
     with open(path, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
 
         if write_header:
             writer.writeheader()
@@ -1214,6 +1519,7 @@ def build_row(
 
     row.update(host_summary)
     row.update(net_summary)
+    row.update(net_meta.get("report_aggregates", REPORT_ZERO) if net_meta else REPORT_ZERO)
     return row
 
 
@@ -1273,8 +1579,20 @@ class RunWriter:
 # MAIN
 # ============================================================
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description="Collect synchronized HostMon/eBPF + P4 features per time window")
+def profile_parser() -> argparse.ArgumentParser:
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--profile", choices=sorted(PROFILES),
+                     help="option bundle for the target: 'switch' (Wedge100BF-32X: 1 s windows, 3-window TTL, batched "
+                          "reader on the wire-format route with the syncs in one RPC, read budget 80%% of the window) "
+                          "or 'model' (Tofino software model: 60 s windows, hardware reads, no idle clearing, no "
+                          "budget). Options given explicitly override the profile")
+    return pre
+
+
+def build_arg_parser(profile: Optional[str] = None) -> argparse.ArgumentParser:
+    """The collector's options; with `profile`, that bundle's values become the defaults."""
+    ap = argparse.ArgumentParser(description="Collect synchronized HostMon/eBPF + P4 features per time window",
+                                 parents=[profile_parser()])
 
     ap.add_argument("--mode", choices=["command", "pcap"], required=True)
     ap.add_argument("--scenario-name", required=True)
@@ -1343,6 +1661,21 @@ def main() -> None:
                     help="print, per window, the active-set size and the time spent in the register sync, the reads "
                          "and the clears (also enabled by P4_READER_TIMING=1)")
     ap.add_argument("--reader-timing-file", help="append the per-window timing as JSON lines to this file")
+    ap.add_argument("--read-budget-frac", type=float, default=0.0,
+                    help="a register read may take at most this fraction of the window (0 = no limit). When the "
+                         "active set does not fit, the most recently reported/changed buckets are read and the rest "
+                         "skipped and counted (net_buckets_skipped, net_overload); the report-only columns rep_* "
+                         "are always available. The cost estimate starts from the switch measurements and follows "
+                         "the measured windows")
+    ap.add_argument("--max-read-buckets", type=int, default=0,
+                    help="hard cap on flow buckets read per window (0 = none)")
+    ap.add_argument("--max-dst-reads", type=int, default=0,
+                    help="cap on reg_newconn_dst buckets read per window, most reported destinations first (0 = none)")
+    ap.add_argument("--hostmon-cgroup",
+                    help="run the in-kernel monitor (ebpf_perf/hostmon_agg, given with --hostmon) on this cgroup-v2 "
+                         "directory (created if missing): the scenario command is started inside it at a shared "
+                         "start time one second ahead, so host and network windows share one origin. Without this "
+                         "option --hostmon is the streaming monitor started as before")
 
     ap.add_argument("--command")
     ap.add_argument("--shell", default="/bin/bash")
@@ -1356,10 +1689,22 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--interval", type=float, default=0.0)
 
+    if profile:
+        ap.set_defaults(**PROFILES[profile])
+    return ap
+
+
+def main() -> None:
+    profile_args, _ = profile_parser().parse_known_args()
+    ap = build_arg_parser(profile_args.profile)
     args = ap.parse_args()
+    if args.profile:
+        print(f"[INFO] profile {args.profile}: " + ", ".join(f"{k}={getattr(args, k)}" for k in sorted(PROFILES[args.profile])))
 
     if args.mode == "command" and not args.command:
         ap.error("--command is required when --mode command")
+    if args.hostmon_cgroup and args.mode != "command":
+        ap.error("--hostmon-cgroup applies to --mode command (the replayed packets have no local process to monitor)")
 
     if args.mode == "pcap" and not args.pcap:
         ap.error("--pcap is required when --mode pcap")
@@ -1381,6 +1726,8 @@ def main() -> None:
     workload_proc = None
     report_collector = None
     batched_reader = None
+    cgroup_path: Optional[Path] = None
+    cgroup_created = False
 
     run_id = f"{args.scenario_name}_{int(time.time())}"
     writer = RunWriter(args.out_csv, run_id)
@@ -1446,35 +1793,48 @@ def main() -> None:
         print(f"[INFO] Collecting CPU reports on {where}")
         report_collector = ReportCollector(args.cpu_iface, ssh_host=args.switch_ssh).start()
 
-        print(f"[INFO] Starting HostMon with window_sec={args.window_sec}")
-        host_proc = start_hostmon(args.hostmon, args.hostmon_log, args.window_sec)
-
-        time.sleep(0.2)
-
-        if args.mode == "pcap":
-            print(f"[INFO] Replaying PCAP: {args.pcap}")
-            global_t0 = time.time()
-
-            workload_proc = subprocess.Popen(
-                [
-                    sys.executable,
-                    args.replay_script,
-                    "--pcap", args.pcap,
-                    "--internal-cidr", args.internal_cidr,
-                    "--int-iface", args.int_iface,
-                    "--ext-iface", args.ext_iface,
-                    "--limit", str(args.limit),
-                    "--interval", str(args.interval),
-                ],
-                text=True,
-            )
-
-        else:
+        def launch() -> subprocess.Popen:
+            if args.mode == "pcap":
+                print(f"[INFO] Replaying PCAP: {args.pcap}")
+                return subprocess.Popen(
+                    [
+                        sys.executable,
+                        args.replay_script,
+                        "--pcap", args.pcap,
+                        "--internal-cidr", args.internal_cidr,
+                        "--int-iface", args.int_iface,
+                        "--ext-iface", args.ext_iface,
+                        "--limit", str(args.limit),
+                        "--interval", str(args.interval),
+                    ],
+                    text=True,
+                )
             print(f"[INFO] Running command scenario: {args.command}")
-            global_t0 = time.time()
-            workload_proc = run_scenario_command(args.command, shell=args.shell)
+            return run_scenario_command(args.command, shell=args.shell,
+                                        cgroup=str(cgroup_path) if cgroup_path is not None else None)
 
-        print(f"[INFO] Reading P4 registers at the end of every window ({args.reader} reader)")
+        if args.hostmon_cgroup:
+            # In-kernel monitor: READY, then a shared start time one second ahead;
+            # the scenario starts inside the cgroup at that instant, and both the
+            # host windows and the network windows are anchored there.
+            cgroup_path, cgroup_created = ensure_cgroup(args.hostmon_cgroup)
+            print(f"[INFO] Starting the in-kernel monitor {args.hostmon} on {cgroup_path} with window_sec={args.window_sec}")
+            host_proc = start_hostmon_agg(args.hostmon, args.hostmon_log, args.window_sec, cgroup_path)
+            print("[INFO] " + wait_for_line(args.hostmon_log, "HOSTMON_READY", 30.0, host_proc))
+            start_mono = time.monotonic() + 1.0
+            send_hostmon_start(host_proc, start_mono)
+            time.sleep(max(0.0, start_mono - time.monotonic()))
+            global_t0 = time.time()
+            workload_proc = launch()
+        else:
+            print(f"[INFO] Starting HostMon with window_sec={args.window_sec}")
+            host_proc = start_hostmon(args.hostmon, args.hostmon_log, args.window_sec)
+            time.sleep(0.2)
+            global_t0 = time.time()
+            workload_proc = launch()
+
+        print(f"[INFO] Reading P4 registers at the end of every window ({args.reader} reader"
+              + (f", budget {args.read_budget_frac:.0%} of the window" if args.read_budget_frac > 0 else "") + ")")
         collect_windows_live(
             collector=report_collector,
             proc=workload_proc,
@@ -1491,6 +1851,9 @@ def main() -> None:
             on_window=on_window,
             read_fn=read_fn,
             timing_log=timing_log,
+            read_budget_frac=args.read_budget_frac,
+            max_read_buckets=args.max_read_buckets,
+            max_dst_reads=args.max_dst_reads,
         )
         report_collector.stop()
         if batched_reader is not None:
@@ -1506,6 +1869,12 @@ def main() -> None:
         print("[INFO] Stopping HostMon")
         stop_hostmon(host_proc)
         host_proc = None
+        health = hostmon_health(args.hostmon_log)
+        if health is not None:
+            print(f"[INFO] HOSTMON_HEALTH {health}")
+            if health["lost"] or health["capacity_errors"] or health["failed"]:
+                print("[WARN] the host monitor reported lost events, capacity errors or failures: "
+                      "treat this run's host rows as incomplete")
 
         host_windows = read_host_windows(args.hostmon_log)
 
@@ -1557,6 +1926,9 @@ def main() -> None:
 
         if batched_reader is not None:
             batched_reader.stop()
+
+        if cgroup_path is not None:
+            cleanup_cgroup(cgroup_path, cgroup_created)
 
         if not committed:
             # Keep what was collected; the output CSV only receives complete runs.

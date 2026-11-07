@@ -473,3 +473,121 @@ the flow rows (`dst_counts`, `dst_diffs`, verdict without the "dst equal" condit
 `bfruntime_pb2`; `ReportCollector.stop()` ends the tcpdump on the switch; the probe and the
 ready line report `protobuf` and `parser`; `--reader-timing` prints the route
 (`reader=batched/raw`).
+
+## 11. Read cadence: profiles, read budget, report-only aggregates (2026-11-07)
+
+Why: the window length and the per-flow read cost pull against each other. On the switch a
+register read costs 1.1-1.55 ms per bucket plus 58-70 ms of syncs (Section 9), so a 0.5 s
+window holds ~350 active buckets and a 1 s window ~600 (about 2,000 with `--reader-raw-wire`
+once Section 10's expectation is confirmed). The dataset's own runs (lab analysis
+`deployment-design-20261107/flow_dynamics.json`) show what a monitored host produces: ordinary
+programs have at most 2 active flows; benign bulk transfers and request loops up to 380 active
+flows (10 ms lifetimes, 16-83 new flows/s); a scanner 27,306 active flows (1,934 new/s); SYN
+fan-out floods 111,760 active (3,000-6,300 new/s). Nothing per-flow can follow a flood, and a
+fixed per-flow watch of 20 s costs 5-10x a TTL-based read for the same information because the
+flows live milliseconds. Detection accuracy is flat from 0.5 to 10 s windows (lab window-length
+test, 2026-11-06). Hence the design below; `hybrid_collector.py` implements it without changing
+any default (no `--profile` = the old behaviour).
+
+What changed in `hybrid_collector.py`:
+
+- `--profile switch`: 1 s windows, `--active-ttl-windows 3` (the dataset model's TTL),
+  `--clear-idle-windows 3`, `--reader batched --reader-raw-wire --reader-sync-batched`,
+  `--p4-snapshot sync`, `--read-budget-frac 0.8`, `--max-dst-reads 256`,
+  `--forward-report-port 192`. `--profile model`: 60 s windows, `--p4-snapshot hw`,
+  `--clear-idle-windows 0`, batched reader, no budget (the model's reads never fit one),
+  report port 2. Explicit options override the profile.
+- `--read-budget-frac F`: a read may take F of the window. A running cost model (`ReadCostModel`:
+  fixed ms per window for the syncs and the RPC overhead, ms per bucket read, ms per bucket
+  cleared; initial values from Section 9, updated from every window's measured timing) says how
+  many buckets fit. When the active set is larger, the most recently reported or changed buckets
+  are read and the rest skipped; the window carries `net_overload`, `net_buckets_active`,
+  `net_buckets_read`, `net_buckets_skipped`, `net_read_budget_ms`, `net_read_overrun`.
+  `--max-read-buckets N` is a hard cap; `--max-dst-reads N` caps the `reg_newconn_dst` buckets
+  read (the most reported destinations first).
+- Report-only columns `rep_*` in every row, from the CPU reports alone (no register read):
+  `rep_new_flows`, `rep_new_flows_per_sec`, `rep_distinct_src_ips`, `rep_distinct_dst_ips`,
+  `rep_distinct_dst_ports`, `rep_tcp_share`, `rep_max_flows_to_one_dst`,
+  `rep_max_flows_to_one_dst_port`. These are the flood/scan signal and stay available when the
+  active set cannot be read. Because the CSV gains columns, appending to an older
+  `hybrid_windows.csv` is refused; use a new `--out-csv`.
+- `--hostmon-cgroup DIR` with `--hostmon ebpf_perf/build/hostmon_agg`: the in-kernel monitor.
+  The collector starts it on the cgroup (created if missing), waits for `HOSTMON_READY`, sends a
+  shared monotonic start time one second ahead, starts the scenario inside the cgroup at that
+  instant, and anchors the network windows there too; `HOSTMON_HEALTH` is printed at the end.
+  Without the option `--hostmon` is the streaming monitor, started as before.
+- Tests: `thesis-hybrid-ebpf-p4/python/tests/test_collector_cadence.py` (budget, caps,
+  aggregates, profiles, CSV guard, monitor protocol with a stand-in monitor, cgroup wrapper);
+  run with `python3 -m unittest tests.test_collector_cadence` from
+  `thesis-hybrid-ebpf-p4/python`.
+
+Cadence to use: one window Δ for both sensors, 1 s on the switch (2 s if the monitored hosts
+keep more than ~600 flows active, or until `--reader-raw-wire` is confirmed), both under the
+4.295 s timestamp wrap; read every active bucket every window, no fixed per-flow watch; the
+host monitor's windows at the same Δ (its map may be read later without loss, up to 65,536
+live entries). Under a flood the budget keeps the reader inside the window and the `rep_*`
+columns carry the signal.
+
+### 11.1 On the Tofino model (logic only; the model's timings say nothing about the switch)
+
+```sh
+sudo live_test/testbed.sh up && sudo live_test/testbed.sh mode live
+python3 live_test/p4_known_answer.py --reader batched --raw-wire            # unchanged, 19/19
+sudo python3 hybrid_collector.py --profile model --mode command --scenario-name model_cadence \
+    --label benign --command "ip netns exec p4int python3 live_test/benign_workload.sh" \
+    --out-csv cadence_model.csv --reader-timing --reader-timing-file timing_model.jsonl
+# the overload path on the model: a budget the model cannot meet (it learns ~270 ms per bucket)
+sudo python3 hybrid_collector.py --profile model --read-budget-frac 0.5 --mode pcap \
+    --scenario-name model_overload --label benign --pcap live_test/run/benign_mix.pcap \
+    --out-csv cadence_model.csv --reader-timing
+```
+
+Expect: the first run reads every active bucket (`net_overload` 0 in every row); the second
+skips buckets from the first window the budget does not cover (`net_buckets_skipped` > 0,
+`net_overload` 1) while `rep_new_flows` equals the window's report count in both runs.
+
+### 11.2 On the Wedge100BF-32X (the cadence measurement)
+
+Prerequisites: Sections 1-2, 9 (program, ports, forwarding, mirror, `enp5s0` up), and the
+current `batched_reader.py` copied to the switch (Section 2). Three replays from PC1 at 1 s
+windows, each with `--reader-timing-file`; the dataset captures are on the lab workstation under
+`vbox-runs/hybrid-rf-study-20261010/data/versioned-collector/additional-study-review-20261022/`
+(`flood21-collect/20261026T151240756153Z/runs/bulk2000.zip/output/run_*/packet_capture.pcap`,
+`flood21-collect/20261026T154421063760Z/runs/syn_fan_40k.zip/output/run_*/packet_capture.pcap`).
+
+```sh
+C="sudo python3 hybrid_collector.py --profile switch --mode command --label benign \
+    --switch-ssh root@172.168.1.2 --forward-int-port 132 --forward-ext-port 140 --cpu-iface enp5s0 \
+    --hostmon HOSTMON_STAND_IN --p4-reader thesis-hybrid-ebpf-p4/python/read_registers_with_index.py \
+    --p4-forwarder thesis-hybrid-ebpf-p4/python/program_forwarding.py --out-csv cadence_switch.csv \
+    --reader-timing"
+# (a) ordinary benign traffic: Section 9's mix, ~100 active buckets per 1 s window
+$C --scenario-name cad_mix --command "tcpreplay -i eth1 --multiplier=6.5 ab_mix.pcap" \
+    --reader-timing-file timing_cad_mix.jsonl
+# (b) heavy benign: a dataset download loop, 230 active flows per window, 24k packets in 20 s
+$C --scenario-name cad_bulk --command "tcpreplay -i eth1 bulk2000.pcap" \
+    --reader-timing-file timing_cad_bulk.jsonl
+# (c) a SYN fan-out flood: 40k single-packet flows in 20 s (2,000 new flows/s, 30k+ active)
+$C --scenario-name cad_flood --label attack --command "tcpreplay -i eth1 syn_fan_40k.pcap" \
+    --reader-timing-file timing_cad_flood.jsonl
+```
+
+Pass criteria: (a) and (b) have `net_overload` 0 and `net_read_overrun` 0 in every window, and
+`wall_ms` in the timing file stays under 800 ms (the budget); (b) reads ~230 buckets per window
+in about 70 + 230 x 1.2 ms = 350 ms (about 150 ms with `--reader-raw-wire` confirmed); (c)
+shows `net_overload` 1 from the first busy window with `net_buckets_read` near the budget's
+fit (~600 at 1.2 ms per bucket), `wall_ms` still under 800 ms, no overrun, and
+`rep_new_flows_per_sec` about 2,000 with `rep_distinct_dst_ips` in the thousands. The CSV sums
+of (a) and (b) must still equal the capture (Section 9's check); for (c) only the read buckets
+are summed, so compare `rep_new_flows` with the report count instead.
+
+### 11.3 The host side (any Linux host with root, the monitor built in `ebpf_perf/build`)
+
+```sh
+sudo python3 hybrid_collector.py --profile switch --mode command --scenario-name host_agg \
+    --label benign --command "live_test/benign_workload.sh" --hostmon ebpf_perf/build/hostmon_agg \
+    --hostmon-cgroup /sys/fs/cgroup/hazim_collect --skip-p4-forwarding --no-register-reset ...
+```
+
+Expect `HOSTMON_READY`, then `HOSTMON_HEALTH {'lost': 0, 'capacity_errors': 0, ...}` at the end,
+and host rows whose `host_window_start_sec` equals the network windows' (the shared origin).
