@@ -10,8 +10,10 @@ Sections 1–6 are the original HostMon. Section 7 repeats the same suite with `
 
 ## Setup
 
-- HostMon as built by `build.sh` from the unchanged `libbpf-bootstrap/examples/c/hostmon*`
-  sources (hostmon `cfdb5296…`, hostmon.bpf.o `0d0eda52…`; full hashes in `build/sha256.txt`).
+- HostMon as built by `build.sh` from the then-uncommitted, cgroup-scoped
+  `libbpf-bootstrap/examples/c/hostmon*` sources (hostmon `cfdb5296…`, hostmon.bpf.o
+  `0d0eda52…`; full hashes in `build/sha256.txt`). Those sources are committed as
+  `hostmon_ref/` since 2026-11-07, and `build.sh` rebuilds the same bytes from them.
 - Three conditions per experiment, counterbalanced, one warm-up round first:
   `base` (no HostMon), `mon_in` (HostMon attached, workload in the monitored cgroup),
   `mon_out` (HostMon attached, workload outside the cgroup).

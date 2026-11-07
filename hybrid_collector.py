@@ -1202,8 +1202,11 @@ def collect_windows_live(
 
         reports = collector.take(win_start_abs, win_end_abs)
         idxs = sorted({safe_int(r["idx"]) for r in reports})
-        dst_idxs = sorted({compute_newconn_dst_index(r["src_ip"], r["dst_ip"], safe_int(r["dport"]), 6)
-                           for r in reports if safe_int(r["proto"]) == 6})
+        # The reg_newconn_dst bucket of every TCP report, computed once per report (a Python CRC each;
+        # ~1,500 reports per window under a flood, RUNBOOK section 12.2).
+        tcp_dst = [compute_newconn_dst_index(r["src_ip"], r["dst_ip"], safe_int(r["dport"]), 6)
+                   for r in reports if safe_int(r["proto"]) == 6]
+        dst_idxs = sorted(set(tcp_dst))
         mismatches = sum(1 for r in reports if r["idx_source"] == "report" and r["idx"] != r["idx_computed"])
         if mismatches:
             print(f"[WARN] window {w}: {mismatches} report(s) carry an index that flow_index.py "
@@ -1229,10 +1232,8 @@ def collect_windows_live(
             for idx in expired:
                 pending_clear.setdefault(idx, 0)
 
-        for r in reports:
-            if safe_int(r["proto"]) == 6:
-                d = compute_newconn_dst_index(r["src_ip"], r["dst_ip"], safe_int(r["dport"]), 6)
-                dst_report_counts[d] = dst_report_counts.get(d, 0) + 1
+        for d in tcp_dst:
+            dst_report_counts[d] = dst_report_counts.get(d, 0) + 1
         for idx in dst_idxs:
             active_dst_last_seen[idx] = w
         active_dst_idxs = sorted(
