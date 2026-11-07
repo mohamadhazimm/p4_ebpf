@@ -98,6 +98,16 @@ REG_NAMES = ["reg_pkts", "reg_bytes", "reg_pkts_ab", "reg_bytes_ab",
              "reg_min_len", "reg_max_len", "reg_first_ts", "reg_last_ts",
              "reg_syn", "reg_ack", "reg_rst"]
 REQUIRED = ["reg_pkts", "reg_bytes", "reg_pkts_ab", "reg_bytes_ab"]
+# A clear zeroes the 14 registers of each bucket in consecutive updates, these three first
+# (RUNBOOK 18). ingress.p4 reads reg_dir_valid first: 0 means a new flow (CPU report, reference
+# ports set), otherwise the packet compares its ports with the references; then it adds to the
+# counters. A packet that arrives while its bucket is being cleared therefore either still finds
+# reg_dir_valid set and is zeroed with the rest (the bucket ends empty and the flow reports at its
+# next packet), or finds it 0 and reports as a new flow with its own reference ports, losing only
+# its own counts. Ordered register by register instead (every bucket's reg_pkts, then every
+# bucket's reg_bytes, ...), one bucket's registers were zeroed up to the whole Write apart, and a
+# packet in between was counted, sent no report and left reg_dir_valid 0 with stale counts.
+CLEAR_FIRST = ["reg_ref_src_port", "reg_ref_dst_port", "reg_dir_valid"]
 SUMMED = ["reg_pkts", "reg_bytes", "reg_pkts_ab", "reg_bytes_ab", "reg_syn", "reg_ack", "reg_rst"]
 DST_REG_NAME = "reg_newconn_dst"
 TABLE_PREFIX = "pipe.Ingress."
@@ -589,6 +599,8 @@ class BatchedRegisterReader(object):
         except KeyError:
             self.dst_table = None
         self.flow_tables = [t for t in self.tables.values() if t is not None]
+        self.clear_tables = ([self.tables[n] for n in CLEAR_FIRST if self.tables.get(n) is not None]
+                             + [t for t in self.flow_tables if t.name not in CLEAR_FIRST])
         if (self.fast or self.raw) and not all(t.ids_ok for t in self.flow_tables + [self.dst_table]
                                                if t is not None):
             log("the client does not expose the field ids: using entry_get()/entry_mod() only")
@@ -745,20 +757,23 @@ class BatchedRegisterReader(object):
 
     def _clear(self, indexes, timing):
         t0 = time.time()
+        # One Write, bucket by bucket (CLEAR_FIRST): all registers of a bucket, then the next bucket.
         if self.raw:
             parts = [self._raw_head(self.pb2.WriteRequest)]
-            for t in self.flow_tables:
+            updates = []
+            for t in self.clear_tables:
                 head, tail = t.raw_clear_update(self.pb2)
-                pack = t.pack_key
-                parts.append(b"".join([head + pack(idx) + tail for idx in indexes]))
+                updates.append((head, tail, t.pack_key))
+            for idx in indexes:
+                parts.extend([head + pack(idx) + tail for head, tail, pack in updates])
             self._raw_write_call(b"".join(parts))
             timing["clear_rpcs"] = 1
         elif self.fast:
             req = self.pb2.WriteRequest()
             self._fill_target(req)
-            for t in self.flow_tables:
-                zero = int_to_bytes(0, t.data_size)
-                for idx in indexes:
+            zeros = [(t, int_to_bytes(0, t.data_size)) for t in self.clear_tables]
+            for idx in indexes:
+                for t, zero in zeros:
                     upd = req.updates.add()
                     upd.type = self.pb2.Update.MODIFY
                     te = upd.entity.table_entry
@@ -772,11 +787,13 @@ class BatchedRegisterReader(object):
             self.rw._write(req)
             timing["clear_rpcs"] = 1
         else:
+            # entry_mod() sends one Write per table, so this route still clears register by register
+            # (in CLEAR_FIRST order); it is the fallback for clients without field ids.
             gc = self.gc
             kw = {}
             if self.p4_name_in_requests and accepts_kwarg(self.flow_tables[0].tbl.entry_mod, "p4_name"):
                 kw["p4_name"] = self.p4_name
-            for t in self.flow_tables:
+            for t in self.clear_tables:
                 keys = [t.tbl.make_key([gc.KeyTuple(KEY_FIELD, i)]) for i in indexes]
                 datas = [t.tbl.make_data([gc.DataTuple(t.data_name, 0)]) for _ in indexes]
                 t.tbl.entry_mod(self.target, keys, datas, **kw)

@@ -1217,3 +1217,73 @@ One new, rare finding: **a clear can race a packet and leave a torn bucket.**
 - Seen once in three flood runs (~30,000 clears each). It predates these fixes.
 - Possible fix: order the clear's updates bucket by bucket, so each bucket's 14 registers are
   zeroed in 14 consecutive updates; then re-measure the clear cost.
+
+## 18. The torn-bucket fix, and two report-capture fixes (2026-11-07, seventh session)
+
+Raw data in the git-ignored `perf/results/switch_v7_20261107_120526/` (README with every number,
+the scripts in `scripts/`). Unit tests: 118 OK, with and without SDE 9.6's `bfruntime_pb2`.
+
+### 18.1 The clear writes bucket by bucket
+
+- **The change** (`batched_reader.py`): the raw and fast routes write their one clear Write
+  bucket by bucket (all 14 registers of a bucket, then the next) instead of register by
+  register.
+- **The order within a bucket** (`CLEAR_FIRST`): the two reference ports, `reg_dir_valid`, then
+  the counters. A packet that lands mid-clear then either:
+  - still sees the old `reg_dir_valid` and is wiped with the rest (the bucket ends empty and the
+    flow reports at its next packet);
+  - or sees it 0 and reports as a new flow with its own reference ports, losing only its own
+    counts.
+- **Unchanged:** the safe route (`entry_mod`, one Write per table) stays register-ordered; the
+  legacy reader already clears bucket by bucket.
+- **Race test:** 16,000 buckets cleared in one Write while the same 16,000 SYNs are replayed at
+  2,500/s (~3,400 land mid-clear).
+  - Old order: **10 and 10 torn**, 5 of each without a CPU report.
+  - New order: **0 and 0**; every bucket filled after its clear is consistent and has exactly one
+    report.
+- **Cost:** +22-29% clear time (1,000 buckets 95 → 116 ms, 5,000 423 → 532 ms, 16,000 1,320 →
+  1,708 ms). `ROUTE_COSTS["raw"]["clear_ms_per_bucket"]` is 0.105 now. That is ~35 ms (~60 bucket
+  reads) per flood window and ~2.5 ms per benign window.
+
+### 18.2 The workload starts once the capture listens
+
+- **The problem:** a flood run left 33 consistent buckets occupied, from the first 0.02 s of the
+  replay. Their reports were sent before the remote tcpdump listened.
+- **The change:**
+  - `ReportCollector.wait_ready()` waits for tcpdump's `listening on` line (its stderr is kept in
+    `capture_messages`);
+  - the collector waits for it, at most 10 s (`REPORT_CAPTURE_READY_S`), before starting the
+    workload; so does `reader_ab.py`.
+- **On the switch:** listening after 0.3 s; occupancy after four flood runs: 0.
+
+### 18.3 `tcpdump --immediate-mode`: the reports came in one burst per ~1 s
+
+- **The symptom:** with 18.2, all 7 ab_mix x59 runs had one window with 0 reports and 0 packets
+  (w8-w10), and 13-21 reports arrived after the last window.
+- **Ruled out:** a gap in the capture, a wall-clock step (sampled), PC1's sending (eth1 counter
+  and capture continuous), the switch (a second tcpdump on `enp5s0` saw all reports
+  continuously), and the start time.
+- **What a trace showed:**
+  - `traced_collector.py` wraps `_add`, `take` and the batched read: the reports reached the
+    collector **in one burst per 1.016-1.017 s**;
+  - the bursts drift ~16 ms per second, and when one crosses a window boundary that window gets
+    none and every later window the previous window's.
+- **The cause:** the remote `tcpdump -U -w -` ran without immediate mode. libpcap hands captured
+  packets over in blocks, at the latest when its 1 s timeout expires; `-U` flushes only what
+  tcpdump already has.
+- **The fix:** `tcpdump --immediate-mode -U ...` (tcpdump 4.9.3 on the switch).
+- **With it:**
+  - reports arrive continuously (largest gap 34 ms), w0 holds the whole first second, and the
+    per-window counts follow PC1's sending second by second;
+  - ab_mix x59 and bulk2000: no empty window, 0 late reports, CSV sums = truth;
+  - flood at 2,000/s: 0 overruns, occupancy 0;
+  - the 57,000 SYNs/s burst: 29,844 reports, every bucket.
+- **Consequence for Sections 9-17:**
+  - every switch collector run received its reports up to ~1 s late, in bursts. Totals are
+    unaffected, but `rep_*` features and a new flow's first read could fall one window late, and
+    w0 often had no reports;
+  - Section 16's late reports at the end of a run and the 1,724-per-window plateaus come from
+    this batching, not from tcpreplay's pacing as guessed there;
+  - per-window results from those runs should not be used as window-exact.
+- **Note:** with immediate mode a burst window's `cpu_indexes` CSV field reaches ~150 KB, so
+  readers using Python's `csv` module need `csv.field_size_limit()` raised.

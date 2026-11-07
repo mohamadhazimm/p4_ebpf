@@ -870,6 +870,10 @@ DEADLINE_SAFETY_MS = 5.0
 # their buckets with the end-of-run clear (RUNBOOK 16).
 LATE_REPORT_QUIET_S = 0.3
 LATE_REPORT_MAX_S = 1.0
+# The workload starts once the CPU-report capture is listening, or after this many seconds with a
+# warning: reports sent before the capture listens are lost, and their buckets stay occupied and
+# unknown to the collector (RUNBOOK 18: the first 20 ms of a replay left 33 buckets occupied).
+REPORT_CAPTURE_READY_S = 10.0
 # An expired bucket whose unconditional clear fails this many times is given up.
 CLEAR_ATTEMPTS = 3
 
@@ -906,13 +910,15 @@ PROFILES: Dict[str, Dict[str, Any]] = {
 ROUTE_COSTS: Dict[str, Dict[str, float]] = {
     # --reader batched --reader-raw-wire: the 14 syncs in one RPC 30-31 ms plus client/IPC overhead.
     # A read costs ~23 ms for its 14 (+1) Read RPCs plus 0.51-0.56 ms per bucket (RUNBOOK 16: 1 bucket
-    # 21 ms, 101 buckets 74 ms, 1,054 units 612 ms); a clear ~3 ms for its Write plus 0.088 ms per
-    # bucket. Reads and clears smaller than min_rate_units do not move the per-bucket costs: one read
+    # 21 ms, 101 buckets 74 ms, 1,054 units 612 ms); a clear ~3 ms for its Write plus 0.105 ms per
+    # bucket (bucket by bucket, RUNBOOK 18: 1,000 buckets 116 ms, 5,000 532 ms, 16,000 1,708 ms; ordered
+    # register by register it was 0.083-0.095 ms, but a packet in the middle of it tore the bucket).
+    # Reads and clears smaller than min_rate_units do not move the per-bucket costs: one read
     # of a single bucket (the collector's connection probe, all request overhead) had taught the model
     # 18.6 ms per bucket, and five benign windows were then overloaded with reads that used 20-45% of
     # their allowance (RUNBOOK 16, bulk2000).
     "raw": {"fixed_ms": 65.0, "read_fixed_ms": 23.0, "read_ms_per_bucket": 0.56, "clear_fixed_ms": 3.0,
-            "clear_ms_per_bucket": 0.088, "min_rate_units": 20.0},
+            "clear_ms_per_bucket": 0.105, "min_rate_units": 20.0},
     # --reader batched with the protobuf classes: syncs 58-70 ms, reads 1.1-1.55 ms, clears 0.55-0.75 ms
     # (per-request parts not measured on this route).
     "fast": {"fixed_ms": 70.0, "read_ms_per_bucket": 1.3, "clear_ms_per_bucket": 0.7, "min_rate_units": 20.0},
@@ -2072,6 +2078,13 @@ def main() -> None:
         where = f"{args.switch_ssh}:{args.cpu_iface}" if args.switch_ssh else args.cpu_iface
         print(f"[INFO] Collecting CPU reports on {where}")
         report_collector = ReportCollector(args.cpu_iface, ssh_host=args.switch_ssh).start()
+        t_capture = time.time()
+        if report_collector.wait_ready(REPORT_CAPTURE_READY_S):
+            print(f"[INFO] CPU-report capture listening after {time.time() - t_capture:.1f} s")
+        else:
+            said = "; ".join(report_collector.capture_messages[-3:]) or "no message"
+            print(f"[WARN] the CPU-report capture did not say it is listening within {REPORT_CAPTURE_READY_S:.0f} s "
+                  f"({said}); the reports of the first packets may be lost")
 
         def launch() -> subprocess.Popen:
             if args.mode == "pcap":

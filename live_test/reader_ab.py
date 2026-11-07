@@ -124,6 +124,9 @@ def main():
     ready = batched.start()
     print(f"[ab] batched reader ready: {json.dumps(ready)}", flush=True)
     reports = ReportCollector(args.cpu_iface, ssh_host=args.switch_ssh).start()
+    if not reports.wait_ready(hc.REPORT_CAPTURE_READY_S):   # start the traffic after this line (RUNBOOK 18)
+        print(f"[ab] WARNING: the CPU-report capture did not say it is listening: "
+              f"{'; '.join(reports.capture_messages[-3:]) or 'no message'}", flush=True)
     print(f"[ab] capturing CPU reports on {args.cpu_iface}; {args.windows} windows of {args.window_sec} s", flush=True)
 
     result = {"args": vars(args), "ready": ready, "windows": [], "totals": {}, "dst_totals": {}}
