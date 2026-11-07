@@ -814,3 +814,98 @@ Notes:
 - `test_agg_equiv` does not build from this repo: it includes
   `libbpf-bootstrap/examples/c/hostmon.c`, and the committed copy is older than the one the
   test was written against (no `monotonic_ns`, `capacity_errors`, ...).
+
+## 13. Results on the switch (2026-11-07, second session): the Section 11.4 reruns
+
+Run from PC1 with ad2ee2e (`hybrid_collector.py`, `batched_reader.py`,
+`read_registers_with_index.py`). The P4 is unchanged (`basic_newconn_head`), and the stand-in
+captures are the ones from Section 12. The raw data is in the git-ignored run dir
+`perf/results/cadence_fix_20261107_080818/` (README with every number, logs `NNN_*.txt`, the
+scripts in `scripts/`).
+
+### 13.1 Unit tests and the `clear_indexes` known answer
+
+- `test_collector_cadence` + `test_batched_reader`: 55 OK (5 skipped).
+- The full suite (104 tests) has one error that comes and goes (2 of 4 runs), in a file
+  ad2ee2e does not touch:
+  - `test_collector_robustness.HostmonStopTests.test_a_hostmon_that_ignores_signals_is_killed_with_its_group`;
+  - its `alive()` helper opens `/proc/<pid>/stat` after the child has been reaped and raises
+    `FileNotFoundError`, which should count as "not alive".
+- Known answer, bucket 6886, raw route:
+  - `--clear-indexes 6886` alone, with the bucket not read: cleared in 0 syncs, 0 read RPCs
+    and 1 clear RPC (`cleared_unconditional` 1).
+  - All 14 registers are 0 afterwards; dst stays 1.
+  - The next packet sends a CPU report for 6886 and reads pkts 1, dst 2.
+  - The legacy reader's `--indexes 6886 --clear-indexes 6886` clears it as well.
+
+### 13.2 The reruns (`--profile switch`)
+
+| run | windows | active median / max | read median | overrun rows | late_ms median / max | wall median / max | cleared | CSV sums |
+|---|---|---|---|---|---|---|---|---|
+| (c) SYN stand-in | 24 | 5,988 / 6,816 | 708 | 6 (Section 12: 19) | 273 / 452 | 656 / 836 (953) | 29,547 | read buckets only |
+| (d) after (c), `--no-register-reset` | 21 | 507 / 536 | all | 0 | 16 / 33 | 410 / 505 | 2,171 | **91.2% of packets** (Section 12: 54%) |
+| (c') (c) + `; sleep 6` | 31 | 5,924 / 6,607 | 794 | 5 | 231 / 476 | 654 / 797 | 35,062 | read buckets only |
+| (d') after (c'), `--no-register-reset` | 21 | 559 / 575 | all | 0 | 19 / 32 | 442 / 493 | 2,376 | = truth |
+| (b) ab_mix x59 | 21 | 555 / 575 | all | 0 | 17 / 43 | 439 / 469 | 2,362 | = truth |
+| (a) ab_mix x6.5 | 183 | 62 / 71 | all | 0 | 3 / 7 | 97 / 128 | 2,739 | = truth |
+
+**`--clear-expired` works.**
+
+- In (c), 29,547 expired buckets were cleared unconditionally, from window 4 on (TTL 3).
+  `net_clear_backlog` was 0 in every window; 0 clears were given up.
+- After (c), 5,429 of 65,536 buckets were still occupied (8.3%; Section 12: 46%).
+  - That is exactly the last window's active set: buckets still inside their TTL when
+    tcpreplay ended. `--mode command` stops with the command (`drain_seconds` 0).
+- (d) therefore reported 2,530 of 2,768 flows (91.4%; the occupancy predicts 2,539).
+- With 6 more windows after the flood, (c'):
+  - every reported bucket was cleared (35,062);
+  - the table was empty afterwards (0 occupied);
+  - (d') reported 2,768 of 2,768 with every CSV sum equal to the truth.
+- So a collector that keeps running loses no flows after a flood. Only the end of a run leaves
+  buckets occupied, which matters for a following `--no-register-reset` run.
+- (c) has 34,976 reports against 29,902 distinct buckets: cleared buckets report again when a
+  later flow lands in them.
+
+**The deadline rule stops the lag but does not meet both 11.4 timing criteria.**
+
+- What holds:
+  - the cost estimate starts at the raw route's values;
+  - the lateness does not grow (late_ms median 268 ms in the first half, 285 ms in the second);
+  - there is no "overran by" warning;
+  - overruns are 6 of 24 (19 of 25 before), and wall max is 836 ms.
+- Criterion 1: `net_read_late_ms` "well under 100 ms" fails, with a **median of 273 ms**.
+  - This is the collector's work between the boundary and the decision (`prep_ms` 193 ms).
+  - `compute_newconn_dst_index` runs twice per report in the main loop (lines 1205 and 1234). It
+    is a bitwise CRC-16, 44.5 us per call on PC1, which comes to 130-260 ms at 1,500-2,950
+    reports per window.
+  - The report thread computes `compute_flow_index` (49 us) for every arriving report and
+    competes for the GIL.
+  - When the reports stop ((c') window 24 on) late_ms is 12-28 ms. In (a), (b) and (d) it is
+    3-19 ms.
+  - The rule shrinks the allowance correctly (median 687 ms), so the price is fewer buckets read
+    (median 708 vs ~1,180 in Section 12), not lag.
+- Criterion 2: `wall_ms` ≤ `net_read_allow_ms` "in nearly every window" fails: 10 of 24 exceed
+  it (nine by 0-41 ms, one by 105 ms).
+  - The allowance is fixed at the decision. The selection after it is not counted: the dst
+    ranking, the clear list, `select_within_budget` and the clear candidates. Offline at 6,000
+    active and 6,000 dst buckets it takes 26 ms; it takes more under the report thread.
+  - In 5 of the 6 overruns, late_ms + wall_ms is under 1,000 ms: those reads ended after the
+    boundary only because of 11-58 ms of work between the decision and the read. Only one (w17)
+    is an estimation miss.
+
+**Fix 3 holds.** A window with nothing to read takes 2 ms ((c') w30), against 46-47 ms for one
+that still reads dst buckets.
+
+**(a) and (b)** pass every 11.2 criterion as before, and their wall times are unchanged.
+
+### 13.3 Suggestions
+
+1. Compute the dst index once per report, in the report thread when the report arrives (as
+   `compute_flow_index` is), and use a table-driven CRC-16. That takes ~200 ms per window off
+   the boundary at flood rates.
+2. Take the decision time after the selection, or subtract its measured time from the
+   allowance.
+3. At the end of a run, clear the active set and the backlog (~0.5 s for 5,429 buckets on the
+   raw route), or allow `--drain-seconds` in `--mode command`.
+4. Make the `alive()` helper in `test_collector_robustness.py` treat a missing `/proc/<pid>/stat`
+   as not alive.
