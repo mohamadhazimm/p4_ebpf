@@ -248,6 +248,27 @@ class ReadBudgetTests(unittest.TestCase):
         self.assertGreater(cost.margin_ms, 0.0)
         self.assertLess(windows[1]["report_aggregates"]["net_buckets_read"], 158)
 
+    def test_a_one_bucket_first_window_does_not_overload_the_benign_windows_after_it(self):
+        class RequestCostReader(FakeReader):
+            """The raw route's measured shape: a read 23 ms plus 0.56 ms per unit, a clear 3 ms plus 0.088 per bucket."""
+
+            def __call__(self, indexes, w, **kw):
+                payload = super().__call__(indexes, w, **kw)
+                units = len(indexes) + hc.ReadCostModel.DST_WEIGHT * len(kw.get("dst_indexes") or [])
+                n_clear = len(payload["cleared"])
+                payload["timing"]["read_ms"] = 23.0 + 0.56 * units if units else 0.0
+                payload["timing"]["clear_ms"] = 3.0 + 0.088 * n_clear if n_clear else 0.0
+                return payload
+
+        reports = {0: [report(0, proto=17)]}                                         # the connection probe alone
+        reports.update({w: [report(100 * w + i, proto=17) for i in range(100)] for w in range(1, 8)})
+        windows, reader = self.run_live(reports, 8, window_sec=1.0, reader=RequestCostReader(),
+                                        read_budget_frac=0.7, cost_model=hc.ReadCostModel.for_route("raw"))
+        self.assertEqual([w["report_aggregates"]["net_overload"] for w in windows], [0] * len(windows))
+        aggs = [w["report_aggregates"] for w in windows]
+        self.assertEqual([a["net_buckets_read"] for a in aggs], [a["net_buckets_active"] for a in aggs])
+        self.assertGreater(max(a["net_buckets_active"] for a in aggs), 400)
+
     def test_without_clear_expired_the_buckets_just_expire(self):
         cost = hc.ReadCostModel(fixed_ms=10.0, read_ms_per_bucket=5.0, clear_ms_per_bucket=0.5)
         windows, reader = self.run_live({0: [report(i, proto=17) for i in range(20)]}, 6,
@@ -376,17 +397,19 @@ class HelperTests(unittest.TestCase):
 
     def test_cost_model_routes_dst_weight_and_clears(self):
         raw = hc.ReadCostModel.for_route("raw")
-        self.assertEqual((raw.route, raw.fixed_ms, raw.read_ms_per_bucket, raw.clear_ms_per_bucket),
-                         ("raw", 65.0, 0.62, 0.09))
+        self.assertEqual((raw.route, raw.fixed_ms, raw.read_fixed_ms, raw.read_ms_per_bucket, raw.clear_fixed_ms,
+                          raw.clear_ms_per_bucket, raw.min_rate_units), ("raw", 65.0, 23.0, 0.56, 3.0, 0.088, 20.0))
         for route in hc.ROUTE_COSTS:
             self.assertEqual(hc.ReadCostModel.for_route(route).route, route)
-        # 1 s window, 80%: the raw route fits (800 - 65) // 0.62 buckets; 200 clears and 100 dst reads take their share
-        self.assertEqual(raw.buckets_within(800.0), int((800 - 65) // 0.62))
-        self.assertEqual(raw.buckets_within(800.0, n_cleared=200, n_dst=100),
-                         int((800 - 65 - 200 * 0.09 - 100 * hc.ReadCostModel.DST_WEIGHT * 0.62) // 0.62))
-        self.assertEqual(raw.clears_within(100.0), int(100 // 0.09))
+        # 1 s window, 70%: the raw route fits (700 - 65 - 23) // 0.56 buckets; 200 clears (their Write and
+        # 0.088 ms each) and 100 dst reads take their share
+        self.assertEqual(raw.buckets_within(700.0), int((700 - 65 - 23) // 0.56))
+        self.assertEqual(raw.buckets_within(700.0, n_cleared=200, n_dst=100),
+                         int((700 - 65 - 23 - 3 - 200 * 0.088 - 100 * hc.ReadCostModel.DST_WEIGHT * 0.56) // 0.56))
+        self.assertEqual(raw.clears_within(100.0), int(100 // 0.088))
         self.assertEqual(raw.clears_within(0.0), 0)
-        self.assertAlmostEqual(raw.predict_ms(100, n_cleared=10, n_dst=20), 65 + 103 * 0.62 + 0.9)
+        self.assertAlmostEqual(raw.predict_ms(100, n_cleared=10, n_dst=20), 65 + 23 + 103 * 0.56 + 3 + 10 * 0.088)
+        self.assertAlmostEqual(raw.predict_ms(0), 65.0)                              # nothing read or cleared
         # the per-bucket read cost is fitted per flow-bucket unit, a dst read counting DST_WEIGHT of one
         m = hc.ReadCostModel(fixed_ms=10.0, read_ms_per_bucket=1.0, clear_ms_per_bucket=1.0, alpha=1.0)
         m.update(100, 0, {"sync_ms": 10.0, "read_ms": 115.0, "clear_ms": 0.0, "overhead_ms": 0.0}, n_dst=100)
@@ -404,6 +427,56 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(m.margin_ms, 20.0)
         self.assertEqual(m.buckets_within(200.0), int((200 - m.fixed_ms - 20.0) // m.read_ms_per_bucket))
 
+    def test_small_reads_do_not_inflate_the_per_bucket_costs(self):
+        # RUNBOOK 16 (bulk2000): the first read held one bucket, the collector's connection probe: 21 ms, all of it
+        # request overhead. Learned per bucket, that was 18.6 ms, and five benign windows were then overloaded.
+        raw = hc.ReadCostModel.for_route("raw")
+        raw.update(1, 1, {"sync_ms": 33.0, "read_ms": 21.0, "clear_ms": 3.0, "overhead_ms": 2.0}, n_dst=1)
+        self.assertEqual((raw.read_ms_per_bucket, raw.clear_ms_per_bucket), (0.56, 0.088))
+        # a large read moves the per-bucket costs, with the per-request parts taken off first
+        m = hc.ReadCostModel.for_route("raw", alpha=1.0)
+        m.update(1016, 1600, {"sync_ms": 33.0, "read_ms": 612.0, "clear_ms": 144.0, "overhead_ms": 43.0}, n_dst=256)
+        self.assertAlmostEqual(m.read_ms_per_bucket, (612.0 - 23.0) / (1016 + hc.ReadCostModel.DST_WEIGHT * 256))
+        self.assertAlmostEqual(m.clear_ms_per_bucket, (144.0 - 3.0) / 1600)
+        # a model built without per-request parts and minimum (the other tests) learns from every read as before
+        m = hc.ReadCostModel(fixed_ms=10.0, read_ms_per_bucket=1.0, clear_ms_per_bucket=1.0, alpha=1.0)
+        m.update(1, 1, {"sync_ms": 10.0, "read_ms": 21.0, "clear_ms": 3.0, "overhead_ms": 0.0})
+        self.assertEqual((m.read_ms_per_bucket, m.clear_ms_per_bucket), (21.0, 3.0))
+
+    def test_reports_that_arrive_after_the_last_window_are_cleared_at_the_end(self):
+        class LateCollector(FakeCollector):
+            def __init__(self, reports, t0, window_sec, late):
+                super().__init__(reports, t0, window_sec)
+                self.late, self.since = late, []
+
+            def take_after(self, start):
+                self.since.append(start)
+                return list(self.late)
+
+        clock = FakeClock()
+        t0 = clock.time()
+        late = [report(900, proto=17), report(901, proto=17), report(900, proto=17)]
+        collector = LateCollector({0: [report(1, proto=17)]}, t0, 0.05, late)
+        reader = FakeReader()
+        windows = hc.collect_windows_live(collector, FakeProc(3), 0.05, 0.0, t0, "reader.py", active_ttl_windows=3,
+                                          clear_idle_windows=0, read_fn=reader, clock=clock, clear_expired=True)
+        self.assertEqual(reader.calls[-1]["indexes"], [])                            # the end-of-run clear reads nothing
+        self.assertEqual(reader.calls[-1]["clear_indexes"], [1, 900, 901])
+        self.assertEqual(windows[-1]["late_report_indexes"], [900, 901])
+        self.assertAlmostEqual(collector.since[0], t0 + len(windows) * 0.05)       # the reports after the last window
+        self.assertGreater(len(collector.since), 1)                                  # it waited until they stopped
+        self.assertGreaterEqual(clock.time() - collector.since[0], hc.LATE_REPORT_QUIET_S)
+
+    def test_late_reports_wait_until_quiet_or_the_maximum(self):
+        clock = FakeClock()
+        arrivals = iter(range(1, 1000))                                              # a report per poll: never quiet
+        got = hc.wait_for_late_reports(lambda since: [{"idx": 0}] * next(arrivals), 0.0, clock)
+        self.assertGreaterEqual(clock.time() - 1000.0, hc.LATE_REPORT_MAX_S)
+        self.assertGreater(len(got), 1)
+        clock = FakeClock()
+        self.assertEqual(hc.wait_for_late_reports(lambda since: [], 0.0, clock), [])
+        self.assertLess(clock.time() - 1000.0, hc.LATE_REPORT_QUIET_S + 0.1)
+
     def test_payload_timing_falls_back_to_the_legacy_fields(self):
         t = hc.payload_timing_ms({"sync_s": 0.04, "read_s": 0.14, "clear_s": 0.01}, 220.0)
         self.assertEqual((t["sync_ms"], t["read_ms"], t["clear_ms"]), (40.0, 100.0, 10.0))
@@ -417,7 +490,7 @@ class ProfileTests(unittest.TestCase):
         args = hc.build_arg_parser("switch").parse_args(self.BASE + ["--profile", "switch"])
         self.assertEqual((args.window_sec, args.active_ttl_windows, args.clear_idle_windows), (1.0, 3, 3))
         self.assertEqual((args.reader, args.reader_raw_wire, args.reader_sync_batched), ("batched", True, True))
-        self.assertEqual((args.read_budget_frac, args.max_dst_reads, args.forward_report_port), (0.8, 256, 192))
+        self.assertEqual((args.read_budget_frac, args.max_dst_reads, args.forward_report_port), (0.7, 256, 192))
         self.assertEqual((args.clear_expired, args.clear_budget_frac), (1, 0.5))
 
     def test_explicit_options_override_the_profile(self):

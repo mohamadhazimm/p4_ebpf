@@ -191,6 +191,12 @@ class ReportCollector:
         with self._lock:
             return [r for t, r in self._reports if start <= t < end]
 
+    def take_after(self, start: float) -> List[Dict[str, object]]:
+        """The reports received at or after start (at the end of a run: those that
+        arrived after the last window)."""
+        with self._lock:
+            return [r for t, r in self._reports if t >= start]
+
 
 def collect_indexes_on_iface(iface: str, timeout: float, ssh_host: Optional[str] = None) -> List[int]:
     seen: List[int] = []

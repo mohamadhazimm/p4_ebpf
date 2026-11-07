@@ -474,7 +474,7 @@ class EquivalenceTests(unittest.TestCase):
         self.assertEqual(self.strip(win_s), self.strip(win_b))
         self.assertEqual(sw_s.stats["sync_ops"], sw_b.stats["sync_ops"])
         self.assertEqual(sw_s.stats["write_rpcs"],
-                         len(win_s) + windows_with_clears if HAS_PB2 else sw_b.stats["write_rpcs"])
+                         windows_with_sync + windows_with_clears if HAS_PB2 else sw_b.stats["write_rpcs"])
 
     def test_safe_parse_and_chunking_give_the_same_windows(self):
         (_, win_fast, _, csv_fast, _), (_, win_safe, _, csv_safe, _) = (
@@ -765,7 +765,8 @@ class RawWireTests(unittest.TestCase):
     def test_wire_parser_decodes_a_server_style_response(self):
         pb2 = bfrt_mock.bfruntime_pb2
         rsp = pb2.ReadResponse()
-        rsp.status.add()                                      # unknown to the parser: skipped
+        if "status" in pb2.ReadResponse.DESCRIPTOR.fields_by_name:   # not in SDE 9.6
+            rsp.status.add()                                  # unknown to the parser: skipped
         te = rsp.entities.add().table_entry                   # one DataField per pipe, as the server sends
         te.table_id = 1000
         te.is_default_entry = True                            # a field the parser does not look at

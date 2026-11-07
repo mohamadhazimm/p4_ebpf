@@ -493,7 +493,7 @@ What changed in `hybrid_collector.py`:
 
 - `--profile switch`: 1 s windows, `--active-ttl-windows 3` (the dataset model's TTL),
   `--clear-idle-windows 3`, `--reader batched --reader-raw-wire --reader-sync-batched`,
-  `--p4-snapshot sync`, `--read-budget-frac 0.8`, `--max-dst-reads 256`, `--clear-expired 1`,
+  `--p4-snapshot sync`, `--read-budget-frac 0.7` (0.8 until Section 14), `--max-dst-reads 256`, `--clear-expired 1`,
   `--clear-budget-frac 0.5` (Section 11.4),
   `--forward-report-port 192`. `--profile model`: 60 s windows, batched reader,
   `--p4-snapshot sync`, `--p4-read-timeout 600`, `--clear-idle-windows 0`, no budget (the
@@ -966,3 +966,254 @@ The dataset's own captures are now in the repository: `live_test/captures/bulk20
 each with its truth and the replay commands in `live_test/captures/README.md`. Note that the
 dataset's SYN flood is a 0.70 s burst at 57,000 SYNs/s: replay it with `--pps 2000` to compare
 with the stand-in, and at its original timing for the burst.
+
+## 14. Results on the switch (2026-11-07, third session): the Section 13.4 reruns
+
+Run from PC1 with e8a3d2d and 45129e0. P4, captures and setup are as in Sections 12 and 13.
+The raw data is in the git-ignored run dir `perf/results/switch_v3_20261107_091147/` (README
+with every number, `cad_flood/cost_replay.txt`, the scripts in `scripts/`).
+
+### 14.1 PC1 without the switch
+
+- Full unit-test suite: 111 OK (5 skipped) in 4 of 4 runs. The `alive()` race is fixed.
+- `DEP=/usr CLANG=clang-10 BPFTOOL=<bpftool v7.3.0> ./ebpf_perf/build.sh` builds every binary
+  and `sha256.txt`, then **exits 141**.
+  - The cause is `"$BPFTOOL" --version | head -1` under `set -o pipefail`: this bpftool prints
+    3 lines, and `head` closes the pipe after the first.
+  - It happened in both builds. `clang-version.txt` and the `built:` line are missing.
+  - `sed -n 1p` instead of `head -1` (for both version lines) fixes it.
+  - The warnings about `struct bpf_link_info` / `enum bpf_link_type` come from PC1's older
+    system UAPI headers and are harmless (`-I$BOOT/libbpf/include/uapi` silences them).
+- `test_agg_equiv` now builds from the repository and **passes on PC1**: 3,006 scenarios,
+  37,445 rows identical.
+
+### 14.2 The reruns (`--profile switch`)
+
+| run | windows | active median / max | read median | overrun rows | late_ms median / max | wall > allow | wall median / max | end-of-run clear | CSV sums |
+|---|---|---|---|---|---|---|---|---|---|
+| (c) SYN stand-in | 22 | 6,517 / 7,803 | 919 (Section 13: 708) | 2 (6) | 71 / 307 (273 / 452) | 5 (10) | 770 / 894 | 6,619 of 6,619 in 594 ms | read buckets only |
+| (d) after (c), `--no-register-reset` | 21 | 559 / 572 | all | 0 | 3 / 5 | 0 | 426 / 466 | 391 | **= truth** (Section 13: 91%) |
+| (b) ab_mix x59 | 21 | 561 / 576 | all | 0 | 3 / 12 | 0 | 422 / 453 | 384 | = truth |
+| (a) ab_mix x6.5 | 183 | 62 / 71 | all | 0 | 2 / 5 | 0 | 97 / 117 | 30 | = truth |
+
+What meets the 13.4 expectations:
+
+- **The end-of-run line:** `cleared 6619 of the 6619 buckets still occupied`, in 594 ms.
+  - Every bucket reported in (c) was cleared: 28,208 on expiry plus 6,619 at the end, which is
+    the report count of 34,827.
+- **Occupancy after (c):** 0 of 65,536.
+- **(d):** 2,768 of 2,768 flows, and every CSV sum equals the truth.
+- **(a) and (b):** pass Section 11.2's criteria. Their late_ms fell from 3-17 ms to 2-3 ms.
+
+What falls slightly short:
+
+- **`net_read_late_ms` "well under 100 ms":** median 71 ms, steady at 67 / 73 in the two halves.
+  - The cost model ends at `prep_ms` 59, `select_ms` 54 and `post_ms` 50 ms (~1,600 reports and
+    ~6,500 active buckets per window).
+  - The max, 307 ms in w14, follows w13's overrun. The deadline rule cut w14's allowance to
+    509 ms, and w15 was back at 41 ms.
+- **`wall_ms` ≤ `net_read_allow_ms` "in nearly every window":** 16 of 21; 5 exceed it by
+  12-106 ms.
+- **"0-1 overruns":** 2 (w10 and w13).
+
+Why (`cost_replay.txt`, the cost model replayed over the run's timing records):
+
+- Clears (0.085-0.092 ms per bucket), syncs (30-35 ms) and the overhead are predicted well.
+- The read cost on the switch varies from 0.52 to 0.75 ms per unit. w10 and w13 ran at 0.69 and
+  0.75 ms against the model's ~0.60, which is 111 and 131 ms over the prediction.
+- The margin before them was 16 and 25 ms. It is an EMA (alpha 0.3) of the overshoots, which
+  occur in 7 of 21 windows, so it decays in between.
+- In flood windows, late + select + post + 5 ms leaves ~820 ms before the boundary, so the
+  800 ms budget is nearly the deadline. Every read is planned for 800 ms, and a read that is
+  15-25% slow crosses the boundary.
+
+### 14.3 Suggestions
+
+1. Size the margin from a high percentile of the recent overshoots (for example the p90 of the
+   last 10 windows, or the max with a slow decay) instead of the EMA. Or keep a relative headroom
+   of ~15% of the predicted read time. Or lower `--read-budget-frac` to 0.7 in `--profile switch`.
+   Each costs about 100-150 buckets per flood window, and should bring the overruns to 0-1.
+2. `ebpf_perf/build.sh`: replace `| head -1` with `| sed -n 1p` on the two version lines.
+3. `test_batched_reader.EquivalenceTests.test_rpc_counts_per_window` fails wherever the SDE's
+   `bfruntime_pb2` is importable (checked on PC1 with the switch's SDE 9.6 modules): `197 != 203`.
+   - Line 477 expects one sync Write per window with `--sync-batched` (`len(win_s) +
+     windows_with_clears`). Since Section 11.4, a window with nothing to read is not synced.
+   - In the scenario, 114 of 120 windows sync and 83 clear: 114 + 83 = 197 is right, and the
+     expected value should be `windows_with_sync + windows_with_clears`.
+   - Without `bfruntime_pb2` the line takes its `else` branch, so the suite passes on PC1 and
+     the lab workstation as they are.
+4. `test_batched_reader.RawWireTests.test_wire_parser_decodes_a_server_style_response` still
+   errors with the SDE 9.6 modules: it sets `ReadResponse.status`, a field SDE 9.6 does not have
+   (open since Section 10). It should skip when the field is absent.
+
+## 15. The 14.3 fixes, and the 0.7 budget on the switch (2026-11-07, fourth session)
+
+Changes, made on PC1 on top of 45129e0 (with this section, uncommitted when written):
+
+- `ebpf_perf/build.sh`: `sed -n 1p` instead of `head -1` on the two version lines (14.1).
+- `test_batched_reader.py`:
+  - `test_rpc_counts_per_window` expects one sync Write per synced window (14.3 item 3);
+  - `test_wire_parser_decodes_a_server_style_response` adds `ReadResponse.status` only where
+    the field exists (item 4).
+- `hybrid_collector.py`: `--profile switch` sets `--read-budget-frac 0.7` instead of 0.8
+  (item 1, the simplest of its three options), with the comment and the `--profile` help
+  updated. The file keeps its CRLF line endings.
+- `test_collector_cadence.py`: the profile test expects 0.7.
+
+Results (raw data in the git-ignored `perf/results/switch_v4_20261107_094158/`, README with
+every number):
+
+- Unit tests: 111 OK both without the SDE protobufs and with the switch's SDE 9.6
+  `bfruntime_pb2` (2 of 2 runs each). `build.sh` exits 0 on PC1; `test_agg_equiv` passes.
+- On the switch, `--profile switch` (budget 700 ms), stand-in captures:
+
+  | run | read median | overrun rows | late_ms median / max | wall max | CSV sums |
+  |---|---|---|---|---|---|
+  | (c) SYN stand-in | 764 (0.8: 919) | **0** (0.8: 2) | 58 / 122 | 837 | read buckets only |
+  | (d) after (c), no reset | all | 0 | 3 / 5 | 556 | = truth |
+  | (c2) SYN stand-in again | 711 | **0** | 57 / 85 | 717 | read buckets only |
+  | (b) ab_mix x59 | all | 0 | 3 / 7 | 507 | = truth |
+  | (a) ab_mix x6.5 | all | 0 | 2 / 4 | 122 | = truth |
+  | (e) ab_mix x6.5 for 20 s, then the SYN stand-in | 65 benign; 506-892 flood | **0** | 20 / 95 | 714 | - |
+
+  - All flood buckets are cleared, the last ones by the end-of-run clear (5,829-6,728 buckets
+    in 0.5-0.6 s). The occupancy after (c) is 0.
+  - In a flood window the allowance now leaves ~120 ms before the boundary, so a read up to
+    ~120 ms slower than planned still ends in time. Two reads in (c) were 60 and 137 ms slower
+    than their allowance; neither overran.
+  - The cost is ~150-200 fewer buckets read per flood window. For benign traffic the budget
+    does not bind: (b)'s largest read takes 507 ms.
+  - late_ms levels off with the active set (41-85 ms in windows 11-21 at ~6,500 active
+    buckets); it does not grow with time.
+  - The clear backlog was nonzero once: up to 1,116 buckets in (c2) windows 5-7, when window
+    1's ~3,000 buckets expired together. It was empty from window 8 on.
+
+One smaller finding (not changed): the cost model's cold start.
+
+- The per-bucket read and clear costs are fitted without a per-request part, so small reads
+  overstate them.
+  - In (c2), window 0 read 11 buckets in 31 ms, ~24 ms of it the 15 read requests, so the
+    model learned 2.46 ms per unit.
+  - Window 1 then read 509 buckets instead of ~1,000; the model recovered by window 4.
+- In (e), the realistic case, the benign windows (~65 reads, ~16 clears) taught the model
+  0.75-0.9 ms per read and 0.13-0.21 ms per clear. At flood sizes these are ~0.58 and 0.09.
+  - So the first six flood windows read 506-892 buckets, each ending 65-125 ms inside its
+    allowance (10-30% under what fits), until ~w29.
+- The error is on the safe side.
+- Fix, if wanted: fit read time = a + b x units and clear time = c + d x buckets (or fold the
+  per-request part into `fixed_ms`), or update the per-bucket estimates only from windows with
+  at least ~200 units.
+
+Not yet run: the real dataset captures (`bulk2000`, `syn_fan_40k`, on the lab workstation,
+not on PC1), and runs longer than ~3 minutes (`on_window()` re-reads the whole monitor log,
+Section 13.4).
+
+## 16. The dataset's own captures on the switch (2026-11-07, fifth session)
+
+These are the replays of `live_test/captures/` (51cc9d7) with the Section 15 working tree
+(budget 0.7), as its README describes. The raw data is in the git-ignored
+`perf/results/switch_v5_20261107_104051/` (README with every number, the scripts in
+`scripts/`).
+
+| run | overload rows | overrun rows | late_ms median / max | CPU reports | after the run |
+|---|---|---|---|---|---|
+| (b) `bulk2000`, original timing | **5** | 0 | 2 / 4 | 2,002 (1,830-2,002 expected) | CSV sums **= truth** in all seven columns |
+| (c1) `syn_fan_40k --pps 2000` | 20 | 0 | 64 / 102 | 33,509 (≥ 29,843) | **176 buckets occupied**; (d) then 2,762 of 2,768 flows |
+| (c2) `syn_fan_40k`, original timing (57,000 SYNs/s) | 11 | 2 (the burst windows) | 17 / 652 | **29,844 = 29,843 buckets + 1 probe** | 0 occupied; (d) 2,768 of 2,768, = truth |
+
+What holds:
+
+- (b) is exact and on time.
+- The CPU-report path loses nothing at the dataset's 57,000 SYNs/s: every distinct bucket
+  reported, all delivered within ~2 windows.
+- The clear backlog after the burst (peak 22,164 expired buckets) drains at ~3,500-3,850 per
+  window and is empty by window 12, as `live_test/captures/README.md` expects.
+
+Three findings:
+
+1. **The cost model's cold start gives a false overload in benign traffic** (Section 15's
+   finding, now harmful).
+   - In (b), window 1 read one bucket (the collector's connection probe) in 21 ms of
+     per-request overhead, and the model learned 18.6 ms per bucket.
+   - Windows 3-7 of benign traffic then skipped 359 bucket reads and carry `net_overload` 1,
+     with reads of only 142-308 ms in a 700 ms allowance. The model recovered by window 8.
+   - The totals stay exact (the skipped buckets' packets show up in later reads), but those
+     windows' register features are low and wrongly flagged. Any run that starts with a single
+     connection gets this.
+   - Fix: fit read time = a + b x units and clear time = c + d x buckets (or move the
+     per-request part into `fixed_ms`), or learn the per-bucket costs only from windows with
+     at least ~100-200 units.
+2. **Reports that arrive after the last window are never cleared.**
+   - After (c1), 176 buckets stayed occupied. Matched to the capture by bucket index and source
+     port, all 176 are single SYNs sent in the last 0.1 s of the replay (19.89-19.99 s). None
+     is from earlier, so no report was lost mid-run.
+   - Their reports reached the collector after its last window took its reports. The end-of-run
+     clear covers only tracked buckets, so it skipped them, and the next capture without a reset
+     lost 6 of 2,768 flows.
+   - Fix: before the end-of-run clear, wait briefly (~0.5-1 s, or until no report for ~0.3 s),
+     take the late reports, and clear their buckets as well. Or run one more full window after
+     the command ends (`--drain-seconds` in `--mode command`).
+   - Likely factor (not measured): tcpreplay's pacing on PC1. A 0.5 ms gap plus ~80 us of timer
+     overshoot gives 1,724 packets/s, the rate the stand-in replays actually ran at and the
+     `rep_new_flows` of several (c1) windows. At `--pps 2000`, tcpreplay catches up in bursts.
+3. **A 57,000/s burst decides two reads late.**
+   - Processing 17,859 and 11,450 reports in a window (~36 us each on PC1) puts w1 651 ms and w2
+     309 ms behind. The deadline rule shrinks both allowances, but both end slightly after the
+     boundary; w3 is on time.
+   - Acceptable as is. The burst window reads 438 of 17,859 active buckets (its `rep_*`
+     features are complete).
+
+## 17. The fixes for 16's findings 1 and 2, on the switch (2026-11-07, sixth session)
+
+Changes (on PC1, with Sections 14-16 in the same commit):
+
+1. **`ReadCostModel` per-request parts.**
+   - `ROUTE_COSTS["raw"]` now holds `read_fixed_ms` 23 (the Read RPCs), `read_ms_per_bucket`
+     0.56, `clear_fixed_ms` 3 (the Write), `clear_ms_per_bucket` 0.088 and `min_rate_units` 20.
+     They are fitted to Section 16's reads: 1 bucket 21 ms, 101 buckets 74 ms, 1,054 units
+     612 ms.
+   - `predict_ms` and `buckets_within` add the per-request parts.
+   - `update` takes them off before learning the per-bucket costs, and learns nothing per bucket
+     from reads or clears smaller than `min_rate_units`.
+   - `"fast"` gets `min_rate_units` 20 only; `"legacy"`, `"model"` and directly built models are
+     unchanged.
+2. **Late reports at the end of a run.**
+   - `ReportCollector.take_after(t)`.
+   - With `--clear-expired`, `wait_for_late_reports()` waits until no report has come for
+     0.3 s (at most 1 s). The buckets of the reports received after the last window are then
+     added to the end-of-run clear (named in its line, `windows[-1]["late_report_indexes"]`).
+3. Five tests. The two collector tests fail against the previous code, with exactly Section
+   16's symptoms. Suite: 116 OK, with and without SDE 9.6's `bfruntime_pb2`.
+
+Results (git-ignored `perf/results/switch_v6_20261107_113553/`, README with every number):
+
+- **bulk2000 (b):** 0 overloaded windows (Section 16: 5) and 0 skipped bucket reads (359). After
+  the one-bucket first window, every active bucket was read. All seven CSV sums equal the
+  truth.
+- **`syn_fan_40k --pps 2000` (c1), twice:** 0 overruns, occupancy 0 afterwards, and (d) after the
+  first gives 2,768 of 2,768 flows with every sum equal to the truth.
+  - Neither run had a late report; Section 16's had 176, as tcpreplay's timing varies.
+  - So a third run adds 300 SYNs at 200/s from 0.2 s after tcpreplay exits. The end-of-run clear
+    took 184 buckets from 184 late reports.
+  - 33 buckets stayed occupied: the trickle's last packets (264-299), sent after the
+    collector's 1 s wait had ended, which no run can see.
+- **The burst (c2):** as in Section 16. No report lost, 2 overruns in the burst windows,
+  occupancy 0.
+- **ab_mix x6.5 (a):** exact, 0 overload.
+
+One new, rare finding: **a clear can race a packet and leave a torn bucket.**
+
+- After the trickle run, bucket 20531 held pkts 1 and bytes 60, with dir_valid, ports, lengths,
+  timestamps and flags 0. Its only packets are flood packets #10514 and #21201 (~5.3 s and
+  ~10.6 s).
+- The likely cause is the clear's order. `batched_reader._clear` sends one Write ordered by
+  register (every bucket's `reg_pkts`, then every bucket's `reg_bytes`, ..., `reg_rst`), so a
+  bucket's first and last registers are zeroed up to the Write's duration apart: ~150 ms for a
+  flood window's clears.
+- A packet in that gap:
+  - is counted in the registers that are already zero;
+  - sees the old `dir_valid` 1, so it sends no CPU report, and its flow is lost;
+  - leaves the bucket with dir_valid 0 and stale counts once the clear finishes.
+- Seen once in three flood runs (~30,000 clears each). It predates these fixes.
+- Possible fix: order the clear's updates bucket by bucket, so each bucket's 14 registers are
+  zeroed in 14 consecutive updates; then re-measure the clear cost.

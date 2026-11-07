@@ -865,13 +865,21 @@ REPORT_ZERO = {
 
 # A read may use the time left until the next window boundary minus this margin.
 DEADLINE_SAFETY_MS = 5.0
+# CPU reports that reach the collector after its last window took its reports: at the end of a run
+# it waits until none has arrived for LATE_REPORT_QUIET_S (at most LATE_REPORT_MAX_S) and clears
+# their buckets with the end-of-run clear (RUNBOOK 16).
+LATE_REPORT_QUIET_S = 0.3
+LATE_REPORT_MAX_S = 1.0
 # An expired bucket whose unconditional clear fails this many times is given up.
 CLEAR_ATTEMPTS = 3
 
 # Recommended option bundles. "switch": the Wedge100BF-32X with the batched
 # reader on its wire-format route (RUNBOOK sections 9-10): 1 s windows, the
-# dataset's 3-window idle TTL, syncs in one RPC, and a read budget of 80% of the
-# window. "model": the Tofino software model. With the batched reader its 15
+# dataset's 3-window idle TTL, syncs in one RPC, and a read budget of 70% of the
+# window (RUNBOOK 14.2: at 80% the budget nearly equalled the deadline in a flood,
+# where the reports, the selection and the post-read work take ~175 ms, so a
+# read 15-25% slower than predicted ended after the next boundary).
+# "model": the Tofino software model. With the batched reader its 15
 # register syncs take 45-140 s and the shadow reads after them 7-121 s, 52-232 s
 # per window in all; its hardware reads take ~0.47 s per register entry (18
 # buckets = 118 s, growing with the active set). Measured 2026-11-07
@@ -884,7 +892,7 @@ CLEAR_ATTEMPTS = 3
 PROFILES: Dict[str, Dict[str, Any]] = {
     "switch": {"window_sec": 1.0, "active_ttl_windows": 3, "clear_idle_windows": 3, "reader": "batched",
                "reader_raw_wire": True, "reader_sync_batched": True, "p4_snapshot": "sync",
-               "read_budget_frac": 0.8, "max_dst_reads": 256, "forward_report_port": 192,
+               "read_budget_frac": 0.7, "max_dst_reads": 256, "forward_report_port": 192,
                "clear_expired": 1, "clear_budget_frac": 0.5},
     "model": {"window_sec": 60.0, "active_ttl_windows": 3, "clear_idle_windows": 0, "reader": "batched",
               "p4_snapshot": "sync", "p4_read_timeout": 600.0, "read_budget_frac": 0.0, "max_dst_reads": 0,
@@ -896,12 +904,18 @@ PROFILES: Dict[str, Dict[str, Any]] = {
 # (live_test/RESULTS.md, 2026-11-07). A run's model keeps learning from every
 # window, so these only decide how well the first windows fit the budget.
 ROUTE_COSTS: Dict[str, Dict[str, float]] = {
-    # --reader batched --reader-raw-wire: the 14 syncs in one RPC 30-31 ms plus client/IPC overhead,
-    # reads 0.50-0.56 ms per bucket on the bench and 0.62-0.70 ms in a live run (which also reads
-    # reg_newconn_dst buckets), clears 0.084-0.089 ms per bucket.
-    "raw": {"fixed_ms": 65.0, "read_ms_per_bucket": 0.62, "clear_ms_per_bucket": 0.09},
-    # --reader batched with the protobuf classes: syncs 58-70 ms, reads 1.1-1.55 ms, clears 0.55-0.75 ms.
-    "fast": {"fixed_ms": 70.0, "read_ms_per_bucket": 1.3, "clear_ms_per_bucket": 0.7},
+    # --reader batched --reader-raw-wire: the 14 syncs in one RPC 30-31 ms plus client/IPC overhead.
+    # A read costs ~23 ms for its 14 (+1) Read RPCs plus 0.51-0.56 ms per bucket (RUNBOOK 16: 1 bucket
+    # 21 ms, 101 buckets 74 ms, 1,054 units 612 ms); a clear ~3 ms for its Write plus 0.088 ms per
+    # bucket. Reads and clears smaller than min_rate_units do not move the per-bucket costs: one read
+    # of a single bucket (the collector's connection probe, all request overhead) had taught the model
+    # 18.6 ms per bucket, and five benign windows were then overloaded with reads that used 20-45% of
+    # their allowance (RUNBOOK 16, bulk2000).
+    "raw": {"fixed_ms": 65.0, "read_fixed_ms": 23.0, "read_ms_per_bucket": 0.56, "clear_fixed_ms": 3.0,
+            "clear_ms_per_bucket": 0.088, "min_rate_units": 20.0},
+    # --reader batched with the protobuf classes: syncs 58-70 ms, reads 1.1-1.55 ms, clears 0.55-0.75 ms
+    # (per-request parts not measured on this route).
+    "fast": {"fixed_ms": 70.0, "read_ms_per_bucket": 1.3, "clear_ms_per_bucket": 0.7, "min_rate_units": 20.0},
     # --reader legacy: one bfshell session per window (1.4-1.5 s) and 14 reg.get() calls per bucket
     # (4.5-5.1 s at ~915 active buckets).
     "legacy": {"fixed_ms": 1500.0, "read_ms_per_bucket": 3.6, "clear_ms_per_bucket": 1.5},
@@ -939,15 +953,24 @@ class ReadCostModel:
 
     The starting values are ROUTE_COSTS[route] (for_route()). Every measured
     window moves them with an exponential average, so the budget follows the
-    reader route and the control plane actually in use."""
+    reader route and the control plane actually in use. A read with at least one
+    bucket also pays read_fixed_ms (its Read RPCs), one with a clear
+    clear_fixed_ms (its Write RPC); these per-request parts are taken off before
+    the per-bucket costs are learned, and reads or clears of fewer than
+    min_rate_units buckets do not move the per-bucket costs at all (their time is
+    almost all request overhead)."""
 
     DST_WEIGHT = 0.15
 
     def __init__(self, fixed_ms: float = 70.0, read_ms_per_bucket: float = 1.3,
-                 clear_ms_per_bucket: float = 0.7, alpha: float = 0.3, route: str = "fast"):
+                 clear_ms_per_bucket: float = 0.7, alpha: float = 0.3, route: str = "fast",
+                 read_fixed_ms: float = 0.0, clear_fixed_ms: float = 0.0, min_rate_units: float = 0.0):
         self.fixed_ms = fixed_ms
         self.read_ms_per_bucket = read_ms_per_bucket
         self.clear_ms_per_bucket = clear_ms_per_bucket
+        self.read_fixed_ms = read_fixed_ms        # per read with at least one bucket: its Read RPCs
+        self.clear_fixed_ms = clear_fixed_ms      # per read with at least one clear: its Write RPC
+        self.min_rate_units = min_rate_units      # smaller reads / clears leave the per-bucket costs alone
         self.alpha = alpha
         self.route = route
         self.prep_ms = 0.0
@@ -974,10 +997,12 @@ class ReadCostModel:
         self.windows_seen += 1
         self.fixed_ms = self._ema(self.fixed_ms, timing["sync_ms"] + timing["overhead_ms"])
         units = n_read + self.DST_WEIGHT * n_dst
-        if units > 0:
-            self.read_ms_per_bucket = self._ema(self.read_ms_per_bucket, timing["read_ms"] / units)
-        if n_cleared > 0:
-            self.clear_ms_per_bucket = self._ema(self.clear_ms_per_bucket, timing["clear_ms"] / n_cleared)
+        if units > 0 and units >= self.min_rate_units:
+            self.read_ms_per_bucket = self._ema(self.read_ms_per_bucket,
+                                                max(0.0, timing["read_ms"] - self.read_fixed_ms) / units)
+        if n_cleared > 0 and n_cleared >= self.min_rate_units:
+            self.clear_ms_per_bucket = self._ema(self.clear_ms_per_bucket,
+                                                 max(0.0, timing["clear_ms"] - self.clear_fixed_ms) / n_cleared)
 
     def update_processing(self, prep_ms: float, post_ms: float, select_ms: float = 0.0) -> None:
         """The collector's own time before, around and after the read (faster
@@ -987,13 +1012,15 @@ class ReadCostModel:
         self.post_ms = self._ema(self.post_ms, max(0.0, post_ms), alpha=0.5)
 
     def predict_ms(self, n_read: int, n_cleared: int = 0, n_dst: int = 0) -> float:
-        return (self.fixed_ms + (n_read + self.DST_WEIGHT * n_dst) * self.read_ms_per_bucket
-                + n_cleared * self.clear_ms_per_bucket)
+        units = n_read + self.DST_WEIGHT * n_dst
+        return (self.fixed_ms + (self.read_fixed_ms if units > 0 else 0.0) + units * self.read_ms_per_bucket
+                + (self.clear_fixed_ms if n_cleared > 0 else 0.0) + n_cleared * self.clear_ms_per_bucket)
 
     def buckets_within(self, budget_ms: float, n_cleared: int = 0, n_dst: int = 0) -> int:
         """How many flow buckets a read can cover inside budget_ms, next to
         n_cleared clears and n_dst reg_newconn_dst reads, keeping margin_ms free."""
-        available = (budget_ms - self.fixed_ms - self.margin_ms - n_cleared * self.clear_ms_per_bucket
+        available = (budget_ms - self.fixed_ms - self.margin_ms - self.read_fixed_ms
+                     - (self.clear_fixed_ms if n_cleared > 0 else 0.0) - n_cleared * self.clear_ms_per_bucket
                      - n_dst * self.DST_WEIGHT * self.read_ms_per_bucket)
         if available <= 0 or self.read_ms_per_bucket <= 0:
             return 0
@@ -1008,7 +1035,9 @@ class ReadCostModel:
 
     def as_dict(self) -> Dict[str, float]:
         return {"route": self.route, "fixed_ms": round(self.fixed_ms, 2),
+                "read_fixed_ms": round(self.read_fixed_ms, 2),
                 "read_ms_per_bucket": round(self.read_ms_per_bucket, 4),
+                "clear_fixed_ms": round(self.clear_fixed_ms, 2),
                 "clear_ms_per_bucket": round(self.clear_ms_per_bucket, 4),
                 "prep_ms": round(self.prep_ms, 2), "select_ms": round(self.select_ms, 2),
                 "post_ms": round(self.post_ms, 2), "margin_ms": round(self.margin_ms, 2),
@@ -1094,6 +1123,23 @@ def run_p4_register_reset(resetter_path: str, switch_ssh: Optional[str] = None) 
     started = time.time()
     subprocess.run(cmd, check=True)
     print(f"[INFO] P4 registers cleared in {time.time() - started:.1f} s")
+
+
+def wait_for_late_reports(take_after: Callable[[float], List[Dict[str, object]]], since: float, clk: Any,
+                          quiet_s: float = LATE_REPORT_QUIET_S,
+                          max_s: float = LATE_REPORT_MAX_S) -> List[Dict[str, object]]:
+    """The CPU reports received at or after `since` (the end of the last window),
+    once none has arrived for quiet_s seconds, or after max_s seconds."""
+    start = clk.time()
+    count, changed = -1, start
+    while True:
+        late = take_after(since)
+        now = clk.time()
+        if len(late) != count:
+            count, changed = len(late), now
+        if now - changed >= quiet_s or now - start >= max_s:
+            return late
+        clk.sleep(0.05)
 
 
 def collect_windows_live(
@@ -1430,7 +1476,15 @@ def collect_windows_live(
     # 5,429 buckets stayed occupied and the next capture without a register reset lost 8.6% of its
     # flows. The run's windows are complete at this point, so a failed clear only leaves them occupied.
     if clear_expired and windows:
-        leftover = sorted(set(active_idx_last_seen) | set(pending_clear))
+        # Reports that arrived after the last window took its reports: no window has seen their
+        # buckets (RUNBOOK 16: the last 0.1 s of a 2,000 packets/s flood left 176 of them occupied).
+        # A collector without take_after (the tests' fakes) skips this.
+        late_reports: List[Dict[str, object]] = []
+        take_after = getattr(collector, "take_after", None)
+        if take_after is not None:
+            late_reports = wait_for_late_reports(take_after, win_end_abs, clk)
+        late_idxs = {safe_int(r["idx"]) for r in late_reports}
+        leftover = sorted(set(active_idx_last_seen) | set(pending_clear) | late_idxs)
         final_cleared: List[int] = []
         if leftover:
             t_clear = clk.time()
@@ -1444,12 +1498,14 @@ def collect_windows_live(
                                       clear_indexes=leftover)
                 final_cleared = sorted(safe_int(x) for x in payload.get("cleared", []))
                 print(f"[INFO] end of run: cleared {len(final_cleared)} of the {len(leftover)} buckets still occupied "
-                      f"(the last windows' active set and the clear backlog) in "
+                      f"(the last windows' active set, the clear backlog and {len(late_idxs)} bucket(s) of the "
+                      f"{len(late_reports)} report(s) that arrived after the last window) in "
                       f"{(clk.time() - t_clear) * 1000.0:.0f} ms")
             except (P4ReadError, RuntimeError, OSError, ValueError) as error:
                 print(f"[WARN] end of run: clearing the {len(leftover)} occupied buckets failed ({error}); they stay "
                       f"occupied until the next register reset")
         windows[-1]["final_cleared_indexes"] = final_cleared
+        windows[-1]["late_report_indexes"] = sorted(late_idxs)
 
     if overruns:
         print(f"[WARN] {overruns} of {len(windows)} register reads ended after the next window boundary; "
@@ -1797,7 +1853,7 @@ def profile_parser() -> argparse.ArgumentParser:
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--profile", choices=sorted(PROFILES),
                      help="option bundle for the target: 'switch' (Wedge100BF-32X: 1 s windows, 3-window TTL, batched "
-                          "reader on the wire-format route with the syncs in one RPC, read budget 80%% of the window) "
+                          "reader on the wire-format route with the syncs in one RPC, read budget 70%% of the window) "
                           "or 'model' (Tofino software model: 60 s windows, batched reader with register syncs, "
                           "600 s read timeout, no idle clearing, no budget). Options given explicitly override the "
                           "profile")

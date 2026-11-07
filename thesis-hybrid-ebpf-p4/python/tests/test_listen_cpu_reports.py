@@ -25,6 +25,15 @@ def report(magic, src, dst, sport, dport, proto, idx=None):
     return raw + PACKET_TAIL
 
 
+class TakeTests(unittest.TestCase):
+    def test_take_and_take_after(self):
+        rc = ReportCollector("veth5")
+        rc._reports.extend([(1.0, {"idx": 1}), (2.0, {"idx": 2}), (3.0, {"idx": 3})])
+        self.assertEqual([r["idx"] for r in rc.take(1.0, 2.0)], [1])
+        self.assertEqual([r["idx"] for r in rc.take_after(2.0)], [2, 3])
+        self.assertEqual(rc.take_after(4.0), [])
+
+
 class ParseCpuReportTests(unittest.TestCase):
     def test_current_report_carries_the_index(self):
         expected = compute_flow_index("10.0.0.1", "10.0.0.2", 1234, 80, 6)
