@@ -186,11 +186,11 @@ class ProfileTests(unittest.TestCase):
 
     def test_the_model_profile_and_the_unchanged_defaults(self):
         args = hc.build_arg_parser("model").parse_args(self.BASE + ["--profile", "model"])
-        self.assertEqual((args.window_sec, args.p4_snapshot, args.clear_idle_windows, args.read_budget_frac),
-                         (60.0, "hw", 0, 0.0))
+        self.assertEqual((args.window_sec, args.p4_snapshot, args.p4_read_timeout, args.clear_idle_windows,
+                          args.read_budget_frac), (60.0, "sync", 600.0, 0, 0.0))
         plain = hc.build_arg_parser().parse_args(self.BASE)
-        self.assertEqual((plain.window_sec, plain.active_ttl_windows, plain.reader, plain.read_budget_frac),
-                         (10.0, 5, "legacy", 0.0))
+        self.assertEqual((plain.window_sec, plain.active_ttl_windows, plain.reader, plain.read_budget_frac,
+                          plain.p4_snapshot, plain.p4_read_timeout), (10.0, 5, "legacy", 0.0, "sync", 120.0))
 
     def test_every_profile_key_is_an_option(self):
         dests = {a.dest for a in hc.build_arg_parser()._actions}

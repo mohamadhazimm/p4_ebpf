@@ -857,16 +857,23 @@ REPORT_ZERO = {
 # Recommended option bundles. "switch": the Wedge100BF-32X with the batched
 # reader on its wire-format route (RUNBOOK sections 9-10): 1 s windows, the
 # dataset's 3-window idle TTL, syncs in one RPC, and a read budget of 80% of the
-# window. "model": the Tofino software model, whose register sync takes seconds
-# and whose direct reads take ~0.27 s per bucket (live_test/RESULTS.md), so long
-# windows, hardware reads, no idle clearing, and no budget (the model's reads
-# would never fit one). Explicit options override the profile.
+# window. "model": the Tofino software model. With the batched reader its 15
+# register syncs take 45-140 s and the shadow reads after them 7-121 s, 52-232 s
+# per window in all; its hardware reads take ~0.47 s per register entry (18
+# buckets = 118 s, growing with the active set). Measured 2026-11-07
+# (live_test/RESULTS.md). Hence sync snapshots, a 600 s read timeout (the default
+# 120 s cut off reads that would have finished), long windows, no idle clearing,
+# and no budget (the syncs alone take most or all of a 60 s window, so a budget
+# leaves no room for bucket reads).
+# The reads still end after the next window boundary; that is expected on the
+# model. Explicit options override the profile.
 PROFILES: Dict[str, Dict[str, Any]] = {
     "switch": {"window_sec": 1.0, "active_ttl_windows": 3, "clear_idle_windows": 3, "reader": "batched",
                "reader_raw_wire": True, "reader_sync_batched": True, "p4_snapshot": "sync",
                "read_budget_frac": 0.8, "max_dst_reads": 256, "forward_report_port": 192},
     "model": {"window_sec": 60.0, "active_ttl_windows": 3, "clear_idle_windows": 0, "reader": "batched",
-              "p4_snapshot": "hw", "read_budget_frac": 0.0, "max_dst_reads": 0, "forward_report_port": 2},
+              "p4_snapshot": "sync", "p4_read_timeout": 600.0, "read_budget_frac": 0.0, "max_dst_reads": 0,
+              "forward_report_port": 2},
 }
 
 
@@ -1584,8 +1591,9 @@ def profile_parser() -> argparse.ArgumentParser:
     pre.add_argument("--profile", choices=sorted(PROFILES),
                      help="option bundle for the target: 'switch' (Wedge100BF-32X: 1 s windows, 3-window TTL, batched "
                           "reader on the wire-format route with the syncs in one RPC, read budget 80%% of the window) "
-                          "or 'model' (Tofino software model: 60 s windows, hardware reads, no idle clearing, no "
-                          "budget). Options given explicitly override the profile")
+                          "or 'model' (Tofino software model: 60 s windows, batched reader with register syncs, "
+                          "600 s read timeout, no idle clearing, no budget). Options given explicitly override the "
+                          "profile")
     return pre
 
 
@@ -1627,8 +1635,9 @@ def build_arg_parser(profile: Optional[str] = None) -> argparse.ArgumentParser:
                     help="do not clear the P4 registers before the run (a bucket left from an earlier run "
                          "then sends no CPU report for a new flow that lands in it)")
     ap.add_argument("--p4-read-timeout", type=float, default=120.0,
-                    help="seconds one register read's bfshell session may take before the read is retried "
-                         "(the reader process itself is stopped 30 s later)")
+                    help="seconds one register read may take before it is retried: the legacy reader's bfshell "
+                         "session (that process is stopped 30 s later) or the batched reader's answer (the reader "
+                         "is restarted)")
     ap.add_argument("--p4-read-retries", type=int, default=2,
                     help="retries of a failed register read before the run stops")
     ap.add_argument("--reader", choices=["legacy", "batched"], default="legacy",
