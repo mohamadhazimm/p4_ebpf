@@ -565,12 +565,16 @@ sudo python3 hybrid_collector.py --profile model --read-budget-frac 0.5 --mode p
 
 Expect (measured on 2026-11-07, `live_test/RESULTS.md`): the first run reads every active
 bucket (`net_overload` 0 in every row) and its `rep_new_flows` sum to the collector's CPU report
-count (70). The second reads all of window 0 (the cost model starts from the switch's numbers),
-then learns the model's cost (~99 s fixed for the syncs, ~2.1 s per bucket) and reads no flow
-bucket in the later windows (`net_buckets_skipped` > 0, `net_overload` 1; the syncs and the
-`reg_newconn_dst` reads still run), while `rep_new_flows` sum to the report count (84, the
+count (70). The second read all of window 0 when the cost model started from the switch's
+numbers, then learned the model's cost (~99 s fixed for the syncs, ~2.1 s per bucket) and read
+no flow bucket in the later windows (`net_buckets_skipped` > 0, `net_overload` 1; the syncs and
+the `reg_newconn_dst` reads still run), while `rep_new_flows` sum to the report count (84, the
 capture's flows). `net_read_overrun` is 1 in every row of both runs: the model's reads
-(52-232 s per window) end after the next 60 s boundary.
+(52-232 s per window) end after the next 60 s boundary. Since Section 11.4 the cost model
+starts from the model's own costs (`ROUTE_COSTS["model"]`), so window 0 is skipped as well;
+nothing else changes for `--profile model` (no budget, no `--clear-expired`), except that a
+window with nothing to read is no longer synced and that the CSV has four more columns (use a
+new `--out-csv`). This run need not be repeated for 11.4.
 
 ### 11.2 On the Wedge100BF-32X (the cadence measurement)
 
@@ -610,10 +614,14 @@ are summed, so compare `rep_new_flows` with the report count instead.
 ### 11.3 The host side (any Linux host with root, the monitor built in `ebpf_perf/build`)
 
 Build the monitor with `./ebpf_perf/build.sh`; on a machine without the lab's dependency
-bundle, `DEP=/usr ./ebpf_perf/build.sh` uses the system's clang-14 and libelf. Its last step,
-`test_agg_equiv`, does not compile against this repository's `hostmon.c` (the test expects a
-`hostmon.c` with file-scope health counters) and the script then exits non-zero without
-`sha256.txt`, but `build/hostmon_agg` is built before that step.
+bundle, `DEP=/usr ./ebpf_perf/build.sh` uses the system's clang-14 and libelf, and
+`CLANG=clang-10` (for example) another clang for the BPF objects (`-fno-common` is set for
+clang 10, as PC1 needed). Until 2026-11-07 the last step, `test_agg_equiv`, did not compile from
+this repository: the reference monitor it is checked against (the cgroup-scoped streaming
+`hostmon.c` measured in `ebpf_perf/COMPARISON.md`) had never been committed. It is now
+`ebpf_perf/hostmon_ref/`, the build uses it, and `./ebpf_perf/build/test_agg_equiv` passes
+(3,006 scenarios, 37,445 rows identical); on the lab workstation the build reproduces the
+2026-10-27 binaries byte for byte (`build/sha256.txt`).
 
 ```sh
 sudo python3 hybrid_collector.py --profile switch --mode command --scenario-name host_agg \

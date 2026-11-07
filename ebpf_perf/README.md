@@ -1,9 +1,14 @@
 # HostMon eBPF performance benchmark
 
-Measures the cost of `libbpf-bootstrap/examples/c/hostmon` (the eBPF collector that
-computes the ADFA syscall-sequence descriptors: total/unique syscalls, entropy,
-top-syscall frequency, average/max run length, transition count, rare-syscall
-ratio, first-50/100 unique) on the local machine.
+Measures the cost of HostMon (the eBPF collector that computes the ADFA
+syscall-sequence descriptors: total/unique syscalls, entropy, top-syscall
+frequency, average/max run length, transition count, rare-syscall ratio,
+first-50/100 unique) on the local machine. The HostMon measured here is the
+cgroup-scoped streaming monitor in `hostmon_ref/` (`hostmon WINDOW_SEC
+DEDICATED_CGROUP_V2_PATH`, `HOSTMON_READY` and a start time on stdin), not the
+vendored system-wide `libbpf-bootstrap/examples/c/hostmon`; `hostmon_agg/` is
+its in-kernel-aggregating replacement. `build.sh` reproduces the binaries of
+the 2026-10-26/27 measurements byte for byte (hashes in `build/sha256.txt`).
 
 ```sh
 ./build.sh                 # no root; builds build/hostmon (static) and build/bench_load

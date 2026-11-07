@@ -1,7 +1,7 @@
 # hostmon_agg: HostMon with in-kernel aggregation
 
-`hostmon_agg` computes the same per-window, per-process ADFA features as
-`libbpf-bootstrap/examples/c/hostmon` and prints them in the same format. The
+`hostmon_agg` computes the same per-window, per-process ADFA features as the
+streaming monitor in `../hostmon_ref/` and prints them in the same format. The
 command line, the `HOSTMON_READY` / stdin start-time handshake and the
 `HOSTMON_HEALTH` line are the same, so it is a drop-in replacement in
 `run_macro.sh`, `run_bench.sh` and `run_literature.sh` (set `HOSTMON_BIN`).
