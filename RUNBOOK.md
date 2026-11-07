@@ -494,9 +494,12 @@ What changed in `hybrid_collector.py`:
 - `--profile switch`: 1 s windows, `--active-ttl-windows 3` (the dataset model's TTL),
   `--clear-idle-windows 3`, `--reader batched --reader-raw-wire --reader-sync-batched`,
   `--p4-snapshot sync`, `--read-budget-frac 0.8`, `--max-dst-reads 256`,
-  `--forward-report-port 192`. `--profile model`: 60 s windows, `--p4-snapshot hw`,
-  `--clear-idle-windows 0`, batched reader, no budget (the model's reads never fit one),
-  report port 2. Explicit options override the profile.
+  `--forward-report-port 192`. `--profile model`: 60 s windows, batched reader,
+  `--p4-snapshot sync`, `--p4-read-timeout 600`, `--clear-idle-windows 0`, no budget (the
+  model's syncs alone take 45-140 s), report port 2. (Until 2026-11-07 it had
+  `--p4-snapshot hw` and the default 120 s timeout: the batched reader's hardware reads cost
+  ~0.47 s per register entry on the model, so 18 buckets took 118 s and larger active sets timed
+  out; see `live_test/RESULTS.md`.) Explicit options override the profile.
 - `--read-budget-frac F`: a read may take F of the window. A running cost model (`ReadCostModel`:
   fixed ms per window for the syncs and the RPC overhead, ms per bucket read, ms per bucket
   cleared; initial values from Section 9, updated from every window's measured timing) says how
@@ -530,21 +533,34 @@ columns carry the signal.
 
 ### 11.1 On the Tofino model (logic only; the model's timings say nothing about the switch)
 
+From the repository root (`testbed.sh up` leaves the testbed in replay mode, which the known
+answer injects on; the command run needs live mode, the PCAP run replay mode):
+
 ```sh
-sudo live_test/testbed.sh up && sudo live_test/testbed.sh mode live
-python3 live_test/p4_known_answer.py --reader batched --raw-wire            # unchanged, 19/19
+sudo live_test/testbed.sh up
+sudo python3 live_test/p4_known_answer.py --reader batched --raw-wire       # unchanged, 19/19 (~12 min)
+sudo live_test/testbed.sh mode live
 sudo python3 hybrid_collector.py --profile model --mode command --scenario-name model_cadence \
-    --label benign --command "ip netns exec p4int python3 live_test/benign_workload.sh" \
+    --label benign --command "ip netns exec p4int setpriv --reuid=$USER --regid=$USER --init-groups \
+    bash live_test/benign_workload.sh mixed" \
     --out-csv cadence_model.csv --reader-timing --reader-timing-file timing_model.jsonl
-# the overload path on the model: a budget the model cannot meet (it learns ~270 ms per bucket)
+# the overload path on the model: a budget the model cannot meet (its syncs alone take 45-140 s)
+[ -f live_test/data/benign_mix.pcap ] || python3 live_test/make_benign_pcap.py \
+    --out live_test/data/benign_mix.pcap --truth live_test/data/benign_mix_truth.json
+sudo live_test/testbed.sh mode replay
 sudo python3 hybrid_collector.py --profile model --read-budget-frac 0.5 --mode pcap \
-    --scenario-name model_overload --label benign --pcap live_test/run/benign_mix.pcap \
-    --out-csv cadence_model.csv --reader-timing
+    --scenario-name model_overload --label benign --pcap live_test/data/benign_mix.pcap \
+    --int-iface veth0 --ext-iface veth2 --interval 0.1 --out-csv cadence_model.csv --reader-timing
 ```
 
-Expect: the first run reads every active bucket (`net_overload` 0 in every row); the second
-skips buckets from the first window the budget does not cover (`net_buckets_skipped` > 0,
-`net_overload` 1) while `rep_new_flows` equals the window's report count in both runs.
+Expect (measured on 2026-11-07, `live_test/RESULTS.md`): the first run reads every active
+bucket (`net_overload` 0 in every row) and its `rep_new_flows` sum to the collector's CPU report
+count (70). The second reads all of window 0 (the cost model starts from the switch's numbers),
+then learns the model's cost (~99 s fixed for the syncs, ~2.1 s per bucket) and reads no flow
+bucket in the later windows (`net_buckets_skipped` > 0, `net_overload` 1; the syncs and the
+`reg_newconn_dst` reads still run), while `rep_new_flows` sum to the report count (84, the
+capture's flows). `net_read_overrun` is 1 in every row of both runs: the model's reads
+(52-232 s per window) end after the next 60 s boundary.
 
 ### 11.2 On the Wedge100BF-32X (the cadence measurement)
 
@@ -583,14 +599,27 @@ are summed, so compare `rep_new_flows` with the report count instead.
 
 ### 11.3 The host side (any Linux host with root, the monitor built in `ebpf_perf/build`)
 
+Build the monitor with `./ebpf_perf/build.sh`; on a machine without the lab's dependency
+bundle, `DEP=/usr ./ebpf_perf/build.sh` uses the system's clang-14 and libelf. Its last step,
+`test_agg_equiv`, does not compile against this repository's `hostmon.c` (the test expects a
+`hostmon.c` with file-scope health counters) and the script then exits non-zero without
+`sha256.txt`, but `build/hostmon_agg` is built before that step.
+
 ```sh
 sudo python3 hybrid_collector.py --profile switch --mode command --scenario-name host_agg \
-    --label benign --command "live_test/benign_workload.sh" --hostmon ebpf_perf/build/hostmon_agg \
+    --label benign --command "bash live_test/benign_workload.sh files" --hostmon ebpf_perf/build/hostmon_agg \
     --hostmon-cgroup /sys/fs/cgroup/hazim_collect --skip-p4-forwarding --no-register-reset ...
+# on the Tofino model of this VM, with the network side as well (testbed in live mode);
+# 120 s windows so that the model's reads end inside the window
+sudo python3 hybrid_collector.py --profile model --window-sec 120 --mode command --scenario-name host_agg \
+    --label benign --command "ip netns exec p4int setpriv --reuid=$USER --regid=$USER --init-groups \
+    bash live_test/benign_workload.sh mixed" --hostmon ebpf_perf/build/hostmon_agg \
+    --hostmon-cgroup /sys/fs/cgroup/hazim_collect --out-csv cadence_host_agg.csv --reader-timing
 ```
 
 Expect `HOSTMON_READY`, then `HOSTMON_HEALTH {'lost': 0, 'capacity_errors': 0, ...}` at the end,
 and host rows whose `host_window_start_sec` equals the network windows' (the shared origin).
+On the model (2026-11-07): health all 0, equal starts in both rows, the cgroup removed afterwards.
 
 ## 12. Results on the switch (2026-11-07): Sections 10 and 11.2-11.3
 

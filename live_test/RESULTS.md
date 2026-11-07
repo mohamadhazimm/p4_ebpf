@@ -1,10 +1,14 @@
 # Live test results on this VM (benign only)
 
-There were two rounds, with no malware:
+There were four rounds, with no malware:
 
 - **2026-11-03:** this repo's collector (next section).
 - **2026-11-04:** the validations of the release repo `~/Desktop/p4-ebpf-malware-detection`
   ([its section](#2026-11-04-the-release-repos-validations)).
+- **2026-11-05:** the batched gRPC register reader
+  ([its section](#2026-11-05-the-batched-grpc-register-reader-on-the-model)).
+- **2026-11-07:** the collector's read-cadence profiles, read budget, report-only aggregates
+  and `hostmon_agg` ([its section](#2026-11-07-read-cadence-profiles-read-budget-report-only-aggregates-hostmon_agg)).
 
 ## 2026-11-03: this repo's collector
 
@@ -187,15 +191,67 @@ so these times say nothing about the switch; the switch commands are in
 [`RUNBOOK.md`](../RUNBOOK.md). The run's windows are late by 55-268 s for the same reason
 (sync reads, 60 s windows), which is why only the per-bucket read model matches per window.
 
+## 2026-11-07: read cadence profiles, read budget, report-only aggregates, hostmon_agg
+
+Commits 4980a04 (`--profile switch|model`, `--read-budget-frac` with the learned cost model,
+the `rep_*` and `net_overload`/`net_buckets_*`/`net_read_overrun` columns, `--hostmon-cgroup`
+with `ebpf_perf/build/hostmon_agg`) and 0b64bef (`derive_p4_features`'s `byte_layer` and
+`rate_window`), checked with RUNBOOK sections 11.1 and 11.3 on the real components of this VM,
+benign traffic only (section 11.2 needs the switch). Evidence: `live_test/results/cadence_20261107/`
+(`runA`/`runB`/`runC` logs, CSVs and timing files; `run1*` are the attempts with the profile as
+committed) and `live_test/results/ka_rawwire_20261107.json`.
+
+| Check | Result |
+| --- | --- |
+| `tests.test_collector_cadence` / all of `thesis-hybrid-ebpf-p4/python/tests` | 17/17 / 93/93 |
+| `tests/test_pcap_window_alignment.py` + `tests/validation` (venv: scikit-learn 1.3.2, NumPy 1.24.4) | the pull fixes 2 tests (`test_rate_window_convention_is_explicit`, `test_d10_offline_byte_unit_matches_p4`); the other 12 failures and 37 errors are the same at 9c109d1 (the 37 import `ReportCollector` from the lab machine's `listen_cpu_reports` layout; the failures are the suite's known-defect tests) |
+| `p4_known_answer.py --reader batched --raw-wire` | 19/19 (in 696 s) |
+| `DEP=/usr ./ebpf_perf/build.sh` | `hostmon` and `hostmon_agg` built; the last step, `test_agg_equiv.c`, does not compile against this repo's `hostmon.c` (it expects file-scope health counters; the same since 9a36b2b) |
+| 11.1 command run (`model_cadence`, mixed workload, 4 x 60 s) | 70 CPU reports = sum of `rep_new_flows`, 0 index mismatches; active 19/70/70/70, all read; `net_overload` 0 in every row |
+| 11.1 overload run (`model_overload`, `benign_mix.pcap`, budget 0.5) | 84 reports = sum of `rep_new_flows` = the capture's 84 flows; window 0 reads 17 of 17 (`net_overload` 0); windows 1-6 read 0 of 30-57 active buckets (`net_overload` 1, 280 skipped in all); learned cost 98.9 s fixed + 2.13 s per bucket |
+| 11.3 host side (`host_agg`, `hostmon_agg` on `/sys/fs/cgroup/hazim_collect`, 2 x 120 s) | `HOSTMON_READY`; `HOSTMON_HEALTH` lost/capacity/late/failed 0/0/0/0; `host_window_start_sec` = `net_window_start_sec` in both rows; window 0: 71 processes, 81,349 syscalls, 259 execs, 85 connects, 70 reports; the cgroup removed afterwards; reads 95 s and 52 s, no overrun |
+
+Per window with the batched reader and sync snapshots: 15 syncs 45-140 s, reads 7-121 s (when
+flow buckets are read), 52-232 s in all, so `net_read_overrun` is 1 in every 60 s window of 11.1.
+
+### Problems found
+
+1. **`--profile model` as committed did not complete a run** (fixed). It set
+   `--p4-snapshot hw` with the batched reader and kept the default `--p4-read-timeout 120`.
+   The batched reader's hardware reads cost ~0.47 s per register entry here: window 0 of the
+   command run (18 buckets, 253 entities) answered in 118 s on the third attempt after two
+   attempts were cut off at 120 s, and window 1 (more buckets) timed out again. With sync
+   snapshots and the 120 s timeout, window 0 timed out as well (sync plus read took 155-232 s
+   today, 93-115 s on 2026-11-05). The profile now sets `p4_snapshot` `sync` and
+   `p4_read_timeout` 600 (`PROFILES` in `hybrid_collector.py`, `test_collector_cadence`
+   updated); the runs above gave these two as explicit options.
+2. **RUNBOOK 11.1 and 11.3 commands** (fixed in `RUNBOOK.md`): `python3` on the bash script
+   `benign_workload.sh`, with no scenario (it then only prints its usage); the known answer
+   run in live mode, where `veth0` is inside netns `p4int`; the PCAP at `live_test/run/`
+   instead of `live_test/data/`; PCAP mode without `--int-iface veth0 --ext-iface veth2` (the
+   collector's defaults are the model's `veth1`/`veth3`).
+3. **Not changed:** `derive_p4_features` gives `byte_layer` and `rate_window` defaults
+   (`ipv4`, `recorded`) although 0b64bef's message says they must be selected explicitly. A
+   caller that passes neither now gets IPv4 totalLen bytes (the data plane's convention, which
+   `analyze_run.py` expects) instead of the earlier `len(packet)`, and recorded window
+   durations (equal to the nominal ones for `analyze_run.py`, which passes nominal edges).
+4. **Not changed:** when the budget fits no bucket, the reader still runs the 15 syncs and
+   reads the `reg_newconn_dst` buckets (capped only by `--max-dst-reads`, no cap under the
+   model profile). The skipped windows' register columns are 0 (`net_flow_count_seen` 0),
+   not missing, so only `net_overload` tells an overloaded window from an idle one. On the
+   switch the syncs cost ~70 ms.
+
 ## Limits of the software model
 
 Forwarding ~100-200 packets/s (1 MiB of HTTP in 8 s). Register sync 15 s idle and
-25-45 s with traffic (the switch: 37-40 ms); direct reads ~0.27 s per bucket
-(switch: 1.4 ms); a bucket clear ~3 s. Timestamps tick in 1.25 ms steps. On the
+25-45 s with traffic (the switch: 37-40 ms); direct reads ~0.27 s per bucket with the
+legacy reader (switch: 1.4 ms); with the batched reader ~0.47 s per register entry (18
+buckets x 14 registers + 1 `reg_newconn_dst` entry in 118 s); a bucket clear ~3 s. Timestamps tick in 1.25 ms steps. On the
 model one read takes longer than the default 10 s window; with sync reads, idle
 clears and 30 s windows the reads fell up to 203 s behind. The clean runs used
-40-60 s windows, `--p4-snapshot hw` and `--clear-idle-windows 0`. None of these
-timings describe the ASIC.
+40-60 s windows, `--p4-snapshot hw` and `--clear-idle-windows 0` with the legacy reader;
+with the batched reader, `--p4-snapshot sync` and `--p4-read-timeout 600` (`--profile model`
+since 2026-11-07). None of these timings describe the ASIC.
 
 ## Not tested
 
