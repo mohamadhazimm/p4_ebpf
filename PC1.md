@@ -344,3 +344,147 @@ State left: the switch runs `basic_fix` with 132 <-> 140 and the mirror to 192, 
 the end of the last run, `enp5s0` down (it was down before; `ip link set enp5s0 up` before the next
 runs). PC1: no namespace or macvlan, the cgroup removed by the collector, `../p4-ebpf-malware-detection`
 at `3e7cb5f`, no `../venv`, 277 MB free on `/`.
+
+## Results, part 2 (PC1, 2026-11-08): programs of the dataset's kind
+
+**Why.** Section 2 scored the release's Python workloads. The dataset's 105 benign rows are one-shot CLI
+tools (brotli, bzip2, coreutils b2sum/base32/base64/basenc/cksum/md5sum/od/sha256sum/sort/sum/wc, cpio,
+curl, diffutils cmp, expat xmlwf, git, gzip, inetutils ftp/ping/telnet, jq, lz4, m4, ncompress, openssl,
+rsync, sqlite3, tar, unzip, wget, xxhsum, xz, zip, zstd; 59 amd64_static, 28 i386_static, 18
+amd64_dynamic), each at light/medium/heavy sizes, 24 to 40,117 calls. The generator of that revision is
+not on PC1 (the construction repo holds the earlier bash-script workloads), so executions of the same kind
+were rebuilt here from the rows' own numbers.
+
+**What was generated** (`perf/results/dataset_v1/benign_cli/`, git-ignored: `scripts/`, `manifest.tsv`,
+`runs/`, `rows_cli.csv`, `score_cli.txt`):
+
+- Sizes: the rows' light/medium/heavy counts are reproduced by inputs of 1, 16 and 64 MiB of the dataset
+  generator's periodic pattern `(i*37+1) % 256`, read in each tool's block size (strace on PC1: b2sum
+  78/558/2094 against the rows' 62/542/2078, gzip 100/-/2116 against 66/547/2086, bzip2 336/4180 against
+  300/4253, cksum 1070 against 1054, base64 463/6419 against 428/6383, cmp 8256/32832 against 8236/32814,
+  xz 8342 against 8356, tar 13356 against 12670; `busybox sleep` 17 against the null rows' 18).
+  `make_fixtures.py` writes them, plus a copy for cmp, a tree for tar/rsync/zip, a zip for unzip, a git
+  repo and a 351-byte index page.
+- `bin/null_static` (static C, does nothing for 30 s) and `busybox sleep 30` as the null program.
+  `bin/outto FILE PROG ARGS` (static C: opens FILE as stdout and execs PROG; 3 calls plus the execve)
+  stands in for the dataset runner's stdout redirection, since the launcher runs the command without a
+  shell.
+- The same programs as static binaries where busybox has them (md5sum, sha256sum, gzip, bzip2, wc, cmp,
+  tar, wget), the dataset's amd64_static mode; everything else is Ubuntu 20.04's dynamic build.
+- Services on PC2 behind port 140: `servers.py` (HTTP 8089, the 351 B page), `openssl s_server` on 8443
+  (self-signed), and `scripts/banners.py` with an FTP-like banner on 8021 and a telnet-like one on 8023.
+- 47 executions (`make_manifest.py` -> `manifest.tsv`; `run_cli.sh` drives the common collector command,
+  one dataset row each): 2 null, 30 GNU file tools, 7 network clients (curl x2, wget, openssl s_client,
+  telnet, ftp, ping), 8 busybox static.
+
+**Checks.** All 47: `HOSTMON_HEALTH` zeros, 40 rows with equal window starts, 0 overruns, 0 overloaded,
+CPU reports = connections. 42 ended with code 0; the null runs with -15 (they sleep 30 s); bzip2-heavy
+with -15 (64 MiB took longer than 20 s on this VM, 13,371 of about 17,000 calls; the guest finished);
+telnet with 1 (connection closed after EOF on stdin). Network rows against the dataset's: curl 12 pkts /
+941 B b->a against 12 / 746, wget 12 / 941 against 12 / 746, openssl 14 / 2,223 against 13 / 2,293, telnet
+7 / 219 against 7 / 206, ftp 11 / 443 against 13 / 488, ping 0 counted packets as in the dataset (ICMP).
+cmp-heavy was first run against a hard link of its own file (GNU cmp returns at once, 167 calls) and
+rerun against a copy; the table holds the rerun.
+
+**The programs match the dataset's.** Live host total against the dataset row of the same program and
+size (each includes its launcher: 134 calls here, 178 there):
+
+| program | live | dataset |
+|---|---|---|
+| b2sum light / medium / heavy | 184 / 664 / 2,200 | 240 / 720 / 2,256 |
+| gzip light / medium / heavy | 200 / 680 / 2,216 | 244 / 725 / 2,264 |
+| bzip2 light / medium | 435 / 4,279 | 478 / 4,431 |
+| base64 light / medium / heavy | 562 / 6,518 / 25,574 | 606 / 6,561 / 25,618 |
+| cksum heavy, wc medium, sum light | 1,176 / 1,174 / 408 | 1,232 / 1,236 / 465 |
+| cmp medium / heavy | 8,363 / 32,939 | 8,414 / 33,009 |
+| xz heavy, tar heavy | 8,442 / 13,463 | 8,534 / 12,848 |
+| curl / wget / openssl | 682 / 317 / 323 | 352 / 342 / 395 |
+| telnet / ftp / ping | 283 / 320 / 257 | 235 / 251 / 215 |
+
+The file tools differ by the prologue (44 calls) and the dynamic loader. zip, unzip, git-heavy, rsync and
+sort were built here with other inputs than the dataset's and differ more (2,378 against 28,309; 1,324
+against 20,454; 424 against 10,492; 14,076 against 33,001; 16,787 against 13,006).
+
+**Scores** (`score.py perf/results/dataset_v1/benign_cli/rows_cli.csv`, verbatim):
+
+```
+execution                          category          host  network  hybrid  in range   furthest outside (value vs dataset range)
+null-static-glibc-amd64_static     null              0.71     0.39    0.71  163/235    host_total_syscalls_total__max 117 vs [196, 196], host_total_syscalls_total__sum 117 vs [196, 196], host_max_run_length_max__sum 12 vs [54, 54]
+null-busybox-sleep-amd64_static    null              0.71     0.39    0.71  163/235    host_total_syscalls_total__max 119 vs [196, 196], host_total_syscalls_total__sum 119 vs [196, 196], host_max_run_length_max__sum 12 vs [54, 54]
+coreutils-b2sum-light-amd64_dynami benign            0.66     0.39    0.65  213/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.371 vs [2.342, 2.788], host_first100_unique_max__std 4.371 vs [2.342, 3.591]
+coreutils-b2sum-medium-amd64_dynam benign            0.23     0.39    0.23  225/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.371 vs [2.342, 2.788], host_first100_unique_max__std 4.371 vs [2.342, 3.591]
+coreutils-b2sum-heavy-amd64_dynami benign            0.23     0.39    0.22  225/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.371 vs [2.342, 2.788], host_first100_unique_max__std 4.371 vs [2.342, 3.591]
+coreutils-md5sum-heavy-amd64_dynam benign            0.23     0.39    0.22  225/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.371 vs [2.342, 2.788], host_first100_unique_max__std 4.371 vs [2.342, 3.591]
+coreutils-sha256sum-medium-amd64_d benign            0.23     0.39    0.23  225/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.371 vs [2.342, 2.788], host_first100_unique_max__std 4.371 vs [2.342, 3.591]
+coreutils-cksum-heavy-amd64_dynami benign            0.22     0.39    0.23  225/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.371 vs [2.342, 2.788], host_first100_unique_max__std 4.371 vs [2.342, 3.591]
+coreutils-sum-light-amd64_dynamic  benign            0.29     0.39    0.35  225/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.371 vs [2.342, 2.788], host_first100_unique_max__std 4.371 vs [2.342, 3.591]
+coreutils-wc-medium-amd64_dynamic  benign            0.22     0.39    0.23  225/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.371 vs [2.342, 2.788], host_first100_unique_max__std 4.371 vs [2.342, 3.591]
+coreutils-od-light-amd64_dynamic   benign            0.29     0.39    0.32  217/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.375 vs [2.342, 2.788], host_first100_unique_max__std 4.375 vs [2.342, 3.591]
+coreutils-sort-heavy-amd64_dynamic benign            0.22     0.39    0.19  229/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.37 vs [2.342, 2.788], host_first100_unique_max__max 28 vs [15, 23]
+coreutils-base64-light-amd64_dynam benign            0.29     0.39    0.32  218/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.371 vs [2.342, 2.788], host_first100_unique_max__std 4.371 vs [2.342, 3.591]
+coreutils-base64-medium-amd64_dyna benign            0.27     0.39    0.30  218/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.371 vs [2.342, 2.788], host_first100_unique_max__std 4.371 vs [2.342, 3.591]
+coreutils-base64-heavy-amd64_dynam benign            0.27     0.39    0.29  219/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.377 vs [2.342, 2.788], host_first100_unique_max__std 4.377 vs [2.342, 3.591]
+gzip-light-amd64_dynamic           benign            0.60     0.39    0.62  215/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.371 vs [2.342, 2.788], host_first100_unique_max__std 4.371 vs [2.342, 3.591]
+bzip2-light-amd64_dynamic          benign            0.27     0.39    0.25  225/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.371 vs [2.342, 2.788], host_first100_unique_max__std 4.371 vs [2.342, 3.591]
+gzip-medium-amd64_dynamic          benign            0.22     0.39    0.23  225/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.371 vs [2.342, 2.788], host_first100_unique_max__std 4.371 vs [2.342, 3.591]
+bzip2-medium-amd64_dynamic         benign            0.37     0.39    0.33  223/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.353 vs [2.342, 2.788], host_rare_syscall_ratio_max__active_windows 6 vs [1, 4]
+gzip-heavy-amd64_dynamic           benign            0.25     0.39    0.25  223/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.37 vs [2.342, 2.788], host_first100_unique_max__max 28 vs [15, 23]
+bzip2-heavy-amd64_dynamic          benign            0.43     0.39    0.38  198/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_rare_syscall_ratio_mean__active_windows 16 vs [1, 4], host_rare_syscall_ratio_max__active_windows 16 vs [1, 4]
+xz-utils-xz-heavy-amd64_dynamic    benign            0.25     0.39    0.22  228/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.366 vs [2.342, 2.788], host_first100_unique_max__max 28 vs [15, 23]
+lz4-heavy-amd64_dynamic            benign            0.66     0.39    0.72  211/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.371 vs [2.342, 2.788], host_first100_unique_max__std 4.371 vs [2.342, 3.591]
+diffutils-cmp-medium-amd64_dynamic benign            0.25     0.39    0.24  221/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.371 vs [2.342, 2.788], host_first100_unique_max__std 4.371 vs [2.342, 3.591]
+tar-heavy-amd64_dynamic            benign            0.33     0.39    0.28  213/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.371 vs [2.342, 2.788], host_first100_unique_max__std 4.371 vs [2.342, 3.591]
+zip-heavy-amd64_dynamic            benign            0.22     0.39    0.21  227/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.37 vs [2.342, 2.788], host_first100_unique_max__max 28 vs [15, 23]
+unzip-heavy-amd64_dynamic          benign            0.22     0.39    0.26  221/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.371 vs [2.342, 2.788], host_first100_unique_max__std 4.371 vs [2.342, 3.591]
+rsync-light-amd64_dynamic          benign            0.67     0.39    0.78  218/235    host_first100_unique_mean__max 19.33 vs [15, 17.33], host_first100_unique_max__std 4.371 vs [2.342, 3.591], host_first100_unique_max__max 28 vs [15, 23]
+rsync-heavy-amd64_dynamic          benign            0.63     0.39    0.69  217/235    host_first100_unique_mean__max 20.33 vs [15, 17.33], host_first100_unique_mean__std 3.175 vs [2.342, 2.788], host_first100_unique_max__std 4.371 vs [2.342, 3.591]
+git-light-amd64_dynamic            benign            0.66     0.39    0.70  213/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.371 vs [2.342, 2.788], host_first100_unique_max__std 4.371 vs [2.342, 3.591]
+git-heavy-amd64_dynamic            benign            0.73     0.39    0.59  228/235    host_first100_unique_mean__std 4.928 vs [2.342, 2.788], host_first100_unique_mean__max 28 vs [15, 17.33], host_first50_unique_mean__std 3.216 vs [0.7806, 1.873]
+curl-net-amd64_dynamic             benign            0.40     0.01    0.25  221/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.371 vs [2.342, 2.788], host_first100_unique_max__std 4.371 vs [2.342, 3.591]
+curl-net-2-amd64_dynamic           benign            0.41     0.17    0.29  225/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.371 vs [2.342, 2.788], host_first100_unique_max__std 4.371 vs [2.342, 3.591]
+wget-net-amd64_dynamic             benign            0.67     0.01    0.39  217/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.371 vs [2.342, 2.788], host_first100_unique_max__std 4.371 vs [2.342, 3.591]
+openssl-net-amd64_dynamic          benign            0.66     0.00    0.40  213/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.371 vs [2.342, 2.788], host_first100_unique_max__std 4.371 vs [2.342, 3.591]
+inetutils-telnet-net-amd64_dynamic benign            0.72     0.10    0.52  213/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.371 vs [2.342, 2.788], host_first100_unique_max__std 4.371 vs [2.342, 3.591]
+inetutils-ftp-net-amd64_dynamic    benign            0.80     0.21    0.53  209/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.371 vs [2.342, 2.788], host_first100_unique_max__std 4.371 vs [2.342, 3.591]
+inetutils-ping-net-amd64_dynamic   benign            0.68     0.39    0.75  221/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.371 vs [2.342, 2.788], host_first100_unique_max__std 4.371 vs [2.342, 3.591]
+busybox-md5sum-light-amd64_static  benign            0.45     0.39    0.44  221/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.371 vs [2.342, 2.788], host_first100_unique_max__std 4.371 vs [2.342, 3.591]
+busybox-sha256sum-medium-amd64_sta benign            0.37     0.39    0.29  221/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.371 vs [2.342, 2.788], host_first100_unique_max__std 4.371 vs [2.342, 3.591]
+busybox-gzip-heavy-amd64_static    benign            0.22     0.39    0.22  227/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.37 vs [2.342, 2.788], host_first100_unique_max__max 28 vs [15, 23]
+busybox-bzip2-medium-amd64_static  benign            0.70     0.39    0.52  224/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.386 vs [2.342, 2.788], host_rare_syscall_ratio_max__active_windows 9 vs [1, 4]
+busybox-wc-heavy-amd64_static      benign            0.42     0.39    0.30  221/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.37 vs [2.342, 2.788], host_first100_unique_max__max 28 vs [15, 23]
+busybox-cmp-medium-amd64_static    benign            0.37     0.39    0.28  221/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.371 vs [2.342, 2.788], host_first100_unique_max__std 4.371 vs [2.342, 3.591]
+busybox-tar-heavy-amd64_static     benign            0.68     0.39    0.71  209/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.371 vs [2.342, 2.788], host_first100_unique_max__std 4.371 vs [2.342, 3.591]
+busybox-wget-net-amd64_static      benign            0.65     0.00    0.42  203/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.371 vs [2.342, 2.788], host_first100_unique_max__std 4.371 vs [2.342, 3.591]
+diffutils-cmp-heavy-amd64_dynamic  benign            0.31     0.39    0.25  213/235    host_first100_unique_mean__max 28 vs [15, 17.33], host_first100_unique_mean__std 4.371 vs [2.342, 2.788], host_first100_unique_max__std 4.371 vs [2.342, 3.591]
+probability of malicious from detectors trained on all 240 dataset rows (0.5 = threshold)
+```
+
+Reading: the host detector is below 0.5 for 30 of the 47 rows, the hybrid for 33, the network detector
+for all 47 (0.39 is its value for a row without traffic; the network clients get 0.00-0.21). Every medium
+and heavy file tool scores 0.22-0.43 on the host side, curl 0.40 and 0.41, with 213-229 of the 235 features
+inside the benign range. Still at or above 0.5 on the host side: the two null runs (0.71) and 15 short
+executions of 117-682 calls: b2sum-light 0.66, gzip-light 0.60, lz4-heavy 0.66, git 0.66 and 0.73, rsync
+0.67 and 0.63, wget 0.67, openssl 0.66, telnet 0.72, ftp 0.80, ping 0.68, busybox bzip2-medium 0.70, busybox
+tar 0.68, busybox wget 0.65. On the hybrid side 14 remain (wget, openssl and busybox wget drop below 0.5;
+telnet 0.52, ftp 0.53 and ping 0.75 stay above).
+
+**What still differs: the launcher's own signature, on every row.** The features furthest outside are
+the same for 45 of the 47 rows: `host_first100_unique_mean__max` 28 against [15, 17.33] and its std; the
+null rows add `host_max_run_length_max__sum` 12 against 54. The first 100 calls of the cgroup are the
+launcher's (`bash -c 'exec "$@"'`), not the program's. The guest's bash (Ubuntu 24.04) made 178 calls with
+15 distinct syscalls among the first 100 and one run of 54 identical calls; PC1's bash 5.0.17 makes 134
+with 28 distinct and a longest run of 12. Every dataset benign row carries 15 and 54 (the minimum of
+`host_max_run_length_max__max` over the 105 rows is 54), every live row 28 and 12. A program of thousands
+of calls dilutes that and scores benign; one of a few hundred does not, and forests that saw 15 and 54 on
+every benign row lean to malware for it. The pairs in the table above show the programs themselves agree.
+
+**What follows.** With programs of the dataset's population, the switch, the monitor and the dataset
+profile produce rows the published detectors accept; the residual is the launch environment, not the
+measurement. Options for the VM side, not done here: run the live launcher with the guest's bash and libc
+(copy `/bin/bash`, its loader and libc from the Ubuntu 24.04 guest and start them through that loader), or
+collect on an Ubuntu 24.04 host; or exclude the prologue on both sides (19.5.6 decided otherwise). The
+Python workloads of section 2 are a different population and do not measure the detectors.
+
+State after this part: the services on PC2 stopped and their files removed; `enp5s0` down; the fixture
+files removed (`make_fixtures.py` regenerates them in seconds); scripts, manifest, per-run CSVs and logs,
+`rows_cli.csv` and `score_cli.txt` stay in `perf/results/dataset_v1/benign_cli/`.
