@@ -826,7 +826,11 @@ class BatchedRegisterReader(object):
             sync_s = 0.0          # nothing to read: a clear needs no snapshot
         elif snapshot == "sync":
             try:
+                # This host's clock when the register snapshot began and ended: a window's register
+                # values are cut somewhere in this interval (RUNBOOK 19.6), not at its boundary.
+                timing["reader_t_sync_start"] = time.time()
                 self._sync_all(sync_tables, timing)
+                timing["reader_t_sync_end"] = time.time()
                 ok = True
             except Exception as error:
                 log("register sync failed (%s); reading from hardware" % error)
@@ -989,6 +993,7 @@ def serve(args):
         line = sys.stdin.readline()
         if not line:
             break
+        t_recv = time.time()
         line = line.strip()
         if not line:
             continue
@@ -1009,6 +1014,10 @@ def serve(args):
             payload = reader.read_window(req.get("indexes") or [], req.get("dst_indexes") or [],
                                          req.get("clear_if_unchanged") or {}, req.get("snapshot", "sync"),
                                          req.get("source", "batched gRPC"), req.get("clear_indexes") or [])
+            # When the request arrived and the reply left, on this host's clock: with the collector's
+            # send and receive times they give the clock offset between the two hosts (RUNBOOK 19.6).
+            payload.setdefault("timing", {})["reader_t_recv"] = t_recv
+            payload["timing"]["reader_t_send"] = time.time()
             out = json.dumps(payload)
         except Exception as error:
             out = json.dumps({"error": "%s: %s" % (type(error).__name__, error)})
