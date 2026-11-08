@@ -1355,3 +1355,134 @@ answers to 19.3 decide it. Paths in `dataset-construction/` are in the dataset r
     expected at 0.5 s (1.5 s TTL).
 - **Replays through the switch** of any cohort capture added to the repository, compared window
   by window with an offline extractor.
+
+## 19.5 Answers from the VM side (2026-11-07)
+
+Written on the lab workstation from the collections' own metadata, the release repository
+(`p4-ebpf-malware-detection`), and the offline tests of 2026-11-04 to 2026-11-07. The decisions
+below were taken by the author.
+
+### 19.5.1 Which trained model counts
+
+- The model 19.1 describes (`dataset-construction/src/live_arm_inference.py`,
+  `train_shared_arm_classifier.py`, the 2026-10-15 run under
+  `data/malware/revision4/family-heldout-balanced-224-v1-20261014/models/`) is the shared-arm
+  classifier: 9 runtime network counters and 9 host counters, 5 statistics each, plus 2
+  availability flags, trained on the 224-malware / 138-benign cohort (362 executions, 57 groups)
+  whose benign controls are shell scripts. The thesis lists it as future work only and never
+  reports it as a result. Do not evaluate against it.
+- The thesis and paper detectors use 29 P4 window features x 5 = 145 network columns and 18 ADFA
+  host features x 5 = 90 host columns, from the same 0.5 s windows. Definitions: release
+  `features/switch_model.py` and `features/host_model.py`; data: `dataset/features.csv`
+  (240 rows); `evaluation/heldout.py` and `evaluation/combined.py` reproduce Tables IV and V.
+- Against that contract, 19.1's "training differs from live" list reads:
+
+  | 19.1 says training measured | thesis contract |
+  |---|---|
+  | two unidirectional flows per connection | no: one bidirectional flow per (protocol, sorted endpoints), direction from its first packet, as on the switch |
+  | all frames | no: IPv4 TCP/UDP first fragments only, as on the switch |
+  | direction from the guest's send/receive | no: first packet |
+  | whole frames instead of the IPv4 length | yes: the dataset counts Ethernet frame bytes; the switch counts IPv4 `totalLen` (14 B per packet less, and no padding under 60 B) |
+
+  Two differences 19.1 does not list, both measured in release `validation/RESULTS.md` (13 of 13
+  count features equal on 8 captures): the switch merges flows that collide in a CRC-16 bucket
+  (the extractor keeps an exact table), and the switch's 32-bit ns clock wraps at 4.295 s
+  (durations alias).
+- The host metrics listed as "cannot be summed into longer windows" are the shared-arm model's.
+  The thesis host features are recomputed from archived raw events at any window length (19.5.3).
+
+### 19.5.2 Q1: window and sample length
+
+From every cohort run's `run.json` (checked on all 240 dataset rows): `window_seconds` 0.5,
+`windows` 40, `timeout_seconds` 20.0, `observation_mode` "fixed", observation end minus sample
+start = 20.000 s, `p4_network_active_ttl_windows` 3, `telemetry_schema_version` 2026-10-24.21.
+The grid is anchored at `sample_started_wall_us` (whole microseconds): window k covers
+[anchor + 0.5k s, anchor + 0.5(k+1) s). The two captures in `live_test/captures/` last 22-23 s
+because they include the pre- and post-window capture probes and the 1 s drain.
+
+### 19.5.3 Q2: raw eBPF events
+
+Kept. Each run archives `syscall_events.csv` (`timestamp_ns, window_id, pid, tid, comm, event,
+detail=id=N`), `ebpf_events.csv` (named events) and `exec_events.csv` (exec successes and
+returns). On 2026-11-06 all 240 runs were re-binned at 1, 2, 5 and 10 s with the release
+`host_model.py`, and the network side recomputed from the captures (TTL 3 windows at every
+length). At 0.5 s the rebuild equals the stored telemetry in every window of every run (0 cells
+off). Grouped CV, 10 fold assignments (seeds 42 and 0-8), balanced accuracy:
+
+| window | host | network | hybrid |
+|---|---|---|---|
+| 0.5 s | .784 | .756 | .823 |
+| 1 s | .782 | .753 | .815 |
+| 2 s | .780 | .756 | .816 |
+| 5 s | .795 | .763 | .826 |
+| 10 s | .789 | .772 | .836 |
+
+Option C's cost is already paid: 1 s windows change nothing, host or network.
+
+### 19.5.4 Q3: does the offline extractor follow the switch's rules
+
+| switch rule | release `switch_model.py` | to make it switch-exact |
+|---|---|---|
+| IPv4 TCP/UDP only | same | - |
+| one bucket per connection, direction from the first packet | same | - |
+| rates over the nominal window | same | - |
+| IPv4 total length | Ethernet frame (`len(frame)`), padding included | count the IPv4 total length; the study extractor `analyze_p4_pcap_ablation.py` already has `byte_layer="ipv4"` |
+| CRC-16 bucket, collisions merged | exact 5-tuple table | key by `crc16_arc` from release `p4/control_plane/flow_index.py` (equal to the compiled hash bit for bit); only the 15 DoS runs and one scanner collide (cohort p99: 9 active flows per 0.5 s window) |
+| 32-bit ns timestamps | unbounded | mask first and last timestamps to 32 bits |
+
+A's extractor is therefore three small changes, then a recompute of the 240 rows and a retrain.
+
+### 19.5.5 Q4 and the decision
+
+- What the thesis claims today: the sensors are validated live (release `validation/`,
+  2026-11-04); the detection numbers are offline; no live detection number is claimed; the
+  three-arm pipeline is future work. A live detection result is an addition, not a repair.
+- **Decision: option A at 1 s windows** (A and C together), **B once as a demonstration without
+  numbers**, D not needed (its software rules are the extractor that A validates on hardware).
+  Reasons: 1 s is the cadence Sections 15-18 proved (exact benign sums, 0 overruns at budget 0.7,
+  overload mode for floods, empty table afterwards); 0.5 s is unmeasured and tight (19.4: about
+  430 buckets against bulk2000's 250-300); retraining at 1 s costs nothing (19.5.3); host
+  features at 1 s are exact rebins. If 0.5 s is insisted on later, run 19.4's capacity test first.
+
+### 19.5.6 The launch prologue: excluded on both sides
+
+- Every dataset row's host features include the collector's launch wrapper,
+  `/bin/bash -c 'exec "$@"' sample-launch <program> <args>` (stdin `/dev/null`, new session,
+  cwd = a private workspace). Bash's startup before it execs the target is exactly 178 system
+  calls, with one run of 54 identical calls, all in window 0: host total = the program's own calls
+  + 178 (null rows 196 = 18 + 178). It is class-independent. The 2026-11-04 ablation removed it
+  (root pid, timestamp before the second root exec success in `exec_events.csv`) and recomputed
+  the 90 host columns: held-out host BA 0.929 -> 0.929 (same confusion matrix), grouped CV host
+  0.632 -> 0.748 and hybrid 0.718 -> 0.807, combined host 0.784 -> 0.832 and hybrid
+  0.823 -> 0.866. The scripts and the 240-row `features_launcherfree.csv` are on the lab
+  workstation (`additional-study-review-20261022/launcher-ablation/`), not in a repository yet.
+- **Decision:** for A's comparison and for any live run, host features start at the target's own
+  exec, on both sides. Recorded rows: drop the root's calls before its exec success (the window
+  grid stays anchored at launch). Live rows: the monitored process joins the cgroup immediately
+  before it execs the target, and nothing else runs in the cgroup first. Train the models used
+  for A on the prologue-free rows. The published tables stay as collected; the thesis reports the
+  ablation.
+- Consequence for `hybrid_collector.py --hostmon-cgroup`: `cgroup_wrapped_command` runs
+  `bash -c 'echo $$ > cgroup.procs && exec "$1" -c "$2"'`, so the monitored lineage starts with
+  the cgroup write and a second bash parsing a command string: a prologue that matches neither the
+  dataset's 178 calls nor the validation's `collect.py`. Change it to join the cgroup and then
+  `exec "$@"` with the program and its arguments as argv (or cut at the exec boundary in
+  post-processing), before any A or B run.
+
+### 19.5.7 Plan
+
+1. VM side: the switch-exact extractor (19.5.4); recompute the 240 network rows at 1 s (20
+   windows, TTL 3 windows) and the prologue-free host rows at 1 s; retrain; report grouped CV
+   mean and sd over the 10 fold assignments as the offline reference.
+2. PC1: replay the cohort captures through the Wedge at `--window-sec 1`, TTL 3,
+   `--clear-expired`, immediate-mode report capture, with the window grid anchored at each run's
+   `sample_started_wall_us` (the first frame is the pre-window probe about 1 s before the anchor;
+   offset the collector's window 0 accordingly). Compare the 29 features window by window with the
+   switch-exact extractor: counts, bytes, durations and collisions should now all be exact.
+3. Score the switch windows together with the same run's prologue-free eBPF windows using the
+   retrained models, and compare the decisions with the offline rows.
+4. VM: one live run with the Tofino model (`--profile model`) as the demonstration; no numbers.
+
+Data: the 204 CLI-benign and malware captures total 25 MB (largest 24 MB); the flood21
+collection's 41 captures total 923 MB (largest 372 MB, `bulkup_700`), 36 of them in the pool.
+Replays carry packets only; destinations are 10.0.0.x and the floods' random scan targets.
