@@ -640,8 +640,12 @@ class VariantTests(unittest.TestCase):
             path = os.path.join(d, "timing.jsonl")
             log = hc.make_timing_logger("batched", path)
             with contextlib.redirect_stdout(io.StringIO()) as out:
-                log(3, payload, 10.0, 10.25, 1, 0)
+                log(3, payload, 10.0, 10.25, 1, 0, window_end=9.99)
             record = json.loads(Path(path).read_text().splitlines()[-1])
+        # absolute times for the cut-time comparison (RUNBOOK 19.6)
+        self.assertEqual((record["t_window_end"], record["t_read_start"], record["t_read_end"]), (9.99, 10.0, 10.25))
+        clock = record["clock"]
+        self.assertLessEqual(clock["reader_t_sync_start"], clock["reader_t_sync_end"])
         self.assertEqual((record["window"], record["reader"], record["active"], record["cleared"]), (3, "batched", 1, 1))
         self.assertAlmostEqual(record["wall_ms"], 250.0)
         self.assertEqual(record["rpcs"]["read_rpcs"], 14)
@@ -674,6 +678,11 @@ class ServeProtocolTests(unittest.TestCase):
             self.assertEqual(len(ready["tables"]), 14)
             payload = proc.read([KNOWN_IDX], dst_indexes=[1], clear_if_unchanged={KNOWN_IDX: 1}, timeout=30)
             self.assertEqual(payload["rows"][0]["pkts"], 100)
+            # one host here, so the six clock readings are in order (RUNBOOK 19.6)
+            t = payload["timing"]
+            order = [t[k] for k in hc.CLOCK_KEYS]
+            self.assertEqual([t["collector_t_sent"], t["reader_t_recv"], t["reader_t_sync_start"],
+                              t["reader_t_sync_end"], t["reader_t_send"], t["collector_t_reply"]], sorted(order))
             self.assertEqual(payload["cleared"], [])
             self.assertEqual(payload["dst_rows"], [{"idx": 1, "new_conn": 0, "pipes": []}])
             payload = proc.read_with_retries([KNOWN_IDX], 1, retries=0, timeout=30,

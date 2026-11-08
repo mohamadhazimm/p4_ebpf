@@ -1486,3 +1486,90 @@ A's extractor is therefore three small changes, then a recompute of the 240 rows
 Data: the 204 CLI-benign and malware captures total 25 MB (largest 24 MB); the flood21
 collection's 41 captures total 923 MB (largest 372 MB, `bulkup_700`), 36 of them in the pool.
 Replays carry packets only; destinations are 10.0.0.x and the floods' random scan targets.
+
+## 19.6 PC1's notes on the plan, and the replay driver (2026-11-08)
+
+Written on PC1 for the VM side after 19.5. PC1 agrees with 19.5.5: option A at 1 s, B once as a
+demonstration. The user decided that the floods are not replayed on hardware, so the 36 flood21
+runs stay offline only (PC1's disk could not hold them anyway: 328 MB free). Raw data is in the
+git-ignored `perf/results/replay_v1_20261108_061848/` (README with every number).
+
+### 19.6.1 What step 2 (19.5.7) can expect, window by window
+
+1. **The registers are cut after the window ends.**
+   - A window's register values are taken in the snapshot that follows its end. On bulk2000 it
+     starts 5-7 ms after the boundary and lasts ~35 ms (max 37.6). Packets sent in that interval
+     count in the window that just ended.
+   - CPU reports are cut by their arrival on PC1, a few ms after the packet with
+     `--immediate-mode`.
+   - Measured with the replay on the grid (19.6.3): the switch's per-window packet counts equal a
+     nominal-boundary count in 13 of 21 busy windows and differ by 3-7 packets (at most 0.6%) in
+     the others. Totals are exact.
+   - So expect small but non-zero per-window differences in counts and in features built from
+     them. The extractor can reproduce them exactly by cutting at the logged snapshot times
+     (19.6.2).
+2. **The replay must keep the capture's timing.**
+   - tcpreplay times each frame relative to the previous one. On PC1 it was 254 ms late after
+     bulk2000's 22 s (156 ms with `-K`; 2.7-2.9 s with `--timer=nano` or `select`). That would put
+     the network windows out of step with the run's recorded eBPF windows.
+   - The driver replays with `live_test/replay_absolute.py` instead: frame i goes out at
+     start + (t_i - t_0). Timing error median 0.09 ms, max 8.4 ms; anchor alignment error
+     0.02 ms.
+   - Compare against what PC1 actually sent: the driver records it as `tx.pcap`.
+3. **The collector's rules, not only the switch's.** The extractor must also reproduce:
+   - the active set: a bucket counts from the window of its CPU report or of a change in its
+     packet count, for 3 windows;
+   - the idle clear after 3 unchanged reads, after which the bucket's next packet starts a new
+     flow (new first timestamp, new report);
+   - the unconditional clear of expired buckets.
+
+   Durations are the modular difference of the 32-bit timestamps
+   (`hybrid_collector.py:1650-1652`). The 32-bit masking in 19.5.4 matches if the extractor also
+   subtracts modulo 2^32.
+4. **Overload:** at 1 s windows, above roughly 1,000 active buckets the read is budgeted, and a
+   window with `net_overload` 1 can match only on the report-based features and the totals. Only
+   floods get there, and they are not replayed.
+5. **The feature mapping:** the collector's CSV has 30 feature-like `net_*` columns
+   (`net_flow_count_seen` ... `net_dir_valid_count`). Mapping them to the 29 thesis features
+   (release `features/switch_model.py`) needs those definitions, which are not on PC1.
+
+### 19.6.2 New: cut times in the timing log
+
+- **On the switch's clock:** the batched reader reports when a request arrived, when its
+  register snapshot began and ended, and when the reply left (`reader_t_recv`,
+  `reader_t_sync_start`, `reader_t_sync_end`, `reader_t_send`).
+- **On the collector's clock:** `BatchedReaderProcess` adds when the request was sent and the
+  reply received (`collector_t_sent`, `collector_t_reply`).
+- **In the log:** the timing log keeps all six per window under `clock`, with `t_window_end`,
+  `t_read_start` and `t_read_end`.
+- **The clock offset** follows from each read (NTP's formula). From the reads with the shortest
+  round trip (0.9-1.2 ms on PC1) it is known to about ±0.6 ms.
+- **The window origin:** the collector exports it to the scenario as `HYBRID_T0`.
+
+### 19.6.3 New: the replay driver
+
+`sudo python3 live_test/replay_capture.py CAPTURE --out DIR --anchor-offset A [--align-window K]`:
+- **Setup:** it records what PC1 sends, runs the collector with `--profile switch`, and replays
+  with `replay_absolute.py`, so that the run's anchor (A = `sample_started_wall_us` minus the
+  first frame's time) falls on the start of collector window K (default 2). Collector window
+  K + j is then dataset window j.
+- **Outputs:** `windows.csv`, `timing.jsonl`, `collector.log`, `tx.pcap` and `summary.json`.
+  The summary holds the sha256, t0, the alignment error, the replay timing error and the clock
+  offset, and per window its start, its snapshot interval on PC1's clock and the self-check.
+- **The self-check** compares each window's switch packet and byte counts with the packets sent
+  that are certainly or possibly in it (the bounds are in the script's docstring).
+- **On bulk2000** (anchor offset assumed 1.0 s, since its `run.json` is not on PC1): 23 of 23
+  windows inside the bounds; packets 24,008 and bytes 2,184,448, both equal to what was sent.
+
+### 19.6.4 What PC1 needs for step 2
+
+- **The captures:** the 204 non-flood captures (25 MB) in the repository, like
+  `live_test/captures/`, each with:
+  - its run id, to pair it with the eBPF windows;
+  - `sample_started_wall_us` and the capture's first frame time, or their difference.
+- **The mapping** of the 29 features to the collector's columns (19.6.1, item 5), or the release's
+  `features/switch_model.py`.
+- **The comparison:** either the switch-exact extractor on PC1, or the VM side runs it on the
+  driver's outputs (per capture: `windows.csv`, `timing.jsonl`, `tx.pcap`, `summary.json`).
+- **Not done on PC1:** the cgroup prologue change of 19.5.6, which concerns live runs, not
+  replays.

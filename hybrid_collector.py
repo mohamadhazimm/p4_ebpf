@@ -747,11 +747,19 @@ class BatchedReaderProcess:
                    "clear_if_unchanged": {str(int(k)): int(v) for k, v in (clear_if_unchanged or {}).items()},
                    "clear_indexes": [int(i) for i in (clear_indexes or [])],
                    "snapshot": snapshot, "source": source}
+        t_sent = time.time()
         self._proc.stdin.write(json.dumps(request) + "\n")
         self._proc.stdin.flush()
-        reply = json.loads(self._get_line(timeout))
+        line = self._get_line(timeout)
+        t_reply = time.time()
+        reply = json.loads(line)
         if "error" in reply:
             raise RuntimeError(f"batched reader: {reply['error']}")
+        if isinstance(reply.get("timing"), dict):
+            # This host's clock around the request; with the reader's reader_t_recv/reader_t_send they
+            # map the reader's snapshot times (reader_t_sync_start/end) onto this clock (RUNBOOK 19.6).
+            reply["timing"]["collector_t_sent"] = t_sent
+            reply["timing"]["collector_t_reply"] = t_reply
         return reply
 
     def read_with_retries(self, indexes: List[int], window: int, retries: int = 0,
@@ -797,6 +805,11 @@ class BatchedReaderProcess:
                 pass
 
 
+# Absolute times a batched read reports (RUNBOOK 19.6); the timing log keeps them per window.
+CLOCK_KEYS = ("collector_t_sent", "collector_t_reply", "reader_t_recv", "reader_t_sync_start",
+              "reader_t_sync_end", "reader_t_send")
+
+
 def make_timing_logger(reader_name: str, path: Optional[str] = None) -> Callable[..., None]:
     """Per window: active-set size and the time spent in the register sync, the
     reads and the clears (from the reader's payload) next to the wall time of
@@ -804,7 +817,7 @@ def make_timing_logger(reader_name: str, path: Optional[str] = None) -> Callable
     JSON object per window is appended to that file."""
 
     def log(window: int, payload: Dict[str, Any], read_start: float, read_end: float,
-            n_active: int, n_dst: int) -> None:
+            n_active: int, n_dst: int, window_end: Optional[float] = None) -> None:
         wall_ms = (read_end - read_start) * 1000.0
         timing = payload.get("timing") or {}
         sync_s = payload.get("sync_s") or 0.0
@@ -821,7 +834,11 @@ def make_timing_logger(reader_name: str, path: Optional[str] = None) -> Callable
                   "clear_ms": round(clear_ms, 3), "wall_ms": round(wall_ms, 3), "overhead_ms": round(overhead_ms, 3),
                   "us_per_bucket": round(wall_ms * 1000.0 / n_active, 1) if n_active else None,
                   "cleared": len(payload.get("cleared") or []), "errors": len(payload.get("errors") or []),
-                  "rpcs": rpcs}
+                  "rpcs": rpcs,
+                  # absolute times (RUNBOOK 19.6): the window's end and the read on the collector's clock,
+                  # and the batched reader's request, snapshot and reply times on the reader's clock
+                  "t_window_end": window_end, "t_read_start": read_start, "t_read_end": read_end,
+                  "clock": {k: timing[k] for k in CLOCK_KEYS if k in timing}}
         print(f"[TIMING] window {window}: reader={reader_name}{'/' + parser if parser else ''} "
               f"active={n_active} dst={n_dst} "
               f"sync={sync_ms:.1f} ms read={read_ms:.1f} ms clear={clear_ms:.1f} ms wall={wall_ms:.1f} ms "
@@ -1378,7 +1395,7 @@ def collect_windows_live(
                               dst_indexes=read_dst_idxs, **extra)
         read_end = clk.time()
         if timing_log is not None:
-            timing_log(w, payload, read_start, read_end, len(read_idxs), len(read_dst_idxs))
+            timing_log(w, payload, read_start, read_end, len(read_idxs), len(read_dst_idxs), window_end=win_end_abs)
         wall_ms = (read_end - read_start) * 1000.0
         cost.update(len(read_idxs), len(payload.get("cleared") or []), payload_timing_ms(payload, wall_ms),
                     n_dst=len(read_dst_idxs))
@@ -2118,12 +2135,14 @@ def main() -> None:
             send_hostmon_start(host_proc, start_mono)
             time.sleep(max(0.0, start_mono - time.monotonic()))
             global_t0 = time.time()
+            os.environ["HYBRID_T0"] = repr(global_t0)   # the window origin, for the scenario (RUNBOOK 19.6)
             workload_proc = launch()
         else:
             print(f"[INFO] Starting HostMon with window_sec={args.window_sec}")
             host_proc = start_hostmon(args.hostmon, args.hostmon_log, args.window_sec)
             time.sleep(0.2)
             global_t0 = time.time()
+            os.environ["HYBRID_T0"] = repr(global_t0)   # the window origin, for the scenario (RUNBOOK 19.6)
             workload_proc = launch()
 
         if getattr(args, "profile", None) == "model":
