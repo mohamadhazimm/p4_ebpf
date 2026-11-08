@@ -1728,3 +1728,90 @@ Notes on the table:
 5. VM, before step 4 (the live demonstration): the cgroup change of 19.5.6. The monitored
    process joins the cgroup and then runs `exec "$@"`; post-processing cuts at the target's exec
    success, as for the recorded rows.
+
+## 19.8 From the lab workstation: the captures and the 1 s offline reference (2026-11-08)
+
+Written on the lab workstation, where the collections are, for PC1 and the VM side. Nothing from
+19.7.5 item 1 had reached either repository yet, so the packager was written here.
+
+### 19.8.1 The 77 captures (19.7.5 item 2)
+
+- **Where:** `live_test/captures/cohort/`, made by `live_test/package_cohort.py`. The folder's
+  README has every column and check, and the replay loop. Committed to this repository on
+  2026-11-08 together with the packager and this section: `git pull` on PC1 is enough.
+- **Contents:**
+  - 77 captures: 52 malware and 25 benign, 224,158 frames, 22 MB;
+  - `manifest.csv`, with 19.7.3's columns and a few more, in `features.csv` order, the Chaos run
+    last;
+  - `not_replayed.csv`, the other 127 runs.
+- **Done as 19.7.3 asks:** trimmed to [anchor, anchor + 20 s), IPv4 frames only, every byte the
+  switch does not read zeroed, lengths kept, TCP/UDP checksums recomputed.
+- **The anchor offset:** `anchor_offset_s` is the anchor minus the first kept frame, between -5.08
+  and -0.003 s. Pass it as `--anchor-offset`.
+- **Checks (all passed):**
+  - each original capture reproduces its `features.csv` row (145 network columns, release
+    `switch_model.py`, relative difference 1.7e-15);
+  - original and sanitized give the same features in every window at 1 s and 0.5 s, under the
+    switch rules and under `switch_model.py`;
+  - the 127 others are zero under the switch rules too;
+  - scapy: no non-zero byte after the transport header and every checksum valid;
+  - no HTTP request, `Host:` line or domain name is left.
+- **What each rule changes,** alone at 1 s, compared with `switch_model.py` at 1 s (961 busy windows
+  in all):
+
+  | rule | runs | windows | why |
+  |---|---|---|---|
+  | lengths | 77 | 961 | 14 B per packet less, no padding |
+  | parsing | 0 | 0 | the captures have no VLAN tags, IPv4 options or fragments |
+  | key | 1 | 20 | collisions, the Chaos run only |
+  | direction | 0 | 0 | no flow has sport = dport |
+  | time | 34 | 358 | durations alias past 4.295 s |
+  | idle | 26 | 126 | connections idle for 3 s or more restart as new flows |
+
+- **Overload:** only the Chaos run `d538053a...` (`expect_overload` 1): up to 16,422 active buckets
+  in a 1 s window, 30,449 buckets in all, 14,899 of them colliding. Next is Mirai `07146515...`
+  at 120 active buckets.
+- **The switch-exact model in the packager:** `package_cohort.SwitchRules` implements 19.7.2's six
+  rules (each switchable) and the collector's readout. With every rule off it equals
+  `switch_model.py` window by window on all 204 runs. Once the release's `--switch-exact` mode
+  exists, run both on these captures: two independent implementations that agree are the check.
+
+### 19.8.2 The 1 s offline reference (step 1)
+
+Study folder `additional-study-review-20261022/switch-exact-1s/` on the lab workstation:
+`build_rows.py`, `score_rows.py`, `run-20261108/`.
+
+- **Rows:** all 240, rebuilt from the raw runs.
+  - The gates first: each run reproduces its published row, network 1.7e-15 and host 1.8e-15.
+  - Network: the packager's switch rules at 1 s, TTL 3 windows.
+  - Host: the 0.5 s windows of `syscall_events.csv` paired into 1 s, without the root's calls
+    before its second exec success. That is 178 calls in each of the 240 runs, as 19.5.6 says.
+- **Per-window table for step 3:** `windows_1s_switch_prologuefree.csv` (20 windows x 240 runs, 29
+  network + 18 host features). For the 127 runs without TCP/UDP its network columns are zero.
+- **Scoring:** the release's `evaluation/combined.py` and `heldout.py`, unchanged. On the
+  published `features.csv` they reproduce Tables IV and V exactly.
+
+Results:
+
+| rows (1 s) | Table V BA: host / network / hybrid (10 fold assignments) | Table V AUC: hybrid | Table IV BA: host / network / hybrid | training grouped CV: host / network / hybrid |
+|---|---|---|---|---|
+| published, as collected | .782 / .753 / .815 | .866 | .911 / .750 / .926 | .618 / .747 / .699 |
+| switch rules, as collected | .782 / .754 / .814 | .864 | .911 / .750 / .926 | .618 / .747 / .699 |
+| published, prologue-free | .833 / .753 / .851 | .925 | .911 / .750 / .929 | .774 / .747 / .827 |
+| **switch rules, prologue-free** | **.833 ± .030 / .754 ± .018 / .848 ± .031** | **.924** | **.911 / .750 / .929** | **.774 / .747 / .827** |
+| (0.5 s, as published) | .784 / .756 / .823 | .866 | .929 / .750 / .926 | .632 / .747 / .718 |
+
+- **The switch's rules cost nothing:** network-only balanced accuracy .754 against .753, and the
+  network-only held-out decisions are the same (28/0/13/13).
+- **The prologue:** removing it raises host and hybrid, as in the 2026-11-04 ablation.
+- **The held-out host model at 1 s** has one false alarm more than at 0.5 s (23/5/0/26 against
+  24/4/0/26).
+- **Main row:** the last one (switch rules, prologue-free) is what step 3 compares against.
+- **Provisional:** this uses the packager's switch-exact model. Rerun it with the release's
+  `--switch-exact` once that exists.
+
+### 19.8.3 Still open
+
+- **The VM side (19.7.5 item 1):** `compare_replay.py`, and the release's `--switch-exact` mode.
+  The packager's `SwitchRules` can serve as `compare_replay.py`'s extractor until then.
+- **PC1:** step 2 on the 77 captures, Chaos last.
