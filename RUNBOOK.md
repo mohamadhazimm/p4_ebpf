@@ -1573,3 +1573,158 @@ git-ignored `perf/results/replay_v1_20261108_061848/` (README with every number)
   driver's outputs (per capture: `windows.csv`, `timing.jsonl`, `tx.pcap`, `summary.json`).
 - **Not done on PC1:** the cgroup prologue change of 19.5.6, which concerns live runs, not
   replays.
+
+## 19.7 The VM side's decisions on 19.6 (2026-11-08)
+
+Written on the VM for PC1 and for whoever runs step 1 where the collections are (the lab
+workstation). Sources: `hybrid_collector.py`, `batched_reader.py`, and the release repository
+(`p4/ingress*.p4`, `features/switch_model.py`, `validation/features_from_registers.py`,
+`dataset/features.csv`). The cohort's raw runs are not on the VM, so the per-run figures below
+come from `dataset/features.csv` (0.5 s windows, the published extractor).
+
+### 19.7.1 The feature mapping (19.6.1 item 5)
+
+- **Names:** the 29 thesis features are 29 of the collector's 30 `net_*` columns, with the same
+  names in the same order (`NET_ZERO`, `hybrid_collector.py:116-163`, against `FEATURES` in
+  `features/switch_model.py`). Drop `net_new_conn_dst_max`.
+- **One unit differs:** `net_flow_duration_mean` and `net_flow_duration_max` are nanoseconds in
+  the collector's CSV (`hybrid_collector.py:1667-1669`) and seconds in the thesis. Divide them by
+  1e9, as `validation/features_from_registers.py:53-57` does. The collector keeps writing ns,
+  since its tests and PC1's earlier runs use them.
+- **Everything else matches by definition:**
+  - rates use the nominal window;
+  - a ratio with a zero denominator is 0;
+  - `net_dir_valid_count` is the number of occupied buckets read, and every occupied bucket has
+    `dir_valid` 1;
+  - `net_flows_with_ab` and `net_flows_with_ba` come from the cumulative registers.
+- **The statistics per sample** (mean, max, sum, population std, active_windows) are taken over
+  dataset windows j = 0..19, which are collector windows K..K+19. The VM side computes them in
+  step 3.
+
+### 19.7.2 The switch-exact extractor: six rules, not three
+
+19.5.4 listed three changes. Reading the parser, the ingress program and `collect_windows_live`
+adds three more.
+
+| | the switch and the collector | `features/switch_model.py` |
+|---|---|---|
+| 1. lengths | IPv4 `totalLen` for bytes, min_len and max_len (`ingress_parser.p4:61`) | `len(frame)` |
+| 2. parsing | EtherType at byte 12 (no VLAN); the IPv4 header read as 20 bytes whatever its IHL; TCP or UDP at byte 34; no fragment check, so non-first fragments count, with "ports" taken from their payload (`ingress_parser.p4:51-80`) | VLAN tags skipped, IHL honoured, non-first fragments dropped |
+| 3. flow key | CRC-16 bucket (`flow_index.py`); colliding flows merge | exact 5-tuple |
+| 4. direction | each bucket keeps its first packet's (sport, dport). A packet is A->B if its ports equal those, B->A if they are swapped, and A->B otherwise (`ingress.p4:244-281`). Addresses are not compared, so a flow with sport == dport (53<->53, 123<->123) counts entirely as A->B | first endpoint (address, port) |
+| 5. time | low 32 bits of the switch's ns arrival clock; durations are (last - first) mod 2^32 | seconds, unbounded |
+| 6. idle clear | a bucket with no packet in windows s+1..s+3 is cleared after the read of window s+3 (`clear_idle_windows` 3, `hybrid_collector.py:1380-1385`). Its next packet starts a new flow, with new reference ports, first_ts, min/max and CPU report | a flow never ends: a C2 connection that is idle for 3 s keeps its first timestamp and its direction |
+
+Notes on the table:
+- **Correction to 19.5.1:** its "first fragments only, as on the switch" is wrong for the switch
+  (rule 2).
+- **Unchanged:** a bucket is active in windows s..s+3 after a packet in window s, which is 4
+  windows. Both sides test `w - last_seen <= 3` (`hybrid_collector.py:1306-1313`).
+- **Not modelled: the unconditional clear of expired buckets.** It runs only in two cases: when
+  a compare-and-clear loses a race with a packet inside the snapshot interval, or when a bucket
+  was skipped under overload. Windows where that can happen count as ambiguous (19.7.4).
+- **Step 1 trains on all six rules**, so the retrained models see what the switch delivers,
+  including durations that alias at 4.295 s.
+- **Where it goes:** a `--switch-exact` mode of `features/switch_model.py`, standard library
+  only. The default stays off, so the paper's tables still reproduce as published. The VM side
+  writes it next.
+
+### 19.7.3 The replay set and the captures (19.6.4)
+
+- **Replay 77 of the 204 runs:** the 52 malware and 25 benign runs that have any IPv4 TCP/UDP
+  packet in their observation.
+  - The other 127 have none (`net_pkts_total_delta__sum` is 0). Their switch windows are zero by
+    construction, so step 3 uses zero network windows for them.
+  - The packager checks each of them with the switch-exact extractor. Any run that does not come
+    out all zero joins the replay set.
+- **One of the 77 overloads at 1 s: Chaos `d538053ada48405e` (train split).**
+  - Per 0.5 s window it has 9,587 active flows on average (max 10,423); in 20 s it sends
+    221,733 packets, 27,716 of them SYNs. It is the "one scanner" of 19.5.4, and probably the
+    24 MB capture.
+  - So 19.6.1 item 4 ("only floods get there") does not hold for this run.
+  - Replay it last and expect `net_overload` 1 in most windows. Leave it out of the exactness
+    check and report it on its own: its live decision under overload is a result in itself.
+  - The next largest runs are Mirai `0714651541a17ca4` (max 77 flows per 0.5 s window) and Chaos
+    `2d8b09556b0e45a6` (max 11).
+- **Trim each capture to its observation**, [anchor, anchor + 20 s).
+  - Why: the pre-window probe would land in collector window K-1. Through the TTL it would stay
+    active into dataset windows 0-2 and add a flow to the count, length, duration and
+    `net_flows_with_*` features there, which the offline rows never count. The post-window probe
+    is dropped too.
+  - Effect on the driver: `--anchor-offset` becomes the anchor minus the first kept frame, which
+    is <= 0. `replay_absolute.py` (start = HYBRID_T0 + K x window - A) and `analyse` both accept
+    a negative value.
+- **Sanitize each capture:**
+  - keep IPv4 frames only, since nothing else touches the registers;
+  - in each frame, keep the Ethernet header, the IPv4 header with its options, the TCP header
+    (to its data offset) or the UDP header, and at least the 20 or 8 bytes the parser reads at
+    byte 34 (for non-first fragments);
+  - zero every byte after that, keep every length, and recompute the TCP/UDP checksum.
+
+  Why: the switch reads nothing past those bytes, so the counts do not change. And the
+  repository then carries no malware payload: the dataset does not distribute the binaries, and
+  a dropper's or a worm's traffic can carry them. The packager checks that the original and the
+  sanitized capture give the same switch-exact features in every window.
+- **The manifest**, `live_test/captures/cohort/manifest.csv`, has these columns:
+  - `execution_id`: the key in `dataset/features.csv`;
+  - `run_id`: the collection run, to pair the capture with its eBPF windows;
+  - `category`, `label`, `cv_group`;
+  - `capture`, `sha256_original`, `sha256`;
+  - `anchor_us`: `sample_started_wall_us`;
+  - `first_frame_us`: the first frame of the original capture;
+  - `anchor_offset_s`, `ipv4_packets`, `expect_overload`.
+- **Who:** the VM side writes the packager, and it runs where the collections are. The user
+  decides whether the sanitized captures (about 25 MB) go into this public repository or reach
+  PC1 by scp.
+
+### 19.7.4 The comparison (19.6.1 items 1-3, 19.6.4)
+
+- **No cut time is exact.** The reader sends one `Sync` per register table (`batched_reader.py:11`).
+  The tables are synced one after another inside [`reader_t_sync_start`, `reader_t_sync_end`],
+  so the registers of one bucket are not all cut at the same instant. Rather than cutting the
+  extractor at a logged time, each window is classified as clean or ambiguous.
+- **Three comparisons per run:**
+
+  | | what is compared | grid | who |
+  |---|---|---|---|
+  | (i) switch | collector window k against the extractor run on `tx.pcap` | collector windows | PC1, right after each replay |
+  | (ii) replay | the extractor on `tx.pcap` against the extractor on the capture | dataset windows | PC1 |
+  | (iii) end to end | collector window K+j against window j of the switch-exact offline row | dataset windows | VM side, with step 3 |
+
+- **(i) Clean windows:** window k is clean if two conditions hold:
+  - no sent IPv4 frame lies in either snapshot interval that bounds it, [s_(k-1)_lo, s_(k-1)_hi]
+    or [s_k_lo, s_k_hi], each widened by the clock-offset uncertainty;
+  - no bucket's first packet lies within L (`--report-latency`) before b_k or before b_(k+1).
+- **(i) Pass criteria:**
+  - clean windows: the 27 features other than the durations are exactly equal, and the 2
+    durations agree within 1 ms (the switch's MAC stamps against PC1's send stamps; report the
+    distribution);
+  - other windows: the 9 count deltas lie within the self-check's bounds, and the rest is only
+    reported;
+  - per run: the 9 count totals are equal;
+  - overload windows are reported, not judged.
+- **Expect almost every window to be clean.** Apart from the Chaos run, the 77 runs have at most
+  77 active flows per 0.5 s window, against roughly 40 ms of uncertainty at each boundary.
+- **Tooling:** `live_test/compare_replay.py RUN_DIR --capture C --release DIR` does (i) and (ii)
+  and writes `compare.json`. The VM side writes it along with the extractor. PC1 gets the
+  release repository with
+  `git clone -b live-validation https://github.com/mohamadhazimm/p4-ebpf-malware-detection`
+  (about 2 MB).
+- **What comes back from PC1:**
+  - per run, `windows.csv`, `summary.json` and `compare.json`, committed under
+    `perf/replay_cohort/<execution_id>/` (not git-ignored);
+  - `timing.jsonl`, `collector.log` and `tx.pcap` stay in the git-ignored results folder unless
+    the run fails (i) or (ii).
+
+### 19.7.5 Order
+
+1. VM side: the `--switch-exact` mode, `compare_replay.py` and the packager. PC1 can try
+   `compare_replay.py` on `replay_v1_20261108_061848` (bulk2000) straight away.
+2. The user, where the collections are: run the packager and deliver the 77 captures and the
+   manifest.
+3. PC1: step 2 on the 77 runs, with the Chaos run last.
+4. Where the collections are: step 1 at 1 s with `--switch-exact` and prologue-free host rows,
+   then the retrain; then step 3 with PC1's windows.
+5. VM, before step 4 (the live demonstration): the cgroup change of 19.5.6. The monitored
+   process joins the cgroup and then runs `exec "$@"`; post-processing cuts at the target's exec
+   success, as for the recorded rows.
