@@ -6,13 +6,23 @@ time windows and writes them to a CSV file.
 
 ## Related Repositories
 
-- [Thesis and research overview](https://github.com/mohamadhazimm/a-unified-p4-ebpf-architecture-for-host-and-network-malware-detection)
-	documents the architecture, evaluation context, and written research.
-- [Malware Dataset Construction Study](https://github.com/mohamadhazimm/p4_ebpf-dataset-construction)
-	contains the isolated collection and network/host/hybrid model pipeline.
+This repository is one of five in the research project:
 
-These repositories are maintained and released independently. The dataset
-study README links back here and to the thesis.
+- [Malware Dataset Construction Study](https://github.com/mohamadhazimm/p4_ebpf-dataset-construction)
+	contains malware acquisition, the isolated VirtualBox laboratory, the benign
+	workloads, the dataset collections, and the network/host/hybrid model
+	evaluation.
+- [p4-ebpf-malware-detection](https://github.com/mohamadhazimm/p4-ebpf-malware-detection)
+	is the public release of the ICC 2027 paper: the P4 program, the in-kernel
+	monitor, the feature code, the 240-execution dataset, and the evaluation
+	scripts.
+- [Thesis](https://github.com/mohamadhazimm/a-unified-p4-ebpf-architecture-for-host-and-network-malware-detection) (private)
+	contains the master's thesis LaTeX source and its writing reference.
+- [icc-2027-paper](https://github.com/mohamadhazimm/icc-2027-paper) (private)
+	contains the LaTeX source of the ICC 2027 paper, synced with Overleaf.
+
+These repositories are maintained and released independently, and each README
+links to the others.
 
 ## Requirements
 
