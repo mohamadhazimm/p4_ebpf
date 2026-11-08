@@ -5,6 +5,9 @@ against the legacy one (`--reader legacy`) on the hardware switch. Everything he
 is control plane only; the P4 program, the report format, the window length, the
 feature definitions and the CSV layout are unchanged.
 
+**Current work (2026-11-08): `PC1.md`.** Sections 9-19 are the record of the measurements and the
+decisions that led there.
+
 ## 0. What the two readers do per window
 
 | | legacy (`read_registers_with_index.py`) | batched (`batched_reader.py`) |
@@ -1290,6 +1293,11 @@ the scripts in `scripts/`). Unit tests: 118 OK, with and without SDE 9.6's `bfru
 
 ## 19. For the VM side: how to run the end-to-end evaluation (decision needed, 2026-11-07)
 
+**Closed on 2026-11-08.** The user decided: the live system uses the dataset's own window, 0.5 s and 40
+windows per run, with the published detectors (`--profile dataset`, 19.9). Nothing is retrained,
+nothing replayed; the 1 s reference (19.8.2), the cohort replays (19.6-19.8.1) and the open items of
+19.8.3 and 19.9.5 are not pursued. What PC1 runs now is `PC1.md`. 19.1-19.9 stay as the record.
+
 Written on PC1 after Section 18 for the agent and the user on the VM, where `hybrid_collector.py`
 runs with HostMon (eBPF) and the Tofino model (`--profile model`). Nothing is decided yet; the
 answers to 19.3 decide it. Paths in `dataset-construction/` are in the dataset repository.
@@ -1815,6 +1823,8 @@ Results:
 
 ### 19.8.3 Still open
 
+*Closed 2026-11-08: see the note under 19 and `PC1.md`.*
+
 - **The VM side (19.7.5 item 1):** `compare_replay.py`, and the release's `--switch-exact` mode.
   The packager's `SwitchRules` can serve as `compare_replay.py`'s extractor until then.
 - **PC1:** step 2 on the 77 captures, Chaos last.
@@ -1914,6 +1924,8 @@ three rules the collector corrects are the ones that occur.
    evidence stays benign, and the malware side rests on the published rows.
 
 ### 19.9.5 Open
+
+*Closed 2026-11-08: the dataset's window, 0.5 s; see `PC1.md`.*
 
 - Which path is the thesis's live result: 19.8.2's retrained 1 s reference, or 19.9's live rows at
   0.5 s scored by the published detectors (the user).
