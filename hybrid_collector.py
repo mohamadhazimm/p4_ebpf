@@ -2220,8 +2220,9 @@ def build_arg_parser(profile: Optional[str] = None) -> argparse.ArgumentParser:
     ap.add_argument("--launcher", choices=["shell", "dataset"], default="shell",
                     help="how --command starts: 'shell' runs it in --shell -c; 'dataset' splits it into words (no shell "
                          "syntax) and runs it as the dataset's launcher did (/bin/bash -c 'exec \"$@\"' sample-launch "
-                         "PROGRAM ARGS; stdin /dev/null, a new session, a private working directory), whose startup is "
-                         "part of every dataset row's host features (RUNBOOK 19.5.6, 19.9.2)")
+                         "PROGRAM ARGS; stdin /dev/null, a new session, a private working directory, so file paths in "
+                         "the command must be absolute), whose startup is part of every dataset row's host features "
+                         "(RUNBOOK 19.5.6, 19.9.2)")
     ap.add_argument("--command")
     ap.add_argument("--shell", default="/bin/bash")
 
