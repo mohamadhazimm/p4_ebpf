@@ -1483,6 +1483,9 @@ A's extractor is therefore three small changes, then a recompute of the 240 rows
    retrained models, and compare the decisions with the offline rows.
 4. VM: one live run with the Tofino model (`--profile model`) as the demonstration; no numbers.
 
+*2026-11-08: step 1 and the captures for step 2 are done (19.8); the VM side then took a different
+direction (19.9), to be reconciled by the user.*
+
 Data: the 204 CLI-benign and malware captures total 25 MB (largest 24 MB); the flood21
 collection's 41 captures total 923 MB (largest 372 MB, `bulkup_700`), 36 of them in the pool.
 Replays carry packets only; destinations are 10.0.0.x and the floods' random scan targets.
@@ -1585,10 +1588,10 @@ come from `dataset/features.csv` (0.5 s windows, the published extractor).
 ### 19.7.1 The feature mapping (19.6.1 item 5)
 
 - **Names:** the 29 thesis features are 29 of the collector's 30 `net_*` columns, with the same
-  names in the same order (`NET_ZERO`, `hybrid_collector.py:116-163`, against `FEATURES` in
+  names in the same order (`NET_ZERO` in `hybrid_collector.py`, against `FEATURES` in
   `features/switch_model.py`). Drop `net_new_conn_dst_max`.
 - **One unit differs:** `net_flow_duration_mean` and `net_flow_duration_max` are nanoseconds in
-  the collector's CSV (`hybrid_collector.py:1667-1669`) and seconds in the thesis. Divide them by
+  the collector's CSV (`NetSummarizer.add`, without `--duration-unit s`) and seconds in the thesis. Divide them by
   1e9, as `validation/features_from_registers.py:53-57` does. The collector keeps writing ns,
   since its tests and PC1's earlier runs use them.
 - **Everything else matches by definition:**
@@ -1613,13 +1616,13 @@ adds three more.
 | 3. flow key | CRC-16 bucket (`flow_index.py`); colliding flows merge | exact 5-tuple |
 | 4. direction | each bucket keeps its first packet's (sport, dport). A packet is A->B if its ports equal those, B->A if they are swapped, and A->B otherwise (`ingress.p4:244-281`). Addresses are not compared, so a flow with sport == dport (53<->53, 123<->123) counts entirely as A->B | first endpoint (address, port) |
 | 5. time | low 32 bits of the switch's ns arrival clock; durations are (last - first) mod 2^32 | seconds, unbounded |
-| 6. idle clear | a bucket with no packet in windows s+1..s+3 is cleared after the read of window s+3 (`clear_idle_windows` 3, `hybrid_collector.py:1380-1385`). Its next packet starts a new flow, with new reference ports, first_ts, min/max and CPU report | a flow never ends: a C2 connection that is idle for 3 s keeps its first timestamp and its direction |
+| 6. idle clear | a bucket with no packet in windows s+1..s+3 is cleared after the read of window s+3 (`clear_idle_windows` 3, the clear candidates of `collect_windows_live`). Its next packet starts a new flow, with new reference ports, first_ts, min/max and CPU report | a flow never ends: a C2 connection that is idle for 3 s keeps its first timestamp and its direction |
 
 Notes on the table:
 - **Correction to 19.5.1:** its "first fragments only, as on the switch" is wrong for the switch
   (rule 2).
 - **Unchanged:** a bucket is active in windows s..s+3 after a packet in window s, which is 4
-  windows. Both sides test `w - last_seen <= 3` (`hybrid_collector.py:1306-1313`).
+  windows. Both sides test `w - last_seen <= 3` (the active set of `collect_windows_live`).
 - **Not modelled: the unconditional clear of expired buckets.** It runs only in two cases: when
   a compare-and-clear loses a race with a packet inside the snapshot interval, or when a bucket
   was skipped under overload. Windows where that can happen count as ambiguous (19.7.4).
@@ -1815,3 +1818,191 @@ Results:
 - **The VM side (19.7.5 item 1):** `compare_replay.py`, and the release's `--switch-exact` mode.
   The packager's `SwitchRules` can serve as `compare_replay.py`'s extractor until then.
 - **PC1:** step 2 on the 77 captures, Chaos last.
+
+## 19.9 The VM side's later decision (2026-11-08): the live collector matches the dataset's collector
+
+Written on the VM after 19.7, in parallel with 19.8: the lab workstation acted on 19.7 the same day,
+and neither side saw the other's work before this was written. On the VM the user took two
+decisions, in this order: (1) the cohort captures are not replayed through the Wedge; (2) the
+published 240 rows and the detectors trained on them stay the reference, since their results
+exist, and `hybrid_collector.py` (P4 and eBPF) is changed to produce rows by the dataset's
+definitions, so that a live execution is scored by the existing detectors. Under (2) there is no
+retrain, no `--switch-exact` mode in the release and no `compare_replay.py` (19.8.3 waits for
+both); 19.5.5's option A and 19.5.6's prologue-free rows are withdrawn.
+
+What 19.8 established stands and is used below: the six rules' effects on the whole cohort, the
+77 sanitized captures and the 1 s reference. **To reconcile (the user):** 19.8.2's retrained 1 s
+reference and 19.9's live rows at 0.5 s are two evaluation paths; one of them is the thesis's live
+result. 19.8's captures also serve 19.9: replayed from PC1 through the Wedge into the collector
+with `--profile dataset` (anchored on a window boundary as `replay_capture.py` does), each gives a
+live row to set against the run's published row, with no malware running anywhere. That would be
+the direct check of 19.9, if the user wants it.
+
+Consequences:
+- **Hardware only.** The dataset's windows are 0.5 s (19.5.2). The Tofino model cannot read
+  faster than every 60 s (19.1), so the VM can test the logic but never a dataset-shaped row. The
+  Wedge at 0.5 s is unmeasured (19.4 estimates ~430 buckets per read); 19.9.4 step 2 measures it.
+- **Scoring exists already:** release `features/summary.py` (the 5 statistics over the 40
+  windows) and `validation/hybrid/score.py` (trains the paper's forests on the 240 rows, scores a
+  collected row, and places it in the range of its category).
+- **The residuals are measured, not assumed.** The 9 dataset captures on the VM (release
+  `validation/pcaps/`, 8 captures, and `live_test/captures/bulk2000.pcap`): 40,003 IPv4 TCP/UDP
+  packets, 2,959 flows, 0 CRC-16 collisions, 0 equal-port flows, 0 VLAN tags, 0 fragments, 1
+  padded frame (slowloris_256, 6 B).
+
+### 19.9.1 Network: what the collector changes, rule by rule
+
+| | the dataset (`switch_model.py`) | the switch gives | the collector does |
+|---|---|---|---|
+| 1 | bytes and lengths are Ethernet frame bytes | IPv4 `totalLen` | adds 14 per packet to the three byte deltas and 14 to `min_len`/`max_len` before the derived features (averages, ratios, bytes/s). Residual: Ethernet padding on received frames under 60 B, which the switch does not see: 1 frame in 40,003 (frames the guest *sent* are unpadded in its capture, so +14 is exact for them) |
+| 2 | durations in seconds, unbounded | low 32 bits of a ns clock, wrap 4.295 s | unwraps. The window of a bucket's first packet (its report) and of its last change are known to one window, so duration = ((last - first) mod 2^32) + k x 2^32 with k chosen nearest the window estimate; k is unique while the window is under 2.147 s. Written in seconds. A bucket not read for some windows (overload) widens the estimate; then the modular value is kept |
+| 3 | a flow never ends: idle for more than 3 windows it leaves the active set, and returns with all its state (first_ts, direction, min/max) at its next packet | a bucket the collector stops reading is invisible when its flow resumes: no second report | no idle clear during a run (`clear_idle_windows` 0). The buckets that left the active set stay on a dormant list and are read round-robin with the allowance left after the active set, so a resumed flow is seen in the window of its change. A cohort run has at most a few hundred flows (bulkdl 280, session_300 302: ~170 ms on the raw route), so all are read every window; bulk2000's 1,830 would be read in turns and a resumed flow found a few windows late, with its counts intact. Everything is cleared at the end of the run (exists since 45129e0) |
+| 4 | exact 5-tuple table | CRC-16 bucket; a second flow in a bucket is merged, and sends no report | nothing. 0 collisions in the 9 captures; in the cohort only the 15 DoS runs and one scanner collide (19.5.4) |
+| 5 | direction from the first (address, port) | ports only (`ingress.p4:244-281`) | nothing. Differs only for equal-port flows (53<->53, 123<->123): 0 in the 9 captures |
+| 6 | first fragments only, VLAN tags skipped | fragments counted with payload bytes as ports, no VLAN | nothing: 0 of either in the 9 captures, and the lab network has neither |
+| 7 | window 0 starts at `sample_started_wall_us`, 40 windows of 0.5 s, the program stopped at 20.0 s | - | `--window-sec 0.5`, exactly 40 windows, the scenario stopped at 20.0 s after launch as the runner did (release `validation/hybrid/collect.py --seconds`). `global_t0` is already taken immediately before `launch()` in `main()` |
+| 8 | 29 features | 30 `net_*` columns | `net_new_conn_dst_max` is ignored; the 29 have the same names in the same order (19.7.1) |
+
+Rules 1, 2, 3, 7 and 8 are collector work. Rules 4-6 are hardware and stay as residuals; their
+rate in the cohort is known from the captures. None needs a change to the P4 program. 19.8.1
+measured the same rules on the whole cohort at 1 s: lengths in every busy window (rule 1 here),
+aliased durations in 34 runs (rule 2), idle restarts in 26 runs (rule 3), collisions in the Chaos
+run only (rule 4), no equal-port flows (rule 5), no VLAN tags, options or fragments (rule 6): the
+three rules the collector corrects are the ones that occur.
+
+### 19.9.2 Host: the 18 features and the launch
+
+- The collector's host columns already contain the 18 dataset features by name (plus 8 others,
+  ignored), from `hostmon_agg` with windows anchored at the shared start. The release validation
+  of 2026-11-04 showed the monitor equal to `host_model.py` on the same events.
+- **The launch must be the dataset's.** Every published row includes the launcher's startup,
+  178 calls in window 0 (19.5.6), so the live run reproduces it instead of removing it: the child
+  joins the cgroup, then `exec /bin/bash -c 'exec "$@"' sample-launch PROGRAM ARGS...`, stdin
+  `/dev/null`, a new session, cwd a private directory; the monitor counts from that launcher's
+  `execve` (collect.py's rule: execve is the first monitored call). This replaces
+  `cgroup_wrapped_command`'s `exec "$1" -c "$2"`, whose second shell parses a command string and
+  gives a different prologue.
+- Measure the live prologue with the null program: 178 if the host's bash starts like the
+  guest's, otherwise the live count is recorded and reported (class-independent either way).
+
+### 19.9.3 What this gives, and what it cannot
+
+- Gives: a `--profile dataset` whose rows are, feature by feature, what the dataset's collector
+  would have produced for the same execution, up to the residuals of rules 1 and 4-6, with their
+  measured rates; the existing detectors score them unchanged.
+- Cannot: 0.5 s rows from the Tofino model; and a live malware row needs the hardware switch
+  with an isolated host, which NETLAB does not allow (19.2). So the live rows that can be
+  compared with the dataset are benign ones (the release's validation programs and the cohort's
+  benign CLI programs), on PC1 with the Wedge.
+
+### 19.9.4 Checks, in order
+
+1. **VM, no switch:** unit tests for the +14 rule, the unwrap, the dormant reads, the 40-window
+   stop and the launcher; the +14 rule against the 8 stored `<capture>.live.json` of
+   `validation/results/20261104_111459` (the 14 byte features must become exact, slowloris_256
+   within 6 B); the collector's logic on the Tofino model at long windows as in 11.1 (the model
+   proves the logic, not the cadence).
+2. **PC1, capacity at 0.5 s** (19.4): `--profile dataset` with bulk2000 and the benign
+   generators; expected 0 overruns up to ~300 active buckets, the allowance used per window, and
+   how many dormant buckets each window still reads.
+3. **PC1 and the host, dataset-style benign executions** with the Wedge and `hostmon_agg`
+   (the 9 programs of `validation/hybrid/workloads.py`, then cohort benign programs that are
+   available): `score.py` places each row in its category's range and scores it with the three
+   forests. On 2026-11-04 most live benign rows scored malicious; the point of 19.9 is that
+   they stop doing so. What still falls outside the range names the next difference to fix.
+4. **Malware live:** only if the user has an isolated host for the Wedge; otherwise the live
+   evidence stays benign, and the malware side rests on the published rows.
+
+### 19.9.5 Open
+
+- Which path is the thesis's live result: 19.8.2's retrained 1 s reference, or 19.9's live rows at
+  0.5 s scored by the published detectors (the user).
+- Whether 0.5 s holds on the Wedge (step 2). If it does not for the dormant reads, keep the
+  active set only and the idle clear, and report durations and flow counts as approximate.
+- Which cohort benign programs can run on PC1 (binaries, servers in the lab network).
+- The 5-minute collection the user mentions is unknown to the VM side. If it has results of its
+  own, the same approach applies at its window length; otherwise it is not needed here.
+
+### 19.9.6 Implementation on the VM (2026-11-08)
+
+Files: `hybrid_collector.py`, `thesis-hybrid-ebpf-p4/python/tests/test_dataset_profile.py`,
+`live_test/check_frame_bytes.py`, `live_test/dataset_row.py`. Nothing on the switch yet.
+
+- **`--profile dataset`** sets `--window-sec 0.5 --windows 40 --active-ttl-windows 3
+  --clear-idle-windows 0 --clear-expired 0 --dormant-reads 1 --byte-layer frame --duration-unit s
+  --launcher dataset --reader batched --reader-raw-wire --reader-sync-batched --p4-snapshot sync
+  --read-budget-frac 0.7 --max-dst-reads 256 --forward-report-port 192`. Explicit options override
+  it, as with the other profiles. The other profiles and the plain defaults are unchanged.
+- **The new options**, each defaulting to the old behaviour:
+
+  | option | what it does |
+  |---|---|
+  | `--dormant-reads 1` | a bucket that leaves the active set goes on a dormant list instead of the clear queue; each window reads, after the active set, as many dormant buckets as the allowance still fits, oldest read first (round robin); a dormant bucket whose packet count changed is active again from that window with its registers intact (`active_after_read_indexes`, which `NetSummarizer` uses to decide which rows count); `--clear-expired` is not applied during the run; the end-of-run clear covers active, dormant, backlog and late-report buckets. Not counted as overload. Per window the timing log (`--reader-timing-file`) gets `active_read`, `dormant`, `dormant_read`; the CSV schema is unchanged (RunWriter's guard) |
+  | `--byte-layer frame` | 14 B per packet added to the three byte deltas and to `min_len`/`max_len` of each bucket before the derived features |
+  | `--duration-unit s` | durations in seconds: the register difference modulo 2^32, plus k x 4.295 s with k from the windows of the bucket's first appearance and of its last change (and of the read before that change, for a bucket read late); a warning when the window is over 2.147 s |
+  | `--windows N` | exactly N windows whether or not the command has ended; after the last window's read the command is stopped (SIGTERM to its process group, SIGKILL after 2 s), and a non-zero exit code is recorded, not an error (36 of the 240 dataset rows ended non-zero, 16 of them by SIGTERM) |
+  | `--launcher dataset` | the command is split into words and runs as `/bin/bash -c 'exec "$@"' sample-launch PROGRAM ARGS`, stdin `/dev/null`, a new session, cwd a private temporary directory removed afterwards; with `--hostmon-cgroup`, an outer shell joins the cgroup and execs that launcher, so the monitor sees the outer shell's few calls after the join (the redirect's close, the dup2, the execve), then the launcher's startup, then the program; the PID stays the same through the chain |
+
+- **Tests:** `test_dataset_profile.py`, 21 tests: the profile bundle and the defaults; the +14 rule on
+  the deltas and lengths; the unwrap at 4.6 s read every window, after a gap in the reads, in a
+  single window and after a clear; the active-set filter; dormant reads with the resumed flow
+  (its delta counts from its old registers), with a budget (the round robin over 8 dormant buckets
+  at 4 per window) and in the timing log; the fixed window count with the stop after the last
+  read; the launcher for real (stdin empty, cwd, own session, same PID, the cgroup join); and
+  `stop_scenario` (-15, then -9 for a program that ignores SIGTERM). The whole suite is 139 OK
+  (118 before). The root `tests/validation` gives 11 failed, 10 passed, 84 skipped, 37 errors
+  with and without the change (pre-existing: the lab machine's import layout, scikit-learn
+  missing).
+- **The byte rule on the switch's own readouts** (`python3 live_test/check_frame_bytes.py`, over
+  release `validation/results/20261104_111459`): each capture's `after.json` register rows go
+  through `NetSummarizer` as one window.
+
+  | capture | buckets | `ipv4` = the validation's live values | `frame` = the offline extractor (27 features, durations apart) |
+  |---|---|---|---|
+  | beacon_100, beacon_50, bulkdl, dns_2k, null1, session_300, slowloris_128 | 102, 52, 280, 3, 2, 302, 130 | 29/29 each | 27/27 each |
+  | slowloris_256 | 258 | 29/29 | 18/27: the 9 byte features, all from the capture's 6 B of Ethernet padding (`net_bytes_total_delta` 166,136 vs 166,142) |
+
+  So the collector's summarizer is the validation's feature builder, and with `frame` it is the
+  dataset's extractor up to padding the switch cannot see (19.9.1, rule 1). The durations differ
+  under replay (the switch's clock against the capture's), as in the validation: reported, not
+  judged. PASS.
+- **`live_test/dataset_row.py COLLECTOR.csv --execution-id ID --category CAT --label 0|1 --out ROWS.csv`**
+  turns a run's 40 windows into one row with the dataset's 250 columns in the dataset's order
+  (`features/summary.py`'s five statistics over the 18 host and 29 network features; `--durations ns`
+  for runs made without `--duration-unit s`). `validation/hybrid/score.py ROWS.csv` then scores it
+  with the three forests trained on the 240 rows and places it in its category's range. `score.py`
+  needs scikit-learn: on this VM `python3 -m venv --system-site-packages venv && venv/bin/pip
+  install numpy==1.24.4 scikit-learn==1.3.2` (live_test/RESULTS.md).
+
+**For PC1 (19.9.4 steps 2 and 3).** Each run with its own `--out-csv` and `--reader-timing-file`,
+in a git-ignored `perf/results/dataset_v1/`:
+
+```sh
+# step 2: the 0.5 s cadence, bulk2000 at its own timing (1,830 buckets: the dormant list is read in turns)
+sudo python3 hybrid_collector.py --profile dataset --mode command --scenario-name bulk2000 --label benign \
+    --command "tcpreplay -i eth1 live_test/captures/bulk2000.pcap" \
+    --switch-ssh root@172.168.1.2 --cpu-iface enp5s0 \
+    --out-csv perf/results/dataset_v1/bulk2000.csv --reader-timing-file perf/results/dataset_v1/bulk2000.timing.jsonl
+# then the benign generators of Sections 13-16 the same way
+```
+To look at: `net_read_overrun` 0 and `net_overload` 0 in every window; per window in the timing
+log `wall_ms` against the 350 ms allowance, `active_read`, `dormant`, `dormant_read`; the INFO
+line "dormant buckets: ... resumed"; the end-of-run clear count against the buckets used; the
+CSV sums of pkts and bytes against `bulk2000_truth.json` (`totals`, bytes now frame bytes:
+2,184,448 + 14 x 24,008 = 2,520,560).
+
+```sh
+# step 3: a dataset-style execution: the program's command line, host side in the cgroup
+sudo python3 hybrid_collector.py --profile dataset --mode command --scenario-name NAME --label benign \
+    --hostmon ebpf_perf/build/hostmon_agg --hostmon-cgroup /sys/fs/cgroup/hybrid_run \
+    --command "PROGRAM ARGS" --switch-ssh root@172.168.1.2 --cpu-iface enp5s0 \
+    --out-csv perf/results/dataset_v1/NAME.csv --reader-timing-file perf/results/dataset_v1/NAME.timing.jsonl
+python3 live_test/dataset_row.py perf/results/dataset_v1/NAME.csv --execution-id NAME --category CATEGORY --label 0 \
+    --out perf/results/dataset_v1/rows.csv
+venv/bin/python3 ../p4-ebpf-malware-detection/validation/hybrid/score.py perf/results/dataset_v1/rows.csv
+```
+First the programs of release `validation/hybrid/workloads.py` (category `network_benign` for the
+network-active ones, `benign` for the others, `null` for the sleeping one), then cohort benign
+programs that are available on PC1. The prologue (19.9.2): run `--command "sleep 20"` this way and
+`strace -f -c sleep 20` on the same host; the host total over the 40 windows minus strace's count
+is the live launcher prologue, against the dataset's 178. Record it here.

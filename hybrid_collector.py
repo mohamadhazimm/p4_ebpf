@@ -7,9 +7,11 @@ import json
 import os
 import queue
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import re
@@ -413,6 +415,48 @@ def cgroup_wrapped_command(cmd: str, cgroup: str, shell: str = "/bin/bash") -> L
     return ["/bin/bash", "-c", 'echo $$ > "$0/cgroup.procs" && exec "$1" -c "$2"', cgroup, shell, cmd]
 
 
+# The dataset's launcher (RUNBOOK 19.5.6): bash execs the program with its arguments. Its startup
+# before that exec (178 system calls in the dataset's guest) is part of every dataset row's host
+# features, so a run that is to be scored by the dataset's detectors starts the same way.
+DATASET_LAUNCHER = ["/bin/bash", "-c", 'exec "$@"', "sample-launch"]
+
+
+def dataset_launch_command(argv: List[str], cgroup: Optional[str] = None) -> List[str]:
+    """argv that runs the program as the dataset's collector did:
+    `/bin/bash -c 'exec "$@"' sample-launch PROGRAM ARGS...`. With `cgroup`, a
+    shell joins the cgroup first and execs that launcher, so that the monitor
+    sees the launcher's execve and startup, then the program (RUNBOOK 19.9.2).
+    `$0` is the cgroup, `$@` the program and its arguments."""
+    if not argv:
+        raise ValueError("the dataset launcher needs a program to run")
+    if cgroup is None:
+        return DATASET_LAUNCHER + list(argv)
+    return ["/bin/bash", "-c", 'echo $$ > "$0/cgroup.procs" && exec /bin/bash -c \'exec "$@"\' sample-launch "$@"',
+            cgroup, *argv]
+
+
+def stop_scenario(proc: subprocess.Popen, grace: float = 2.0, own_session: bool = False) -> None:
+    """Stop the scenario as the dataset's runner stopped a program at its
+    timeout: SIGTERM, then SIGKILL after `grace` seconds. With own_session the
+    signal goes to the scenario's process group (it was started with
+    start_new_session), so its children stop too."""
+    if proc.poll() is not None:
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            if own_session:
+                os.killpg(os.getpgid(proc.pid), sig)
+            else:
+                proc.send_signal(sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        try:
+            proc.wait(timeout=grace)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
 def ensure_cgroup(path: str) -> "tuple[Path, bool]":
     """(cgroup directory, created now). A cgroup-v2 directory is created by mkdir."""
     p = Path(path)
@@ -489,7 +533,16 @@ def hostmon_health(path: str) -> Optional[Dict[str, int]]:
     return None
 
 
-def run_scenario_command(cmd: str, shell: str = "/bin/bash", cgroup: Optional[str] = None) -> subprocess.Popen:
+def run_scenario_command(cmd: str, shell: str = "/bin/bash", cgroup: Optional[str] = None,
+                         launcher: str = "shell", workspace: Optional[str] = None) -> subprocess.Popen:
+    """launcher 'shell': the command string runs in `shell -c` (in the cgroup
+    when given). launcher 'dataset': the command is split into words (no shell
+    syntax) and runs as the dataset's launcher ran its programs: stdin
+    /dev/null, a new session, cwd `workspace` (RUNBOOK 19.5.6, 19.9.2)."""
+    if launcher == "dataset":
+        argv = shlex.split(cmd)
+        return subprocess.Popen(dataset_launch_command(argv, cgroup), stdin=subprocess.DEVNULL, cwd=workspace,
+                                start_new_session=True)
     if cgroup is not None:
         return subprocess.Popen(cgroup_wrapped_command(cmd, cgroup, shell), text=True)
     return subprocess.Popen([shell, "-lc", cmd])
@@ -817,7 +870,8 @@ def make_timing_logger(reader_name: str, path: Optional[str] = None) -> Callable
     JSON object per window is appended to that file."""
 
     def log(window: int, payload: Dict[str, Any], read_start: float, read_end: float,
-            n_active: int, n_dst: int, window_end: Optional[float] = None) -> None:
+            n_active: int, n_dst: int, window_end: Optional[float] = None,
+            extra: Optional[Dict[str, Any]] = None) -> None:
         wall_ms = (read_end - read_start) * 1000.0
         timing = payload.get("timing") or {}
         sync_s = payload.get("sync_s") or 0.0
@@ -839,6 +893,8 @@ def make_timing_logger(reader_name: str, path: Optional[str] = None) -> Callable
                   # and the batched reader's request, snapshot and reply times on the reader's clock
                   "t_window_end": window_end, "t_read_start": read_start, "t_read_end": read_end,
                   "clock": {k: timing[k] for k in CLOCK_KEYS if k in timing}}
+        if extra:
+            record.update(extra)
         print(f"[TIMING] window {window}: reader={reader_name}{'/' + parser if parser else ''} "
               f"active={n_active} dst={n_dst} "
               f"sync={sync_ms:.1f} ms read={read_ms:.1f} ms clear={clear_ms:.1f} ms wall={wall_ms:.1f} ms "
@@ -918,7 +974,26 @@ PROFILES: Dict[str, Dict[str, Any]] = {
     "model": {"window_sec": 60.0, "active_ttl_windows": 3, "clear_idle_windows": 0, "reader": "batched",
               "p4_snapshot": "sync", "p4_read_timeout": 600.0, "read_budget_frac": 0.0, "max_dst_reads": 0,
               "forward_report_port": 2, "clear_expired": 0},
+    # "dataset": the Wedge100BF-32X producing rows by the dataset's definitions (RUNBOOK 19.9), so that
+    # the detectors trained on dataset/features.csv score them unchanged: 40 windows of 0.5 s from the
+    # launch, the program stopped at 20 s as the dataset's runner did, the dataset's launcher (its
+    # startup is part of every dataset row), Ethernet frame bytes (+14 B per packet on the IPv4
+    # lengths the switch counts), durations in seconds (the 32-bit timestamps unwrapped), and no
+    # bucket cleared during the run: a flow never ends in the dataset's extractor, so buckets that
+    # leave the active set stay dormant, are re-read with the allowance left after the active set,
+    # and are all cleared at the end of the run.
+    "dataset": {"window_sec": 0.5, "active_ttl_windows": 3, "clear_idle_windows": 0, "reader": "batched",
+                "reader_raw_wire": True, "reader_sync_batched": True, "p4_snapshot": "sync",
+                "read_budget_frac": 0.7, "max_dst_reads": 256, "forward_report_port": 192,
+                "clear_expired": 0, "clear_budget_frac": 0.5,
+                "dormant_reads": 1, "byte_layer": "frame", "duration_unit": "s", "windows": 40,
+                "launcher": "dataset"},
 }
+
+# Ethernet header bytes: the dataset counted frame bytes, the switch counts IPv4 totalLen.
+ETHERNET_HEADER_BYTES = 14
+# The flow timestamps are the low 32 bits of a ns clock.
+TS_WRAP_S = (1 << 32) / 1e9
 
 # Starting costs of one register read per reader route, in milliseconds. From
 # the Wedge100BF-32X (RUNBOOK sections 9, 10 and 12.1) and the Tofino model
@@ -1188,6 +1263,9 @@ def collect_windows_live(
     clear_expired: bool = False,
     clear_budget_frac: float = 0.5,
     clock: Any = None,
+    dormant_reads: bool = False,
+    max_windows: int = 0,
+    stop_fn: Optional[Callable[[], None]] = None,
 ) -> List[Dict[str, object]]:
     """Per window: the CPU-reported bucket indexes, and the P4 registers of all
     active indexes read at the end of that window.
@@ -1219,6 +1297,23 @@ def collect_windows_live(
     window; the rest wait (window["report_aggregates"]["net_clear_backlog"]).
     A bucket whose clear fails CLEAR_ATTEMPTS times is given up; one that
     reports again meanwhile is live and leaves the queue.
+
+    dormant_reads (RUNBOOK 19.9, the dataset profile): in the dataset's
+    extractor a flow never ends, so a bucket that leaves the active set is not
+    cleared but kept dormant, and read again, round robin, with whatever the
+    allowance leaves after the active set (never counted as overload). A
+    dormant bucket whose packet count changed is active again from that window,
+    with its registers intact, as the dataset's flow would be. clear_expired is
+    not applied during the run; every bucket still tracked is cleared at the
+    end of the run. Each window records "active_after_read_indexes" (the active
+    set once this read's changes are known; NetSummarizer counts those rows),
+    "dormant_count" and "dormant_read_indexes".
+
+    max_windows: the run has exactly that many windows whether or not the
+    scenario has ended (the dataset's observation was fixed: 40 windows of
+    0.5 s). After the last window's read, stop_fn() stops the scenario, as the
+    runner stopped a program at its timeout; the teardown packets of the dying
+    program then fall outside the run, as they did in the dataset.
 
     The registers are read by read_fn(active_indexes, window, snapshot=...,
     clear_if_unchanged=..., dst_indexes=..., [clear_indexes=...]) -> payload,
@@ -1262,6 +1357,11 @@ def collect_windows_live(
     expired_total = 0
     expired_cleared_total = 0
     dropped_clears = 0
+    # dormant_reads: buckets that left the active set, in round-robin order (oldest read first)
+    dormant: "collections.OrderedDict[int, None]" = collections.OrderedDict()
+    dormant_resumed = 0
+    dormant_reads_total = 0
+    dormant_max = 0
 
     w = 0
     proc_done = False
@@ -1303,6 +1403,7 @@ def collect_windows_live(
         for idx in idxs:
             active_idx_last_seen[idx] = w
             pending_clear.pop(idx, None)     # it reports again, so it is live: not to be cleared
+            dormant.pop(idx, None)
         expired = sorted(
             idx for idx, last_seen in active_idx_last_seen.items()
             if (w - last_seen) > active_ttl_windows
@@ -1316,7 +1417,10 @@ def collect_windows_live(
         # expires here was read too seldom (or never) to be cleared and is still
         # occupied on the switch.
         expired_total += len(expired)
-        if clear_expired:
+        if dormant_reads:
+            for idx in expired:
+                dormant.setdefault(idx, None)
+        elif clear_expired:
             for idx in expired:
                 pending_clear.setdefault(idx, 0)
 
@@ -1376,6 +1480,22 @@ def collect_windows_live(
             print(f"[WARN] window {w}: the {limit} fits {allowed} of {len(active_idxs)} active buckets "
                   f"(cost estimate {cost.as_dict()}); the rest are skipped and counted")
 
+        # Dormant buckets read with what the allowance leaves after the active set, oldest read first.
+        dormant_now: List[int] = []
+        if dormant_reads and dormant and not skipped_idxs:
+            n_dormant = len(dormant)
+            if allow_ms is not None:
+                fit = cost.buckets_within(allow_ms, n_cleared=len(clear_now) + idle_estimate, n_dst=len(read_dst_idxs))
+                n_dormant = max(0, min(n_dormant, fit - len(read_idxs)))
+            if max_read_buckets > 0:
+                n_dormant = max(0, min(n_dormant, max_read_buckets - len(read_idxs)))
+            dormant_now = list(dormant)[:n_dormant]
+            for idx in dormant_now:
+                dormant.move_to_end(idx)
+            dormant_reads_total += len(dormant_now)
+        dormant_max = max(dormant_max, len(dormant))
+        request_idxs = sorted(set(read_idxs) | set(dormant_now))
+
         # Buckets that would complete clear_idle_windows idle reads with this read.
         clear_candidates = {}
         if clear_idle_windows > 0:
@@ -1387,17 +1507,22 @@ def collect_windows_live(
         extra: Dict[str, Any] = {"clear_indexes": clear_now} if clear_now else {}
         read_start = clk.time()
         if read_fn is None:
-            payload = read_p4_with_retries(reader_path, read_idxs, w, retries=read_retries, timeout=read_timeout,
+            payload = read_p4_with_retries(reader_path, request_idxs, w, retries=read_retries, timeout=read_timeout,
                                            switch_ssh=switch_ssh, snapshot=snapshot,
                                            clear_if_unchanged=clear_candidates, dst_indexes=read_dst_idxs, **extra)
         else:
-            payload = read_fn(read_idxs, w, snapshot=snapshot, clear_if_unchanged=clear_candidates,
+            payload = read_fn(request_idxs, w, snapshot=snapshot, clear_if_unchanged=clear_candidates,
                               dst_indexes=read_dst_idxs, **extra)
         read_end = clk.time()
         if timing_log is not None:
-            timing_log(w, payload, read_start, read_end, len(read_idxs), len(read_dst_idxs), window_end=win_end_abs)
+            if dormant_reads:
+                timing_log(w, payload, read_start, read_end, len(request_idxs), len(read_dst_idxs),
+                           window_end=win_end_abs,
+                           extra={"active_read": len(read_idxs), "dormant": len(dormant), "dormant_read": len(dormant_now)})
+            else:
+                timing_log(w, payload, read_start, read_end, len(request_idxs), len(read_dst_idxs), window_end=win_end_abs)
         wall_ms = (read_end - read_start) * 1000.0
-        cost.update(len(read_idxs), len(payload.get("cleared") or []), payload_timing_ms(payload, wall_ms),
+        cost.update(len(request_idxs), len(payload.get("cleared") or []), payload_timing_ms(payload, wall_ms),
                     n_dst=len(read_dst_idxs))
         overrun = read_end > win_end_abs + window_sec
         overruns += int(overrun)
@@ -1420,9 +1545,15 @@ def collect_windows_live(
             if last_pkts.get(idx) != pkts:
                 active_idx_last_seen[idx] = w
                 idle_reads[idx] = 0
+                if idx in dormant:          # its flow resumed: active again, registers intact
+                    del dormant[idx]
+                    dormant_resumed += 1
             else:
                 idle_reads[idx] = idle_reads.get(idx, 0) + 1
             last_pkts[idx] = pkts
+        # The active set once this read's changes are known (before this read's clears take effect:
+        # a bucket cleared after this read still counts in this window).
+        active_after_read = sorted(active_idx_last_seen)
 
         for row in payload.get("dst_rows", []):
             idx = safe_int(row.get("idx"))
@@ -1471,6 +1602,9 @@ def collect_windows_live(
             "cleared_indexes": cleared,
             "expired_indexes": expired,
             "expired_cleared_indexes": expired_cleared,
+            "active_after_read_indexes": active_after_read,
+            "dormant_count": len(dormant),
+            "dormant_read_indexes": sorted(dormant_now),
             "p4_snapshot": payload.get("snapshot"),
             "p4_read_start_sec": round(read_start - global_t0, 3),
             "p4_read_sec": round(read_end - read_start, 3),
@@ -1487,7 +1621,14 @@ def collect_windows_live(
         cost.update_processing((t_decide - t_iter_start) * 1000.0, (post_end - read_end) * 1000.0,
                                select_ms=(read_start - t_decide) * 1000.0)
 
-        if proc_done and proc_end_rel is not None:
+        if max_windows:
+            if w + 1 >= max_windows:
+                # The run has its windows. The program is stopped now, after the last read, as the
+                # dataset's runner stopped it at its timeout; its teardown packets fall outside the run.
+                if stop_fn is not None:
+                    stop_fn()
+                break
+        elif proc_done and proc_end_rel is not None:
             if win_end_rel >= proc_end_rel + drain_seconds:
                 break
 
@@ -1498,7 +1639,7 @@ def collect_windows_live(
     # after the collector stops, finds those buckets empty. RUNBOOK section 13.2: after the flood,
     # 5,429 buckets stayed occupied and the next capture without a register reset lost 8.6% of its
     # flows. The run's windows are complete at this point, so a failed clear only leaves them occupied.
-    if clear_expired and windows:
+    if (clear_expired or dormant_reads) and windows:
         # Reports that arrived after the last window took its reports: no window has seen their
         # buckets (RUNBOOK 16: the last 0.1 s of a 2,000 packets/s flood left 176 of them occupied).
         # A collector without take_after (the tests' fakes) skips this.
@@ -1507,7 +1648,7 @@ def collect_windows_live(
         if take_after is not None:
             late_reports = wait_for_late_reports(take_after, win_end_abs, clk)
         late_idxs = {safe_int(r["idx"]) for r in late_reports}
-        leftover = sorted(set(active_idx_last_seen) | set(pending_clear) | late_idxs)
+        leftover = sorted(set(active_idx_last_seen) | set(pending_clear) | set(dormant) | late_idxs)
         final_cleared: List[int] = []
         if leftover:
             t_clear = clk.time()
@@ -1521,8 +1662,8 @@ def collect_windows_live(
                                       clear_indexes=leftover)
                 final_cleared = sorted(safe_int(x) for x in payload.get("cleared", []))
                 print(f"[INFO] end of run: cleared {len(final_cleared)} of the {len(leftover)} buckets still occupied "
-                      f"(the last windows' active set, the clear backlog and {len(late_idxs)} bucket(s) of the "
-                      f"{len(late_reports)} report(s) that arrived after the last window) in "
+                      f"(the last windows' active set, {len(dormant)} dormant, the clear backlog and {len(late_idxs)} "
+                      f"bucket(s) of the {len(late_reports)} report(s) that arrived after the last window) in "
                       f"{(clk.time() - t_clear) * 1000.0:.0f} ms")
             except (P4ReadError, RuntimeError, OSError, ValueError) as error:
                 print(f"[WARN] end of run: clearing the {len(leftover)} occupied buckets failed ({error}); they stay "
@@ -1537,7 +1678,11 @@ def collect_windows_live(
     if skipped_total:
         print(f"[INFO] read budget: {skipped_total} bucket reads skipped over {sum(1 for win in windows if win['overload'])} "
               f"overloaded window(s); final cost estimate {cost.as_dict()}")
-    if expired_total:
+    if dormant_reads:
+        print(f"[INFO] dormant buckets: {expired_total} left the active set and were kept, at most {dormant_max} at a "
+              f"time; {dormant_reads_total} dormant reads over {len(windows)} windows; {dormant_resumed} resumed "
+              f"and counted again with their registers intact; all cleared at the end of the run")
+    elif expired_total:
         print(f"[INFO] {expired_total} bucket(s) left the active set without an idle clear; "
               + (f"{expired_cleared_total} cleared unconditionally, {len(pending_clear)} still waiting, "
                  f"{dropped_clears} given up after {CLEAR_ATTEMPTS} failed clears"
@@ -1557,17 +1702,55 @@ class NetSummarizer:
     reg_newconn_dst bucket since its previous read.
 
     add() takes the windows one at a time, in order, so that a window's row
-    can be written as soon as the window is read."""
+    can be written as soon as the window is read.
 
-    def __init__(self, window_sec: float):
+    byte_layer "frame" (the dataset profile, RUNBOOK 19.9.1): the dataset
+    counted Ethernet frame bytes, the switch counts IPv4 totalLen, so 14 B per
+    packet are added to the byte deltas and to min_len/max_len before the
+    derived features. duration_unit "s": net_flow_duration_* in seconds, as in
+    the dataset, with the 32-bit wrap of the timestamps resolved from the
+    windows in which the bucket first appeared and last changed (unique while
+    the window is shorter than half the wrap, 2.147 s); "ns" keeps the register
+    difference modulo 2^32. A window's "active_after_read_indexes", when
+    present, names the rows that count in its features; the other rows read
+    (dormant buckets) only update the bookkeeping."""
+
+    def __init__(self, window_sec: float, byte_layer: str = "ipv4", duration_unit: str = "ns"):
+        if byte_layer not in ("ipv4", "frame"):
+            raise ValueError(f"byte_layer must be 'ipv4' or 'frame', not {byte_layer!r}")
+        if duration_unit not in ("ns", "s"):
+            raise ValueError(f"duration_unit must be 'ns' or 's', not {duration_unit!r}")
         self.window_sec = window_sec
+        self.byte_layer = byte_layer
+        self.duration_unit = duration_unit
         self.prev_by_idx: Dict[int, Dict[str, Any]] = {}
         self.prev_new_conn: Dict[int, int] = {}
+        self.n_windows = 0
+        # for the duration unwrap: the window a bucket first appeared in, the windows of the read
+        # before and the read at its last packet-count change, and the window of its last read
+        self.first_window: Dict[int, int] = {}
+        self.last_change_span: Dict[int, "tuple[int, int]"] = {}
+        self.last_read_window: Dict[int, int] = {}
+
+    def unwrap_seconds(self, idx: int, d_mod_ns: int) -> float:
+        """The flow's duration in seconds from the register difference modulo 2^32 (d_mod_ns)
+        and the windows the collector saw: the first packet lies in the bucket's first window,
+        the last one between the read before and the read at its last change."""
+        d_mod = d_mod_ns / 1e9
+        first_w = self.first_window.get(idx, 0)
+        before_w, change_w = self.last_change_span.get(idx, (first_w - 1, first_w))
+        # midpoints in window units (the read of window j is at time j + 1)
+        estimate = ((before_w + change_w) / 2.0 + 1.0 - (first_w + 0.5)) * self.window_sec
+        k = max(0, int(round((estimate - d_mod) / TS_WRAP_S)))
+        return d_mod + k * TS_WRAP_S
 
     def add(self, win: Dict[str, object]) -> Dict[str, object]:
         window_sec = self.window_sec
         prev_by_idx = self.prev_by_idx
         prev_new_conn = self.prev_new_conn
+        w = self.n_windows
+        self.n_windows += 1
+        header = ETHERNET_HEADER_BYTES if self.byte_layer == "frame" else 0
 
         rows = win.get("rows", [])
 
@@ -1582,14 +1765,18 @@ class NetSummarizer:
             return dict(NET_ZERO, net_new_conn_dst_max=new_conn_max)
 
         cleared_after_read = [safe_int(x) for x in win.get("cleared_indexes", [])]
+        # The rows that count in this window: the active set once the read's changes are known
+        # (collect_windows_live with dormant reads). Without the key, every row read is active.
+        active_filter = win.get("active_after_read_indexes")
+        active_set = {safe_int(x) for x in active_filter} if active_filter is not None else None
 
         summary = dict(NET_ZERO)
-        summary["net_flow_count_seen"] = len(rows)
         summary["net_new_conn_dst_max"] = new_conn_max
 
         min_lens: List[int] = []
         max_lens: List[int] = []
         durations: List[float] = []
+        n_active = 0
 
         for row in rows:
             idx = get_row_int(row, "idx", 0)
@@ -1645,6 +1832,31 @@ class NetSummarizer:
             ack_delta = max(0, ack - prev_ack)
             rst_delta = max(0, rst - prev_rst)
 
+            if header:
+                # the dataset's Ethernet frame bytes: 14 B per packet more than the IPv4 lengths
+                bytes_delta += header * pkts_delta
+                bytes_ab_delta += header * pkts_ab_delta
+                bytes_ba_delta += header * pkts_ba_delta
+                if min_len > 0:
+                    min_len += header
+                if max_len > 0:
+                    max_len += header
+
+            # Bookkeeping for the duration unwrap: first appearance, last change, last read.
+            if pkts > 0 and idx not in self.first_window:
+                self.first_window[idx] = w
+            prev_read_w = self.last_read_window.get(idx, w - 1)
+            if pkts != prev_pkts:
+                self.last_change_span[idx] = (prev_read_w, w)
+            self.last_read_window[idx] = w
+            prev_by_idx[idx] = row
+
+            # A row counts in this window if its bucket is active once this read is known, or
+            # if it changed in this window (a dormant flow that resumed).
+            if active_set is not None and idx not in active_set and pkts_delta == 0:
+                continue
+            n_active += 1
+
             summary["net_pkts_total_delta"] += pkts_delta
             summary["net_bytes_total_delta"] += bytes_delta
 
@@ -1666,7 +1878,11 @@ class NetSummarizer:
 
             # first_ts/last_ts are the low 32 bits of a ns clock (wrap every 4.295 s).
             if first_ts > 0 and last_ts > 0:
-                durations.append(float((int(last_ts) - int(first_ts)) % (1 << 32)))
+                d_mod_ns = (int(last_ts) - int(first_ts)) % (1 << 32)
+                if self.duration_unit == "s":
+                    durations.append(self.unwrap_seconds(idx, d_mod_ns))
+                else:
+                    durations.append(float(d_mod_ns))
 
             if dir_valid != 0:
                 summary["net_dir_valid_count"] += 1
@@ -1677,11 +1893,14 @@ class NetSummarizer:
             if pkts_ba > 0 or bytes_ba > 0:
                 summary["net_flows_with_ba"] += 1
 
-            prev_by_idx[idx] = row
+        summary["net_flow_count_seen"] = n_active
 
         # Buckets cleared after this read restart from zero.
         for idx in cleared_after_read:
             prev_by_idx.pop(idx, None)
+            self.first_window.pop(idx, None)
+            self.last_change_span.pop(idx, None)
+            self.last_read_window.pop(idx, None)
 
         pkts_delta = summary["net_pkts_total_delta"]
         bytes_delta = summary["net_bytes_total_delta"]
@@ -1721,9 +1940,10 @@ class NetSummarizer:
 def build_net_summaries(
     net_windows: List[Dict[str, object]],
     window_sec: float,
+    **kwargs: Any,
 ) -> List[Dict[str, object]]:
-    """NetSummarizer over all windows of a run."""
-    summarizer = NetSummarizer(window_sec)
+    """NetSummarizer over all windows of a run (kwargs: byte_layer, duration_unit)."""
+    summarizer = NetSummarizer(window_sec, **kwargs)
     return [summarizer.add(win) for win in net_windows]
 
 
@@ -1878,8 +2098,10 @@ def profile_parser() -> argparse.ArgumentParser:
                      help="option bundle for the target: 'switch' (Wedge100BF-32X: 1 s windows, 3-window TTL, batched "
                           "reader on the wire-format route with the syncs in one RPC, read budget 70%% of the window) "
                           "or 'model' (Tofino software model: 60 s windows, batched reader with register syncs, "
-                          "600 s read timeout, no idle clearing, no budget). Options given explicitly override the "
-                          "profile")
+                          "600 s read timeout, no idle clearing, no budget) or 'dataset' (the Wedge producing rows by "
+                          "the dataset's definitions for its detectors: 40 windows of 0.5 s, the dataset's launcher, "
+                          "frame bytes, durations in seconds, dormant reads instead of clears; RUNBOOK 19.9). Options "
+                          "given explicitly override the profile")
     return pre
 
 
@@ -1980,6 +2202,26 @@ def build_arg_parser(profile: Optional[str] = None) -> argparse.ArgumentParser:
                          "start time one second ahead, so host and network windows share one origin. Without this "
                          "option --hostmon is the streaming monitor started as before")
 
+    ap.add_argument("--dormant-reads", type=int, default=0, choices=[0, 1],
+                    help="1: a bucket that leaves the active set is not cleared but read again, round robin, with the "
+                         "allowance left after the active set, so a flow that pauses and resumes keeps its registers "
+                         "(the dataset's extractor never ends a flow); every tracked bucket is cleared at the end of "
+                         "the run, and --clear-expired is not applied during it (RUNBOOK 19.9.1)")
+    ap.add_argument("--byte-layer", choices=["ipv4", "frame"], default="ipv4",
+                    help="'frame' adds 14 B per packet to the byte counts and the packet lengths: the dataset counted "
+                         "Ethernet frames, the switch counts IPv4 totalLen (RUNBOOK 19.9.1)")
+    ap.add_argument("--duration-unit", choices=["ns", "s"], default="ns",
+                    help="unit of net_flow_duration_mean/max: 'ns' (the register difference modulo 2^32) or 's' (the "
+                         "dataset's seconds, the 32-bit wrap resolved from the windows of the flow's first packet and "
+                         "last change; needs windows under 2.1 s)")
+    ap.add_argument("--windows", type=int, default=0,
+                    help="run exactly this many windows whether or not the command has ended, then stop the command "
+                         "(SIGTERM, then SIGKILL) as the dataset's runner did at its timeout; 0: until the command ends")
+    ap.add_argument("--launcher", choices=["shell", "dataset"], default="shell",
+                    help="how --command starts: 'shell' runs it in --shell -c; 'dataset' splits it into words (no shell "
+                         "syntax) and runs it as the dataset's launcher did (/bin/bash -c 'exec \"$@\"' sample-launch "
+                         "PROGRAM ARGS; stdin /dev/null, a new session, a private working directory), whose startup is "
+                         "part of every dataset row's host features (RUNBOOK 19.5.6, 19.9.2)")
     ap.add_argument("--command")
     ap.add_argument("--shell", default="/bin/bash")
 
@@ -2011,6 +2253,11 @@ def main() -> None:
 
     if args.mode == "pcap" and not args.pcap:
         ap.error("--pcap is required when --mode pcap")
+    if args.launcher == "dataset" and args.mode != "command":
+        ap.error("--launcher dataset applies to --mode command")
+    if args.duration_unit == "s" and args.window_sec > TS_WRAP_S / 2:
+        print(f"[WARN] --duration-unit s resolves the 32-bit timestamp wrap from the windows; with {args.window_sec} s "
+              f"windows (over {TS_WRAP_S / 2:.2f} s) a duration can be off by a multiple of {TS_WRAP_S:.3f} s")
 
     for needed in [args.hostmon, args.p4_reader if args.reader == "legacy" else args.batched_reader]:
         if not Path(needed).exists():
@@ -2034,7 +2281,9 @@ def main() -> None:
 
     run_id = f"{args.scenario_name}_{int(time.time())}"
     writer = RunWriter(args.out_csv, run_id)
-    summarizer = NetSummarizer(args.window_sec)
+    summarizer = NetSummarizer(args.window_sec, byte_layer=args.byte_layer, duration_unit=args.duration_unit)
+    # the dataset launcher's private working directory (RUNBOOK 19.5.6)
+    workspace = tempfile.mkdtemp(prefix="sample-launch-") if args.launcher == "dataset" else None
     net_windows: List[Dict[str, object]] = []
     net_summaries: List[Dict[str, object]] = []
     committed = False
@@ -2119,9 +2368,10 @@ def main() -> None:
                     ],
                     text=True,
                 )
-            print(f"[INFO] Running command scenario: {args.command}")
+            print(f"[INFO] Running command scenario ({args.launcher} launcher): {args.command}")
             return run_scenario_command(args.command, shell=args.shell,
-                                        cgroup=str(cgroup_path) if cgroup_path is not None else None)
+                                        cgroup=str(cgroup_path) if cgroup_path is not None else None,
+                                        launcher=args.launcher, workspace=workspace)
 
         if args.hostmon_cgroup:
             # In-kernel monitor: READY, then a shared start time one second ahead;
@@ -2155,7 +2405,14 @@ def main() -> None:
         print(f"[INFO] Reading P4 registers at the end of every window ({args.reader} reader, cost model "
               f"{cost_model.as_dict()}"
               + (f", budget {args.read_budget_frac:.0%} of the window" if args.read_budget_frac > 0 else "")
-              + (", expired buckets cleared unconditionally" if args.clear_expired else "") + ")")
+              + (", expired buckets cleared unconditionally" if args.clear_expired and not args.dormant_reads else "")
+              + (", dormant buckets re-read instead of cleared" if args.dormant_reads else "")
+              + (f", exactly {args.windows} windows" if args.windows else "")
+              + (f", {args.byte_layer} bytes, durations in {args.duration_unit}") + ")")
+
+        def stop_fn() -> None:
+            stop_scenario(workload_proc, own_session=args.launcher == "dataset")
+
         collect_windows_live(
             collector=report_collector,
             proc=workload_proc,
@@ -2178,6 +2435,9 @@ def main() -> None:
             cost_model=cost_model,
             clear_expired=bool(args.clear_expired),
             clear_budget_frac=args.clear_budget_frac,
+            dormant_reads=bool(args.dormant_reads),
+            max_windows=args.windows,
+            stop_fn=stop_fn if args.windows else None,
         )
         report_collector.stop()
         if batched_reader is not None:
@@ -2228,7 +2488,11 @@ def main() -> None:
         write_ready_rows(host_windows, final=True)
 
         if workload_rc != 0:
-            raise RuntimeError(f"Workload failed with code {workload_rc}")
+            if args.windows:
+                print(f"[INFO] the command ended with code {workload_rc} (negative: stopped by that signal); the run "
+                      f"keeps its {args.windows} windows, as the dataset's runs did")
+            else:
+                raise RuntimeError(f"Workload failed with code {workload_rc}")
 
         writer.commit()
         committed = True
@@ -2242,10 +2506,11 @@ def main() -> None:
     finally:
         if workload_proc is not None and workload_proc.poll() is None:
             try:
-                workload_proc.terminate()
-                workload_proc.wait(timeout=2)
+                stop_scenario(workload_proc, own_session=args.launcher == "dataset")
             except Exception:
                 pass
+        if workspace is not None:
+            shutil.rmtree(workspace, ignore_errors=True)
 
         if host_proc is not None:
             stop_hostmon(host_proc)
