@@ -288,6 +288,37 @@ groups:
   18 s is counted in every window; the dataset's network_benign flows are short.
 - also `host_max_run_length_max__max` 65 vs [54, 54] (threaded).
 
+### 2b. The seven server programs again, with `servers.py` on PC2 behind port 140
+
+Later the same day the user authorized PC1's key on PC2, so the drawn topology could be used: `servers.py
+--bind 192.168.0.2 --www /tmp/www` on PC2 (eth1, switch port 140; Python 3.8.10; ufw active but 8089 and
+9100 answer), the common command unchanged (the collector programs 132 <-> 140 itself), `--server
+192.168.0.2`, execution ids `NAME_pc2`, files in `perf/results/dataset_v1/pc2/` (`rows_pc2.csv`,
+`score_pc2.txt`). All seven: `HOSTMON_HEALTH` zeros, 40 rows with equal window starts, 0 overruns, 0
+overloaded, CPU reports = buckets (12, 40, 6, 20, 1, 32, 12, as before), `net_min_len_min` 66, durations
+0-18.08 s without jumps, reads at most 54-88 ms per window; http_poll and tcp_beacon ended with -15, the
+others with 0. Packets: fanout 173, http_poll 480, http_bulk 533, tcp_beacon 200, interactive 277,
+threaded 422, mixed 355 (hairpin: 169, 462, 533, 200, 277, 401, 359; the difference is the programs'
+own variation, e.g. one more poll before the stop).
+
+```
+execution                          category          host  network  hybrid  in range   furthest outside (value vs dataset range)
+fanout_pc2                         benign            0.98     0.11    0.62   80/235    net_down_up_ratio_delta__mean 2.579 vs [0, 0.06627], net_down_up_ratio_delta__sum 103.1 vs [0, 2.651], net_bytes_ba_delta__sum 5.783e+04 vs [0, 2926]
+http_poll_pc2                      network_benign    0.82     0.55    0.69  111/235    host_rare_syscall_ratio_mean__sum 22.47 vs [0.002564, 0.8299], host_rare_syscall_ratio_max__sum 22.47 vs [0.002564, 0.8299], host_rare_syscall_ratio_max__mean 0.5618 vs [6.409e-05, 0.02075]
+http_bulk_pc2                      network_benign    0.91     0.09    0.46  179/235    net_down_up_ratio_delta__max 115.4 vs [0.006492, 1.97], net_down_up_ratio_delta__std 38.27 vs [0.002198, 0.9128], host_first100_unique_mean__max 28 vs [15, 15]
+tcp_beacon_pc2                     network_benign    0.90     0.70    0.80  155/235    host_rare_syscall_ratio_mean__mean 0.3457 vs [6.409e-05, 0.02075], host_rare_syscall_ratio_max__mean 0.3457 vs [6.409e-05, 0.02075], host_rare_syscall_ratio_mean__sum 13.83 vs [0.002564, 0.8299]
+interactive_pc2                    network_benign    0.71     0.79    0.77  164/235    host_first100_unique_max__max 28 vs [15, 15], host_first100_unique_mean__max 28 vs [15, 15], net_flow_duration_mean__sum 397.8 vs [0.0974, 28.65]
+threaded_pc2                       network_benign    0.90     0.13    0.51  180/235    host_first100_unique_mean__max 28 vs [15, 15], host_first100_unique_max__max 28 vs [15, 15], host_max_run_length_max__max 65 vs [54, 54]
+mixed_pc2                          benign            0.92     0.21    0.54   74/235    net_bytes_ba_delta__mean 8133 vs [0, 73.15], net_bytes_ba_delta__sum 3.253e+05 vs [0, 2926], net_down_up_ratio_delta__mean 5.951 vs [0, 0.06627]
+probability of malicious from detectors trained on all 240 dataset rows (0.5 = threshold)
+```
+
+Against the hairpin rows of section 2 every probability is within 0.02 and every `in range` count within
+2 (http_bulk 179 vs 177, interactive 164 vs 166, threaded 180 vs 182), with the same features furthest
+outside. So the hairpin and the two-port topology give the same rows, and the finding of section 2
+stands. PC2 was left as found (server stopped, `/tmp/servers.py`, `/tmp/www` and `/tmp/servers.log`
+removed); `ssh admin@192.168.0.2` from PC1 now works for the next runs.
+
 ### 3. The prologue: 134, not 178
 
 - Collector host total over 40 windows for `sleep 20`: **172** (all in window 0; `HOSTMON_HEALTH` zeros;
