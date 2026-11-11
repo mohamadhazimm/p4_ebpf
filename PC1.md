@@ -619,9 +619,25 @@ The dataset's malware median is 13. 14 of the 45 live benign rows fall below the
 minimum. Where those first calls weigh most, the score stays high: 10 of the 13 executions under 300
 calls are at or above 0.5 on the host side, against 4 of the 23 above 1,000 (busybox sha256sum, cmp and
 wc, rsync-heavy). This fits PC1's Ubuntu 20.04 (glibc 2.31) starting a program with fewer distinct calls than the
-guest's Ubuntu 24.04 (glibc 2.39): consistent with the counts, not shown call by call (the guest's raw
-`syscall_events.csv` are not on PC1). The way to test it is the one part 2 named for the launcher: run the
-programs with the guest's loader and libc, or collect on an Ubuntu 24.04 host.
+guest's glibc 2.43 (2.43-2ubuntu2.4; the VM is named Ubuntu-Clean-24.04, but its libc is newer):
+consistent with the counts, not shown call by call (the guest's raw `syscall_events.csv` are not on PC1).
+The way to test it is the one part 2 named for the launcher: run the programs with the guest's loader
+and libc, or collect on a host with a newer glibc.
+
+**Checked on the lab workstation, 2026-11-11** (offline; study tree
+`additional-study-review-20261022/pc1-part3-check-20261111/`): in the guest's raw runs, every one of the
+18 dynamic benign programs starts with the loader and libc start-up including `set_tid_address`,
+`set_robust_list`, `rseq`, `prlimit64` and `getrandom` (17-22 distinct calls in the first 50). So do 47 of
+59 amd64-static and 21 of 28 i386-static programs, which were built with glibc 2.35 statically (the other
+19 are musl builds). The workstation's glibc 2.35 `/usr/bin/b2sum` makes the same five calls (17 distinct
+in its first 50). Not yet measured on PC1: `strace /usr/bin/b2sum /dev/null` there would show whether
+glibc 2.31 leaves them out. The dataset's static benign builds carry their own C library, so running them
+on PC1 would give the dataset's start-up exactly.
+
+**Table V on PC1.** scikit-learn 1.8 changed how `StratifiedGroupKFold` shuffles the groups. With only
+that change applied to 1.7 the published Table V becomes 0.795 / 0.759 / 0.834 (PC1, 1.9.1: 0.796 /
+0.760 / 0.828), and stock 1.7 gives the paper's 0.784 / 0.756 / 0.823 exactly. The release now requires
+scikit-learn older than 1.8 (release `ce7d51c`).
 
 ### Failures, with their messages
 
