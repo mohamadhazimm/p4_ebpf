@@ -488,3 +488,148 @@ Python workloads of section 2 are a different population and do not measure the 
 State after this part: the services on PC2 stopped and their files removed; `enp5s0` down; the fixture
 files removed (`make_fixtures.py` regenerates them in seconds); scripts, manifest, per-run CSVs and logs,
 `rows_cli.csv` and `score_cli.txt` stay in `perf/results/dataset_v1/benign_cli/`.
+
+## Results, part 3 (PC1, 2026-11-11): the startup-free rows of 2f90549
+
+**Why.** Commit 2f90549 added `live_test/prologuefree/features_05s_prologuefree.csv`: the 240 rows with
+the 90 host columns recomputed without the launcher's 178 calls. PC1 trains the detectors on it and
+scores the 47 executions of part 2, collected again without PC1's own launcher startup.
+
+### The commit's tables on PC1
+
+The CSV's SHA-256 matches the README. In all 240 rows the host total equals `syscall_count` (the
+published rows: `syscall_count` + 178). The release's `evaluation/heldout.py` and `evaluation/combined.py`
+ran unchanged, with `common.load()` pointed at each CSV (dataset repo `.venv`: Python 3.11, NumPy 2.4.6,
+scikit-learn 1.9.1; disk too full for another venv):
+
+| BA | host | network | hybrid |
+|---|---|---|---|
+| Table IV, published -> startup-free | 0.929 -> 0.929 | 0.750 -> 0.750 | 0.926 -> 0.946 |
+| Table V, published -> startup-free | 0.796 -> 0.852 | 0.760 -> 0.760 | 0.828 -> 0.872 |
+
+Table IV is the commit's to the third decimal. Table V's published row differs from the release README
+(0.784 / 0.756 / 0.823, tested with scikit-learn 1.7), most likely through the fold assignments of
+`StratifiedGroupKFold` in 1.9.1; the change from published to startup-free is the commit's (host +0.056
+here against +0.048, hybrid +0.044 against +0.043).
+
+### The live rows without the startup
+
+- **Launch.** `live_test/prologuefree/pfexec.c` (static C), the rule of 19.5.6 ("the monitored process
+  joins the cgroup immediately before it execs the target"), made exact: its child asks to be traced and
+  execs the program; the successful exec stops it before its first instruction; `pfexec` moves it into
+  the watched cgroup, detaches and waits, and exits like the program (code or signal). The first call
+  counted is the program's first call after its execve, the dataset's cut. `-o FILE` opens stdout before
+  the fork and replaces `bin/outto`. `hybrid_collector.py` is unchanged: `--hostmon-cgroup
+  /sys/fs/cgroup/unified/hazim_launch` (the launcher's bash joins it; not watched) and `--hostmon` a
+  two-line wrapper that runs `hostmon_agg "$1" /sys/fs/cgroup/unified/hazim_prog`; each command is
+  `pfexec /sys/fs/cgroup/unified/hazim_prog [-o FILE] PROG ARGS` (part 2's manifest otherwise).
+- **Exact.** Offline, `hostmon_agg` on the cgroup counts strace's total as root minus the execve:
+  `/bin/true` 29, `busybox true` 12, `b2sum` 47, a PATH lookup 29. In the collector `b2sum` light 77 =
+  78 - 1 (strace's extra `ioctl(TCGETS)` comes from its stdout on `/dev/null`). Part 2 minus now:
+  **107** in 27 of the 32 direct runs (PC1's launcher with absolute paths; part 1's 134 for `sleep 20`
+  probably adds bash's PATH search for `sleep`, not checked) and 120 = 107 + 13 (`outto`) in 13 of 15; the others are programs whose own
+  count varies (rsync, git) and bzip2-heavy (stopped at 20 s both times). Null rows now 10 and 12 calls.
+- **Checks.** All 47: `HOSTMON_HEALTH` zeros, 40 rows, 0 overruns, 0 overloaded windows, collector exit 0,
+  nothing left in the watched cgroup after any run. Exit codes as in part 2 (null x2 and bzip2-heavy -15, telnet 1).
+  Services on PC2 as in part 2 (`openssl s_server -www` with a new self-signed RSA-2048 certificate).
+
+### Scores
+
+`score.py` with the detectors and category ranges from the startup-free CSV, verbatim:
+
+```
+execution                          category          host  network  hybrid  in range   furthest outside (value vs dataset range)
+null-static-glibc-amd64_static     null              0.98     0.39    0.97  169/235    host_first100_unique_mean__sum 6 vs [14, 14], host_first100_unique_mean__max 6 vs [14, 14], host_first50_unique_mean__max 6 vs [14, 14]
+null-busybox-sleep-amd64_static    null              0.97     0.39    0.97  169/235    host_first100_unique_mean__max 8 vs [14, 14], host_first50_unique_mean__max 8 vs [14, 14], host_first50_unique_mean__sum 8 vs [14, 14]
+coreutils-b2sum-light-amd64_dynami benign            0.73     0.39    0.53  229/235    host_unique_syscalls_mean__mean 0.375 vs [0.4, 1.95], host_unique_syscalls_max__mean 0.375 vs [0.4, 1.95], host_unique_syscalls_max__sum 15 vs [16, 78]
+coreutils-b2sum-medium-amd64_dynam benign            0.27     0.39    0.24  229/235    host_unique_syscalls_mean__mean 0.375 vs [0.4, 1.95], host_unique_syscalls_max__mean 0.375 vs [0.4, 1.95], host_unique_syscalls_max__sum 15 vs [16, 78]
+coreutils-b2sum-heavy-amd64_dynami benign            0.28     0.39    0.21  229/235    host_unique_syscalls_mean__mean 0.375 vs [0.4, 1.95], host_unique_syscalls_max__mean 0.375 vs [0.4, 1.95], host_unique_syscalls_max__sum 15 vs [16, 78]
+coreutils-md5sum-heavy-amd64_dynam benign            0.28     0.39    0.21  229/235    host_unique_syscalls_mean__mean 0.375 vs [0.4, 1.95], host_unique_syscalls_max__mean 0.375 vs [0.4, 1.95], host_unique_syscalls_max__sum 15 vs [16, 78]
+coreutils-sha256sum-medium-amd64_d benign            0.27     0.39    0.24  229/235    host_unique_syscalls_mean__mean 0.375 vs [0.4, 1.95], host_unique_syscalls_max__mean 0.375 vs [0.4, 1.95], host_unique_syscalls_max__sum 15 vs [16, 78]
+coreutils-cksum-heavy-amd64_dynami benign            0.24     0.39    0.21  229/235    host_unique_syscalls_mean__mean 0.375 vs [0.4, 1.95], host_unique_syscalls_max__mean 0.375 vs [0.4, 1.95], host_unique_syscalls_max__sum 15 vs [16, 78]
+coreutils-sum-light-amd64_dynamic  benign            0.34     0.39    0.29  229/235    host_unique_syscalls_mean__mean 0.375 vs [0.4, 1.95], host_unique_syscalls_max__mean 0.375 vs [0.4, 1.95], host_unique_syscalls_max__sum 15 vs [16, 78]
+coreutils-wc-medium-amd64_dynamic  benign            0.34     0.39    0.23  227/235    host_unique_syscalls_mean__std 2.186 vs [2.376, 5.62], host_unique_syscalls_max__std 2.186 vs [2.376, 5.933], host_unique_syscalls_mean__max 14 vs [15, 36]
+coreutils-od-light-amd64_dynamic   benign            0.38     0.39    0.28  231/235    host_unique_syscalls_mean__max 12 vs [15, 36], host_unique_syscalls_max__max 12 vs [15, 38], host_unique_syscalls_mean__std 2.011 vs [2.376, 5.62]
+coreutils-sort-heavy-amd64_dynamic benign            0.02     0.39    0.02  235/235    
+coreutils-base64-light-amd64_dynam benign            0.36     0.39    0.32  229/235    host_unique_syscalls_mean__mean 0.375 vs [0.4, 1.95], host_unique_syscalls_max__mean 0.375 vs [0.4, 1.95], host_unique_syscalls_max__sum 15 vs [16, 78]
+coreutils-base64-medium-amd64_dyna benign            0.31     0.39    0.27  229/235    host_unique_syscalls_mean__mean 0.375 vs [0.4, 1.95], host_unique_syscalls_max__mean 0.375 vs [0.4, 1.95], host_unique_syscalls_max__sum 15 vs [16, 78]
+coreutils-base64-heavy-amd64_dynam benign            0.32     0.39    0.27  221/235    host_unique_syscalls_mean__mean 0.375 vs [0.4, 1.95], host_unique_syscalls_max__mean 0.375 vs [0.4, 1.95], host_unique_syscalls_mean__sum 15 vs [16, 78]
+gzip-light-amd64_dynamic           benign            0.76     0.39    0.55  227/235    host_unique_syscalls_mean__std 2.186 vs [2.376, 5.62], host_unique_syscalls_max__std 2.186 vs [2.376, 5.933], host_unique_syscalls_mean__max 14 vs [15, 36]
+bzip2-light-amd64_dynamic          benign            0.05     0.39    0.05  235/235    
+gzip-medium-amd64_dynamic          benign            0.34     0.39    0.26  227/235    host_unique_syscalls_mean__std 2.186 vs [2.376, 5.62], host_unique_syscalls_max__std 2.186 vs [2.376, 5.933], host_unique_syscalls_mean__max 14 vs [15, 36]
+bzip2-medium-amd64_dynamic         benign            0.18     0.39    0.08  227/235    host_rare_syscall_ratio_mean__active_windows 6 vs [1, 4], host_rare_syscall_ratio_max__active_windows 6 vs [1, 4], host_unique_syscalls_mean__max 14 vs [15, 36]
+gzip-heavy-amd64_dynamic           benign            0.48     0.39    0.22  231/235    host_unique_syscalls_mean__max 12 vs [15, 36], host_unique_syscalls_max__max 12 vs [15, 38], host_unique_syscalls_mean__std 1.96 vs [2.376, 5.62]
+bzip2-heavy-amd64_dynamic          benign            0.43     0.39    0.25  210/235    host_rare_syscall_ratio_mean__active_windows 16 vs [1, 4], host_rare_syscall_ratio_max__active_windows 16 vs [1, 4], host_top_syscall_freq_mean__sum 39.85 vs [0.1351, 25.12]
+xz-utils-xz-heavy-amd64_dynamic    benign            0.36     0.39    0.28  231/235    host_first50_unique_mean__max 10 vs [11, 24], host_first50_unique_max__max 10 vs [11, 24], host_first50_unique_mean__std 1.574 vs [1.717, 3.747]
+lz4-heavy-amd64_dynamic            benign            0.37     0.39    0.41  235/235    
+diffutils-cmp-medium-amd64_dynamic benign            0.33     0.39    0.18  229/235    host_unique_syscalls_mean__mean 0.375 vs [0.4, 1.95], host_unique_syscalls_max__mean 0.375 vs [0.4, 1.95], host_unique_syscalls_max__sum 15 vs [16, 78]
+tar-heavy-amd64_dynamic            benign            0.38     0.39    0.50  227/235    host_first50_unique_max__std 1.561 vs [1.717, 3.747], host_first50_unique_mean__std 1.561 vs [1.717, 3.747], host_first50_unique_mean__max 10 vs [11, 24]
+zip-heavy-amd64_dynamic            benign            0.36     0.39    0.23  235/235    
+unzip-heavy-amd64_dynamic          benign            0.35     0.39    0.28  235/235    
+rsync-light-amd64_dynamic          benign            0.75     0.39    0.83  234/235    host_entropy_max__max 4.348 vs [0.01763, 4.301]
+rsync-heavy-amd64_dynamic          benign            0.63     0.39    0.62  234/235    host_entropy_max__max 4.315 vs [0.01763, 4.301]
+git-light-amd64_dynamic            benign            0.55     0.39    0.72  227/235    host_first50_unique_max__std 1.561 vs [1.717, 3.747], host_first50_unique_mean__std 1.561 vs [1.717, 3.747], host_first50_unique_mean__max 10 vs [11, 24]
+git-heavy-amd64_dynamic            benign            0.77     0.39    0.68  231/235    host_first50_unique_mean__max 10 vs [11, 24], host_first50_unique_max__max 10 vs [11, 24], host_first50_unique_mean__std 1.565 vs [1.717, 3.747]
+curl-net-amd64_dynamic             benign            0.65     0.00    0.56  219/235    host_first50_unique_max__std 1.561 vs [1.717, 3.747], host_first50_unique_mean__std 1.561 vs [1.717, 3.747], host_first50_unique_max__max 10 vs [11, 24]
+curl-net-2-amd64_dynamic           benign            0.65     0.21    0.60  219/235    host_first50_unique_max__std 1.561 vs [1.717, 3.747], host_first50_unique_mean__std 1.561 vs [1.717, 3.747], host_first50_unique_max__max 10 vs [11, 24]
+wget-net-amd64_dynamic             benign            0.83     0.02    0.50  215/235    host_first50_unique_mean__std 1.405 vs [1.717, 3.747], host_first50_unique_max__std 1.405 vs [1.717, 3.747], host_first50_unique_mean__max 9 vs [11, 24]
+openssl-net-amd64_dynamic          benign            0.74     0.00    0.34  219/235    host_first50_unique_mean__std 1.561 vs [1.717, 3.747], host_first50_unique_max__std 1.561 vs [1.717, 3.747], host_first50_unique_mean__max 10 vs [11, 24]
+inetutils-telnet-net-amd64_dynamic benign            0.80     0.10    0.54  227/235    host_first50_unique_max__std 1.561 vs [1.717, 3.747], host_first50_unique_mean__std 1.561 vs [1.717, 3.747], host_first50_unique_max__max 10 vs [11, 24]
+inetutils-ftp-net-amd64_dynamic    benign            0.71     0.00    0.42  229/235    net_ba_ratio_pkt_delta__std 0.08516 vs [0, 0.07206], net_ba_ratio_pkt_delta__mean 0.01364 vs [0, 0.01154], net_ba_ratio_pkt_delta__sum 0.5455 vs [0, 0.4615]
+inetutils-ping-net-amd64_dynamic   benign            0.79     0.39    0.89  227/235    host_first50_unique_max__std 1.561 vs [1.717, 3.747], host_first50_unique_mean__std 1.561 vs [1.717, 3.747], host_first50_unique_mean__max 10 vs [11, 24]
+busybox-md5sum-light-amd64_static  benign            0.67     0.39    0.69  207/235    host_first50_unique_mean__std 1.405 vs [1.717, 3.747], host_first50_unique_max__std 1.405 vs [1.717, 3.747], host_first50_unique_mean__max 9 vs [11, 24]
+busybox-sha256sum-medium-amd64_sta benign            0.64     0.39    0.63  207/235    host_first50_unique_mean__std 1.405 vs [1.717, 3.747], host_first50_unique_max__std 1.405 vs [1.717, 3.747], host_first50_unique_mean__max 9 vs [11, 24]
+busybox-gzip-heavy-amd64_static    benign            0.02     0.39    0.01  235/235    
+busybox-bzip2-medium-amd64_static  benign            0.37     0.39    0.21  233/235    host_rare_syscall_ratio_max__active_windows 9 vs [1, 4], host_rare_syscall_ratio_mean__active_windows 9 vs [1, 4]
+busybox-wc-heavy-amd64_static      benign            0.61     0.39    0.50  219/235    host_unique_syscalls_mean__max 10 vs [15, 36], host_unique_syscalls_max__max 10 vs [15, 38], host_unique_syscalls_mean__std 1.8 vs [2.376, 5.62]
+busybox-cmp-medium-amd64_static    benign            0.66     0.39    0.63  207/235    host_unique_syscalls_mean__std 1.717 vs [2.376, 5.62], host_unique_syscalls_mean__max 11 vs [15, 36], host_unique_syscalls_max__std 1.717 vs [2.376, 5.933]
+busybox-tar-heavy-amd64_static     benign            0.40     0.39    0.51  235/235    
+busybox-wget-net-amd64_static      benign            0.23     0.01    0.12  231/235    net_ba_ratio_pkt_delta__std 0.07806 vs [0, 0.07206], net_ba_ratio_pkt_delta__mean 0.0125 vs [0, 0.01154], net_ba_ratio_pkt_delta__sum 0.5 vs [0, 0.4615]
+diffutils-cmp-heavy-amd64_dynamic  benign            0.39     0.39    0.20  219/235    host_unique_syscalls_mean__mean 0.375 vs [0.4, 1.95], host_unique_syscalls_max__mean 0.375 vs [0.4, 1.95], host_unique_syscalls_max__sum 15 vs [16, 78]
+probability of malicious from detectors trained on all 240 dataset rows (0.5 = threshold)
+```
+
+Against part 2 (launcher included, published detectors):
+
+| below 0.5, of 47 | part 2 | startup-free |
+|---|---|---|
+| host | 30 | 28 |
+| hybrid | 33 | 28 |
+| network | 47 | 47 |
+
+- The launcher's signature is gone: `in range` rises for 40 of the 47 rows, 8 rows lie fully inside
+  (235/235), and `host_first100_unique` 28 against [15, 17.33] no longer appears. sort-heavy, bzip2-light
+  and busybox gzip-heavy score 0.01-0.05; lz4-heavy 0.66 -> 0.37, busybox tar 0.68 -> 0.40, busybox wget
+  0.65 -> 0.23, busybox bzip2-medium 0.70 -> 0.37 (host).
+- Higher than before: the null rows 0.71 -> 0.98 (10 and 12 calls against the dataset's 18, three null
+  rows in all), the network clients on the host side (curl 0.40 -> 0.65 twice, wget 0.67 -> 0.83, openssl
+  0.66 -> 0.74, telnet 0.72 -> 0.80, ping 0.68 -> 0.79) and four busybox applets (md5sum 0.45 -> 0.67,
+  sha256sum 0.37 -> 0.64, cmp 0.37 -> 0.66, wc 0.42 -> 0.61).
+
+**What still differs: the program's own C library startup.** Without the launcher, the first calls of
+every row are the program's loader and libc start. Distinct syscalls among the first 50
+(`host_first50_unique_mean__max`), benign rows:
+
+| build | dataset (n, min / median / max) | live (n, min / median / max) |
+|---|---|---|
+| amd64_dynamic | 18: 17 / 19 / 22 | 37: 9 / 12 / 16 |
+| static | 87: 11 / 17 / 24 | 8 (busybox): 9 / 14 / 18 |
+
+The dataset's malware median is 13. 14 of the 45 live benign rows fall below the dataset's benign
+minimum. Where those first calls weigh most, the score stays high: 10 of the 13 executions under 300
+calls are at or above 0.5 on the host side, against 4 of the 23 above 1,000 (busybox sha256sum, cmp and
+wc, rsync-heavy). This fits PC1's Ubuntu 20.04 (glibc 2.31) starting a program with fewer distinct calls than the
+guest's Ubuntu 24.04 (glibc 2.39): consistent with the counts, not shown call by call (the guest's raw
+`syscall_events.csv` are not on PC1). The way to test it is the one part 2 named for the launcher: run the
+programs with the guest's loader and libc, or collect on an Ubuntu 24.04 host.
+
+### Failures, with their messages
+
+- cmp-heavy, first run: `/usr/bin/cmp: .../fx/heavy_copy.bin: No such file or directory` (exit 2): the
+  manifest that ran in part 2 compares against `heavy_copy.bin`, and the fixture had been removed to save
+  disk. Recreated and rerun; the table holds the rerun.
+
+State after this part: services on PC2 stopped and their files removed; `enp5s0` down; our `basic_fix`
+switchd untouched; both cgroups and the fixtures removed. Scripts, manifest, per-run CSVs and logs,
+`rows_pf.csv`, `score_pf.txt`, `compare_parts.txt` and the two tables' outputs stay in
+`perf/results/dataset_v1/prologuefree/` (git-ignored).
