@@ -770,3 +770,51 @@ faithful pipeline gives about those numbers; part 3's 19 of 47 would show as man
 **What comes back.** The comparison's printed table and `compare.json`, `runs/rows.csv`, and any case whose
 collector failed or whose exit code differs from `cases.tsv` (the runner prints both). Expected differences
 worth noting rather than fixing: a few calls from PC1's kernel, and programs whose count depends on timing.
+
+## Part 7 (ready, 2026-11-15): a verdict every window, and a drop rule on the verdict
+
+*For the committee's items 5 (online detection) and 6 (closing the loop: on a malicious verdict, have the switch
+drop the host's flows, and measure time-to-containment). Offline (committee-eval-20261113 REPORT.md 2.6), a model
+trained on observation prefixes makes about 95% of its detections in the first 0.5-s window, floods 98%.*
+
+**Tool.** `live_test/streaming/stream_verdicts.py COLLECTOR.csv`: the paper's forests trained on every dataset
+run at the prefixes 1, 2, 4, 6, 10, 16, 20, 30, 40 windows (`live_test/streaming/dataset_windows.csv.gz`: the
+240 runs' 0.5-s window signals, 170 kB; the 40-window summaries reproduce every published row); after each new
+window it summarizes the run so far like a dataset row and prints a probability. `--detector network` (default:
+a replay has no host side), `--hold-out-group G` trains without the dataset runs of group G (the replayed run's
+`cv_group` in the manifest; otherwise the verdict is in-sample), `--skip-windows K` for a replay anchored on
+window K, `--follow` to score while the collector writes, `--on-alarm "CMD"` runs CMD once at the first window
+over `--threshold` (STREAM_WINDOW and STREAM_PROBABILITY in its environment), `--log` a JSONL record. Checked on
+the workstation: syn_fan_40k held out alarms at window 0 (p 0.98), bulk2000 and a coreutils run do not alarm;
+in `--follow` mode it scored rows as they were appended and ran the hook once. Training takes ~1 s (network) to
+~15 s (stacked).
+
+**Step 1, no switch change: verdicts on the switch's own windows.** After Part 4, for each replay directory:
+
+    ../venv/bin/python3 live_test/streaming/stream_verdicts.py DIR/windows.csv --skip-windows 4 \
+        --hold-out-group CV_GROUP --log DIR/stream.jsonl
+
+and note the first alarm window per run (attacks, network-benign and malware separately). The offline value to
+compare with comes from the same windows in the dataset.
+
+**Step 2, the drop rule (a switch change for this part only).** Add to `ingress.p4` a table after
+`forwarding.apply()`, only for valid IPv4, keyed exactly on `hdr.ipv4.srcAddr`, with the actions `drop` (the
+existing one) and `NoAction` (default), size 1,024; the flow registers are updated earlier, so blocked packets are
+still counted. A small control-plane script (bfrt, like `program_forwarding.py`) adds and removes an entry and
+prints the time the add call returned. Record the compiler's stages and resources, since the table may cost a
+stage, and keep the build separate from the measured detector of section 4 / 5.5.
+
+**Step 3, time to containment.** Replay one attack capture at a time (from `cohort-extra`: `udp_sink_60k`,
+`syn_sink_40k`, `syn_fan_40k` and a GoldenEye run) through the switch with the collector (`--profile dataset`,
+as Part 4) and, beside it,
+
+    ../venv/bin/python3 live_test/streaming/stream_verdicts.py DIR/windows.csv --follow --skip-windows 4 \
+        --hold-out-group CV_GROUP --log DIR/stream.jsonl --on-alarm "python3 MITIGATE add 10.0.0.10"
+
+and count, behind port 140 (a capture on PC2, or the port's counters), the replay's packets forwarded before and
+after the rule. Per run: first attack packet sent, alarm window and time, rule-install time, last forwarded packet,
+and the share of the attack dropped. Then the same with three benign replays (`bulk2000`, `session_1000`,
+`dns_10k`): does any get blocked, and when? Remove the entry after every run.
+
+**What comes back.** Step 1's first-alarm windows; for step 3 the per-run times and counts, the `stream.jsonl`
+files, the compiler's resource lines for the variant with the table, and any failure.
