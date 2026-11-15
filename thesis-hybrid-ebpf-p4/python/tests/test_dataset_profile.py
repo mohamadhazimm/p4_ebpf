@@ -466,26 +466,63 @@ class GlobalTotalsSummaryTests(unittest.TestCase):
         calls = []
 
         def reader(indexes, w, **kw):
-            calls.append(kw)
+            calls.append((list(indexes), kw))
             return {"rows": [mkrow(i, 10 * (w + 1)) for i in indexes], "dst_rows": [], "cleared": [], "errors": [],
-                    "timing": {"sync_ms": 1.0, "read_ms": 1.0, "clear_ms": 0.0}, "totals": totals(10 * (w + 1), 0)}
+                    "timing": {"sync_ms": 1.0, "read_ms": 1.0, "clear_ms": 0.0,
+                               "reader_t_totals_start": 7.0 + w, "reader_t_totals_end": 7.5 + w},
+                    "totals": totals(10 * (w + 1), 0) if kw.get("totals") else None}
 
-        t0 = clock.time()
-        windows = hc.collect_windows_live(FakeCollector({0: [1]}, t0, 0.5), NeverEndingProc(), 0.5, 0.0, t0, "r.py",
-                                          active_ttl_windows=3, clear_idle_windows=0, read_fn=reader, clock=clock,
-                                          max_windows=3, global_totals=True)
-        self.assertTrue(all(c.get("totals") is True for c in calls[:3]))
+        def run(n, **kw):
+            calls[:] = []
+            return hc.collect_windows_live(FakeCollector({0: [1]}, clock.time(), 0.5), NeverEndingProc(), 0.5, 0.0,
+                                           clock.time(), "r.py", active_ttl_windows=3, clear_idle_windows=0,
+                                           read_fn=reader, clock=clock, max_windows=n, global_totals=True, **kw)
+
+        # default "boundary": a totals-only request first, then the window's read without them
+        windows = run(3)
+        self.assertEqual([(i, k.get("totals")) for i, k in calls],
+                         [([], True), ([1], None), ([], True), ([1], None), ([], True), ([1], None)])
         self.assertEqual([w["totals"]["pkts"] for w in windows], [10, 20, 30])
+        self.assertEqual({w["totals_cut"] for w in windows}, {"boundary"})
+        windows = run(2, totals_cut="read")
+        self.assertEqual([k.get("totals") for _i, k in calls], [True, True])
+        self.assertEqual({w["totals_cut"] for w in windows}, {"read"})
+        run(2, totals_cut="snapshot")
+        self.assertEqual([k.get("totals") for _i, k in calls], ["snapshot", "snapshot"])
         with contextlib.redirect_stdout(io.StringIO()):
-            plain = hc.collect_windows_live(FakeCollector({0: [1]}, t0, 0.5), NeverEndingProc(), 0.5, 0.0,
+            plain = hc.collect_windows_live(FakeCollector({0: [1]}, clock.time(), 0.5), NeverEndingProc(), 0.5, 0.0,
                                             clock.time(), "r.py", active_ttl_windows=3, clear_idle_windows=0,
                                             read_fn=reader, clock=clock, max_windows=2)
         self.assertIsNone(plain[0]["totals"])
+        self.assertIsNone(plain[0]["totals_cut"])
+
+    def test_a_failed_boundary_read_leaves_the_totals_to_the_windows_read(self):
+        clock = FakeClock()
+        calls = []
+
+        def reader(indexes, w, **kw):
+            calls.append((list(indexes), kw.get("totals")))
+            if not indexes and kw.get("totals"):
+                raise RuntimeError("batched reader: no reply")
+            return {"rows": [mkrow(i, 10 * (w + 1)) for i in indexes], "dst_rows": [], "cleared": [], "errors": [],
+                    "timing": {"sync_ms": 1.0, "read_ms": 1.0, "clear_ms": 0.0}, "totals": totals(10 * (w + 1), 0)}
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            windows = hc.collect_windows_live(FakeCollector({0: [1]}, clock.time(), 0.5), NeverEndingProc(), 0.5, 0.0,
+                                              clock.time(), "r.py", active_ttl_windows=3, clear_idle_windows=0,
+                                              read_fn=reader, clock=clock, max_windows=2, global_totals=True)
+        self.assertEqual(calls, [([], True), ([1], True), ([], True), ([1], True)])
+        self.assertEqual([w["totals"]["pkts"] for w in windows], [10, 20])
+        self.assertEqual({w["totals_cut"] for w in windows}, {"read"})
+        self.assertIn("the boundary totals read failed", out.getvalue())
 
     def test_the_option(self):
         args = hc.build_arg_parser("dataset").parse_args(ProfileTests.BASE + ["--profile", "dataset", "--global-totals", "1"])
-        self.assertEqual(args.global_totals, 1)
+        self.assertEqual((args.global_totals, args.totals_cut), (1, "boundary"))
         self.assertEqual(hc.build_arg_parser().parse_args(ProfileTests.BASE).global_totals, 0)
+        self.assertEqual(hc.build_arg_parser().parse_args(ProfileTests.BASE + ["--totals-cut", "snapshot"]).totals_cut,
+                         "snapshot")
 
 
 class MissingDestinationRegisterTests(unittest.TestCase):

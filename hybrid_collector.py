@@ -824,7 +824,7 @@ class BatchedReaderProcess:
              clear_if_unchanged: Optional[Dict[int, int]] = None, snapshot: str = "sync",
              timeout: Optional[float] = None, source: str = "batched gRPC",
              clear_indexes: Optional[List[int]] = None, probe: Optional[Dict[int, int]] = None,
-             probe_max_full: Optional[int] = None, totals: bool = False) -> Dict[str, Any]:
+             probe_max_full: Optional[int] = None, totals: Any = False) -> Dict[str, Any]:
         if self._proc is None or self._proc.poll() is not None:
             self.start()
         assert self._proc is not None and self._proc.stdin is not None
@@ -838,7 +838,9 @@ class BatchedReaderProcess:
             if probe_max_full is not None:
                 request["probe_max_full"] = int(probe_max_full)
         if totals:
-            request["totals"] = True    # the gtot build's one-entry totals (batched_reader.read_window)
+            # the gtot build's one-entry totals (batched_reader.read_window): from hardware before the flow
+            # registers' sync, or "snapshot": synced with them (PC1.md part 4d's cut)
+            request["totals"] = "snapshot" if totals == "snapshot" else True
         t_sent = time.time()
         self._proc.stdin.write(json.dumps(request) + "\n")
         self._proc.stdin.flush()
@@ -900,6 +902,8 @@ class BatchedReaderProcess:
 # Absolute times a batched read reports (RUNBOOK 19.6); the timing log keeps them per window.
 CLOCK_KEYS = ("collector_t_sent", "collector_t_reply", "reader_t_recv", "reader_t_sync_start",
               "reader_t_sync_end", "reader_t_send")
+# --global-totals: the reader's clock around the totals' read, i.e. their cut (PC1.md part 4e)
+TOTALS_CLOCK_KEYS = ("reader_t_totals_start", "reader_t_totals_end")
 
 
 def make_timing_logger(reader_name: str, path: Optional[str] = None) -> Callable[..., None]:
@@ -931,7 +935,7 @@ def make_timing_logger(reader_name: str, path: Optional[str] = None) -> Callable
                   # absolute times (RUNBOOK 19.6): the window's end and the read on the collector's clock,
                   # and the batched reader's request, snapshot and reply times on the reader's clock
                   "t_window_end": window_end, "t_read_start": read_start, "t_read_end": read_end,
-                  "clock": {k: timing[k] for k in CLOCK_KEYS if k in timing}}
+                  "clock": {k: timing[k] for k in CLOCK_KEYS + TOTALS_CLOCK_KEYS if k in timing}}
         if extra:
             record.update(extra)
         print(f"[TIMING] window {window}: reader={reader_name}{'/' + parser if parser else ''} "
@@ -1331,6 +1335,7 @@ def collect_windows_live(
     dormant_reads: bool = False,
     dormant_probe: bool = False,
     global_totals: bool = False,
+    totals_cut: str = "boundary",
     max_windows: int = 0,
     stop_fn: Optional[Callable[[], None]] = None,
 ) -> List[Dict[str, object]]:
@@ -1394,9 +1399,16 @@ def collect_windows_live(
     "dormant_deferred_indexes".
 
     global_totals (the test build perf/variants/gtot and the batched reader):
-    every read also returns the seven one-entry totals from the same snapshot
-    (window["totals"]); NetSummarizer(global_totals=True) takes the window's
-    packet, byte and flag totals from their differences.
+    every read also returns the seven one-entry totals (window["totals"]);
+    NetSummarizer(global_totals=True) takes the window's packet, byte and flag
+    totals from their differences. totals_cut "boundary": a request of their
+    own right after the boundary, before the reports are taken and the read is
+    planned (the reader reads them from hardware, no sync: their cut ~2 ms after
+    the boundary, PC1.md part 4e); if it fails, the window's read takes them.
+    "read": in the window's read, from hardware before the flow registers'
+    sync (cut after the reports' processing: ~2 ms calm, ~35 ms under a flood).
+    "snapshot": synced with the flow registers, last in the ~31 ms sync (part
+    4d), so a window's first ~30 ms or more counted in the window before.
 
     A program without reg_newconn_dst (the deployed basic_fix) answers its reads
     with an error and no rows: from then on no destination bucket is requested
@@ -1485,6 +1497,24 @@ def collect_windows_live(
             print(f"[WARN] window {w}: register read of the previous window overran by "
                   f"{now - win_end_abs:.1f} s")
         t_iter_start = clk.time()
+
+        boundary_totals: Optional[Dict[str, Any]] = None
+        boundary_timing: Dict[str, Any] = {}
+        if global_totals and totals_cut == "boundary":
+            # The totals' cut right after the boundary (PC1.md part 4e): a totals-only request, before the reports
+            # are taken. If it fails (after read_fn's retries), the window's read takes them.
+            try:
+                # (global_totals is off without the batched reader, so read_fn is set here)
+                bp = read_fn([], w, snapshot=snapshot, clear_if_unchanged={}, dst_indexes=[], totals=True)
+                if isinstance(bp.get("totals"), dict) and all(bp["totals"].get(k) is not None for k in GTOT_KEYS):
+                    boundary_totals = bp["totals"]
+                    boundary_timing = {k: v for k, v in (bp.get("timing") or {}).items() if k in TOTALS_CLOCK_KEYS}
+                else:
+                    print(f"[WARN] window {w}: the boundary totals read returned no totals "
+                          f"({bp.get('errors')}); the window's read takes them")
+            except Exception as error:
+                print(f"[WARN] window {w}: the boundary totals read failed ({describe_failure(error)}); "
+                      f"the window's read takes them")
 
         reports = collector.take(win_start_abs, win_end_abs)
         idxs = sorted({safe_int(r["idx"]) for r in reports})
@@ -1639,8 +1669,8 @@ def collect_windows_live(
             extra["probe"] = probe_now
             if probe_max_full is not None:
                 extra["probe_max_full"] = probe_max_full
-        if global_totals:
-            extra["totals"] = True
+        if global_totals and boundary_totals is None:
+            extra["totals"] = "snapshot" if totals_cut == "snapshot" else True
         read_start = clk.time()
         if read_fn is None:
             payload = read_p4_with_retries(reader_path, request_idxs, w, retries=read_retries, timeout=read_timeout,
@@ -1650,6 +1680,8 @@ def collect_windows_live(
             payload = read_fn(request_idxs, w, snapshot=snapshot, clear_if_unchanged=clear_candidates,
                               dst_indexes=read_dst_idxs, **extra)
         read_end = clk.time()
+        if boundary_totals is not None and isinstance(payload.get("timing"), dict):
+            payload["timing"].update(boundary_timing)     # the totals' cut, for the timing log
         resumed_now = sorted(safe_int(i) for i in (payload.get("resumed") or []))
         deferred_now = sorted(safe_int(i) for i in (payload.get("deferred") or []))
         dormant_probe_resumed_total += len(resumed_now)
@@ -1768,7 +1800,10 @@ def collect_windows_live(
             "dormant_probed_count": len(probe_now),
             "dormant_resumed_indexes": resumed_now,
             "dormant_deferred_indexes": deferred_now,
-            "totals": payload.get("totals") if global_totals else None,
+            "totals": (boundary_totals if boundary_totals is not None else payload.get("totals"))
+                      if global_totals else None,
+            "totals_cut": (("boundary" if boundary_totals is not None else
+                            ("snapshot" if totals_cut == "snapshot" else "read")) if global_totals else None),
             "p4_snapshot": payload.get("snapshot"),
             "p4_read_start_sec": round(read_start - global_t0, 3),
             "p4_read_sec": round(read_end - read_start, 3),
@@ -2473,6 +2508,11 @@ def build_arg_parser(profile: Optional[str] = None) -> argparse.ArgumentParser:
                     help="test build perf/variants/gtot with the batched reader: read its seven one-entry totals "
                          "every window and take the window's packet, byte and TCP-flag totals from them, so that "
                          "an overloaded read does not shrink them (PC1.md part 4d); adds net_gtot_* check columns")
+    ap.add_argument("--totals-cut", default="boundary", choices=["boundary", "read", "snapshot"],
+                    help="with --global-totals 1: 'boundary' reads the totals in a request of their own right after "
+                         "the window boundary (cut ~2 ms after it, PC1.md part 4e); 'read' in the window's read, "
+                         "before the flow registers' sync (after the reports' processing); 'snapshot' synced with "
+                         "the flow registers, last in the ~31 ms sync (part 4d)")
     ap.add_argument("--byte-layer", choices=["ipv4", "frame"], default="ipv4",
                     help="'frame' adds 14 B per packet to the byte counts and the packet lengths: the dataset counted "
                          "Ethernet frames, the switch counts IPv4 totalLen (RUNBOOK 19.9.1)")
@@ -2715,6 +2755,7 @@ def main() -> None:
             dormant_reads=bool(args.dormant_reads),
             dormant_probe=bool(args.dormant_probe),
             global_totals=bool(args.global_totals),
+            totals_cut=args.totals_cut,
             max_windows=args.windows,
             stop_fn=stop_fn if args.windows else None,
         )

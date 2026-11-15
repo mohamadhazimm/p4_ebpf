@@ -457,8 +457,9 @@ class DormantProbeTests(unittest.TestCase):
 
 
 class GlobalTotalsTests(unittest.TestCase):
-    """read_window(totals=True) on the test build perf/variants/gtot (PC1.md part 4d): the seven one-entry totals,
-    synced with the flow registers, summed over the pipes."""
+    """read_window(totals=True) on the test build perf/variants/gtot (PC1.md parts 4d, 4e): the seven one-entry
+    totals, summed over the pipes; read from hardware before the flow registers' sync, or (totals="snapshot")
+    synced with them."""
 
     def gtot_switch(self):
         sw = bfrt_mock.MockSwitch(registers=bfrt_mock.REG_NAMES + bfrt_mock.GLOBAL_NAMES)
@@ -479,14 +480,66 @@ class GlobalTotalsTests(unittest.TestCase):
         self.assertEqual(list(payload)[-2:], ["totals", "rows"])
         self.assertIn("totals_ms", payload["timing"])
 
-    def test_the_totals_come_from_the_windows_snapshot(self):
+    def test_snapshot_cut_the_totals_come_from_the_windows_snapshot(self):
         sw = self.gtot_switch()
         reader = make_batched(sw)
-        first = reader.read_window([], totals=True)
+        first = reader.read_window([], totals="snapshot")
         self.assertGreater(first["timing"]["sync_rpcs"], 0, "totals alone still take the snapshot")
+        self.assertEqual(first["timing"]["totals_cut"], "snapshot")
         sw.packet(11, 0, 70, 1011, 80, 6, 0x10, 2000)          # after it: only in hardware
         self.assertEqual(reader.read_window([], snapshot="shadow", totals=True)["totals"]["pkts"], first["totals"]["pkts"])
-        self.assertEqual(reader.read_window([], totals=True)["totals"]["pkts"], first["totals"]["pkts"] + 1)
+        self.assertEqual(reader.read_window([], totals="snapshot")["totals"]["pkts"], first["totals"]["pkts"] + 1)
+
+    def test_the_totals_are_read_from_hardware_before_the_sync(self):
+        sw = self.gtot_switch()
+        reader = make_batched(sw)
+        events = []
+        sync_all, read_totals = reader._sync_all, reader._read_totals
+        reader._sync_all = lambda tables, timing: (events.append("sync"), sync_all(tables, timing))[1]
+        reader._read_totals = lambda *a: (events.append("totals"), read_totals(*a))[1]
+        alone = reader.read_window([], totals=True)
+        self.assertEqual((alone["timing"]["sync_rpcs"], alone["timing"]["totals_cut"]), (0, "first"),
+                         "totals alone need no sync")
+        self.assertEqual(alone["totals"]["pkts"], 103)
+        self.assertEqual(alone["timing"]["totals_route"], "one request" if reader.fast else "entry_get")
+        sw.packet(11, 0, 70, 1011, 80, 6, 0x10, 2000)          # in hardware, not in the shadow
+        self.assertEqual(reader.read_window([], totals=True)["totals"]["pkts"], 104)
+        events[:] = []
+        both = reader.read_window([11, KNOWN_IDX], totals=True)
+        self.assertEqual(events, ["totals", "sync"])
+        self.assertEqual(both["timing"]["sync_rpcs"], len(batched_reader.REG_NAMES), "the totals are not synced")
+        self.assertEqual(both["totals"]["pkts"], sum(r["pkts"] for r in both["rows"]))
+        self.assertLessEqual(both["timing"]["reader_t_totals_end"], both["timing"]["reader_t_sync_start"])
+
+    @unittest.skipUnless(HAS_PB2, "the one-request route needs the generated bfruntime_pb2")
+    def test_the_one_request_route_falls_back_to_one_read_per_register(self):
+        sw = self.gtot_switch()
+        reader = make_batched(sw)
+
+        def broken(from_hw, timing):
+            raise RuntimeError("one table per request")
+        reader._read_totals_one_request = broken
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            first = reader.read_window([], totals=True)
+        self.assertIn("one entry_get per register from now on", err.getvalue())
+        self.assertEqual((first["totals"]["pkts"], first["timing"]["totals_route"]), (103, "entry_get"))
+        self.assertIs(reader.totals_one_request, False)
+        self.assertEqual(first["errors"], [])
+
+    @unittest.skipUnless(HAS_PB2, "the one-request route needs the generated bfruntime_pb2")
+    def test_the_one_request_route_is_dropped_when_the_parsers_disagree(self):
+        sw = self.gtot_switch()
+        reader = make_batched(sw)
+        real = reader._read_totals_one_request
+        reader._read_totals_one_request = (lambda f: lambda from_hw, timing: dict(
+            (k, [0] * len(v)) if k == "reg_g_bytes" else (k, v) for k, v in f(from_hw, timing).items()))(real)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            first = reader.read_window([], totals=True)
+        self.assertIn("disagree with the client's parser", err.getvalue())
+        self.assertIs(reader.totals_one_request, False)
+        self.assertEqual(first["timing"]["totals_route"], "entry_get")
+        rows = make_batched(self.gtot_switch(), addr="mock:g2").read_window([11, KNOWN_IDX])["rows"]
+        self.assertEqual(first["totals"]["bytes"], sum(r["bytes"] for r in rows))
 
     def test_a_program_without_totals_says_so_and_nothing_changes_without_the_flag(self):
         sw = bfrt_mock.MockSwitch()
@@ -512,6 +565,8 @@ class GlobalTotalsTests(unittest.TestCase):
                 ready = proc.start()
                 self.assertEqual(ready["global_totals"], bfrt_mock.GLOBAL_NAMES)
                 self.assertEqual(proc.read([], totals=True, timeout=30)["totals"]["pkts"], 103)
+                snap = proc.read([], totals="snapshot", timeout=30)
+                self.assertEqual((snap["totals"]["pkts"], snap["timing"]["totals_cut"]), (103, "snapshot"))
             finally:
                 proc.stop()
 

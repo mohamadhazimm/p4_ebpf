@@ -119,6 +119,51 @@ class SelfCheckByteLayer(unittest.TestCase):
         self.assertEqual(ipv4["self_check"]["sent_bytes_total"], 120)
 
 
+class SelfCheckTotalsCut(unittest.TestCase):
+    """PC1.md part 4e: with --global-totals a window's totals are cut where the global totals were read, not at the
+    flow registers' snapshot, and an overloaded window's totals do not depend on the buckets read."""
+
+    def setUp(self):
+        self.rc = load("replay_capture", REPO / "live_test" / "replay_capture.py")
+
+    def test_the_totals_read_is_the_cut_and_overloaded_windows_are_checked(self):
+        t0, window = 1000.0, 0.5
+        # one packet 3 ms after the boundary of windows 0/1: after the totals' read (1.5-2.5 ms after it), so in
+        # window 1, though before the end of the flow registers' snapshot (40 ms)
+        sent = [(1000.10, tcp_frame(1001)), (1000.503, tcp_frame(1002)), (1000.70, tcp_frame(1003))]
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d)
+            write_pcap(out / "cap.pcap", [(t - 990.0, f) for t, f in sent])
+            write_pcap(out / "tx.pcap", sent)
+            with open(out / "timing.jsonl", "w") as f:
+                for k in (0, 1):
+                    end = t0 + (k + 1) * window
+                    clock = {"collector_t_sent": end + 0.001, "reader_t_recv": end + 0.0012,
+                             "reader_t_send": end + 0.0418, "collector_t_reply": end + 0.042,
+                             "reader_t_totals_start": end + 0.0015, "reader_t_totals_end": end + 0.0025,
+                             "reader_t_sync_start": end + 0.010, "reader_t_sync_end": end + 0.040}
+                    f.write(json.dumps({"window": k, "t_window_end": end, "clock": clock}) + "\n")
+
+            def windows(pkts, gtot):
+                with open(out / "windows.csv", "w", newline="") as f:
+                    w = csv.DictWriter(f, fieldnames=["net_window_id", "net_pkts_total_delta", "net_bytes_total_delta",
+                                                      "net_overload", "net_gtot_used"])
+                    w.writeheader()
+                    for k, n in enumerate(pkts):
+                        w.writerow({"net_window_id": k, "net_pkts_total_delta": n, "net_bytes_total_delta": 54 * n,
+                                    "net_overload": 1, "net_gtot_used": gtot})
+                return self.rc.analyse(out, out / "cap.pcap", 0.0, 0, None, 0.0, window, header_bytes=14)
+
+            totals = windows([1, 2], 1)["self_check"]
+            spilled = windows([2, 1], 1)["self_check"]
+            buckets = windows([1, 2], 0)["self_check"]
+        self.assertEqual((totals["windows_checked"], totals["windows_inside_bounds"]), (2, 2))
+        self.assertEqual(totals["windows_cut_by_the_totals"], 2)
+        self.assertAlmostEqual(totals["totals_read_end_after_window_end_ms"]["median"], 2.5, delta=0.5)
+        self.assertEqual(spilled["windows_inside_bounds"], 0, "a packet 3 ms in counted before a cut at 2.5 ms")
+        self.assertEqual(buckets["windows_checked"], 0, "bucket totals of overloaded windows are not checked")
+
+
 @unittest.skipUnless((RELEASE / "features" / "summary.py").exists(), "release repository not next to p4_ebpf")
 class DatasetRowSkip(unittest.TestCase):
     def test_skip_windows_takes_the_dataset_windows(self):

@@ -612,6 +612,8 @@ class BatchedRegisterReader(object):
             except KeyError:
                 self.global_tables = OrderedDict()
                 break
+        # None: not checked yet; True/False after the first totals read (_read_totals)
+        self.totals_one_request = None if all(t.ids_ok for t in self.global_tables.values()) else False
         self.flow_tables = [t for t in self.tables.values() if t is not None]
         self.clear_tables = ([self.tables[n] for n in CLEAR_FIRST if self.tables.get(n) is not None]
                              + [t for t in self.flow_tables if t.name not in CLEAR_FIRST])
@@ -696,6 +698,85 @@ class BatchedRegisterReader(object):
                         values[idx] = vals
                         timing["read_entities"] += 1
         return values
+
+    def _read_totals(self, from_hw, timing, errors):
+        """The seven one-entry totals, each summed over the pipes (None where a read failed). On the fast and raw
+        routes one ReadRequest of seven entities (checked once against the client's parser, as _read_table checks
+        a route), else one entry_get per register. reader_t_totals_start/end: this host's clock around the read
+        that gave them, i.e. the totals' cut."""
+        t0 = time.time()
+        timing["reader_t_totals_start"] = t0
+        got = None
+        if self.totals_one_request is not False and (self.fast or self.raw):
+            try:
+                got = self._read_totals_one_request(from_hw, timing)
+            except Exception as error:
+                log("the totals in one request failed (%s): one entry_get per register from now on" % error)
+                self.totals_one_request = False
+        timing["reader_t_totals_end"] = time.time()
+        if got is not None and self.totals_one_request is None:
+            probe = dict(read_rpcs=0, read_entities=0)
+            want = dict((name, self._read_safe(t, [0], from_hw, probe).get(0))
+                        for name, t in self.global_tables.items())
+            again = self._read_totals_one_request(from_hw, probe)
+            # counters only grow: the parsers agree if the client's values lie between the two requests'
+            ok = all(got.get(n) is not None and again.get(n) is not None and want[n] is not None
+                     and len(got[n]) == len(want[n]) == len(again[n])
+                     and all(a <= b <= c for a, b, c in zip(got[n], want[n], again[n])) for n in want)
+            if not ok:
+                log("the totals in one request disagree with the client's parser (%r, %r, %r): not using it"
+                    % (got, want, again))
+                got = None
+            self.totals_one_request = ok
+        timing["totals_route"] = "one request" if got is not None else "entry_get"
+        out = OrderedDict()
+        for name, t in self.global_tables.items():
+            v = got.get(name) if got is not None else None
+            if v is None:
+                try:
+                    v = self._read_safe(t, [0], from_hw, timing).get(0)
+                except Exception as error:
+                    errors.append("%s: %s" % (name, error))
+                    v = None
+            out[name[len("reg_g_"):]] = sum(v) if v is not None else None
+        if got is None:
+            timing["reader_t_totals_end"] = time.time()
+        timing["totals_ms"] = round((timing["reader_t_totals_end"] - t0) * 1000.0, 3)
+        return out
+
+    def _read_totals_one_request(self, from_hw, timing):
+        """name -> per-pipe values of the seven one-entry totals, from one ReadRequest."""
+        req = self.pb2.ReadRequest()
+        self._fill_target(req)
+        by_id = {}
+        for name, t in self.global_tables.items():
+            te = req.entities.add().table_entry
+            te.table_id = t.table_id
+            te.table_flags.from_hw = bool(from_hw)
+            kf = te.key.fields.add()
+            kf.field_id = t.key_id
+            kf.exact.value = int_to_bytes(0, t.key_size)
+            by_id[t.table_id] = (name, t)
+        timing["read_rpcs"] += 1
+        got = {}
+        for rsp in self.rw._read(req):
+            for ent in rsp.entities:
+                te = ent.table_entry
+                if te.table_id not in by_id:
+                    continue
+                name, t = by_id[te.table_id]
+                vals = []
+                for f in te.data.fields:
+                    if f.field_id != t.data_id:
+                        continue
+                    if f.HasField("stream"):
+                        vals.append(bytes_to_int(f.stream))
+                    elif f.HasField("int_arr_val"):
+                        vals.extend(int(x) for x in f.int_arr_val.val)
+                if vals:
+                    got[name] = vals
+                    timing["read_entities"] += 1
+        return got
 
     def _read_safe(self, t, indexes, from_hw, timing):
         gc = self.gc
@@ -832,11 +913,16 @@ class BatchedRegisterReader(object):
         caller's read allowance); the others are named in "deferred" (changed,
         not read: under a fan-out flood new flows land in occupied dormant
         buckets by the thousand, and reading them all overran the window).
-        totals: also sync and read the seven one-entry global totals of the test
-        build perf/variants/gtot, in the same snapshot, through the client's own
-        parser (seven entities); payload "totals" = {pkts, bytes, pkts_ab,
-        bytes_ab, syn, ack, rst}, each summed over the pipes (None if a read
-        failed), or an error when the program has no totals."""
+        totals: also read the seven one-entry global totals of the test build
+        perf/variants/gtot; payload "totals" = {pkts, bytes, pkts_ab, bytes_ab,
+        syn, ack, rst}, each summed over the pipes (None if a read failed), or an
+        error when the program has no totals. True: from hardware, before the
+        flow registers' sync (one request of seven entities), so the window's
+        totals are cut ~1 ms after its boundary (PC1.md part 4e). "snapshot":
+        synced with the flow registers and read after them (part 4d): the batched
+        sync takes ~31 ms and the totals came last in it, so the packets of a
+        window's first ~30 ms counted in the window before. Under snapshot=
+        "shadow" (benchmarks) the totals come from the shadow, as "snapshot"."""
         indexes = [int(i) for i in indexes]
         dst_indexes = [int(i) for i in (dst_indexes or [])]
         clear_if_unchanged = clear_if_unchanged or {}
@@ -852,9 +938,18 @@ class BatchedRegisterReader(object):
         sync_tables = list(self.flow_tables)
         if dst_indexes and self.dst_table is not None:
             sync_tables.append(self.dst_table)
-        if totals and self.global_tables:
-            sync_tables.extend(self.global_tables.values())
-        if snapshot == "sync" and not indexes and not dst_indexes and not probe and not totals:
+        totals_cut = None
+        totals_out = None
+        if totals:
+            totals_cut = "snapshot" if (totals == "snapshot" or snapshot == "shadow") else "first"
+            timing["totals_cut"] = totals_cut
+            if not self.global_tables:
+                errors.append("global totals are not in this program (perf/variants/gtot)")
+            elif totals_cut == "first":
+                totals_out = self._read_totals(True, timing, errors)
+            else:
+                sync_tables.extend(self.global_tables.values())
+        if snapshot == "sync" and not indexes and not dst_indexes and not probe and totals_cut != "snapshot":
             sync_s = 0.0          # nothing to read: a clear needs no snapshot
         elif snapshot == "sync":
             try:
@@ -943,21 +1038,8 @@ class BatchedRegisterReader(object):
                     dst_rows.append(make_dst_row(idx, list(v)))
         timing["read_ms"] = round((time.time() - t_read) * 1000.0, 3)
 
-        totals_out = None
-        if totals:
-            if not self.global_tables:
-                errors.append("global totals are not in this program (perf/variants/gtot)")
-            else:
-                t_tot = time.time()
-                totals_out = OrderedDict()
-                for name, t in self.global_tables.items():
-                    try:
-                        v = self._read_safe(t, [0], from_hw, timing).get(0)
-                    except Exception as error:
-                        errors.append("%s: %s" % (name, error))
-                        v = None
-                    totals_out[name[len("reg_g_"):]] = sum(v) if v is not None else None
-                timing["totals_ms"] = round((time.time() - t_tot) * 1000.0, 3)
+        if totals_cut == "snapshot" and self.global_tables:
+            totals_out = self._read_totals(from_hw, timing, errors)
         read_s = round(time.time() - t_start, 4)
 
         # Clear idle buckets whose packet count is still what the caller saw,
@@ -1101,7 +1183,7 @@ def serve(args):
                                          req.get("source", "batched gRPC"), req.get("clear_indexes") or [],
                                          probe=req.get("probe") or None,
                                          probe_max_full=req.get("probe_max_full"),
-                                         totals=bool(req.get("totals")))
+                                         totals=req.get("totals") or False)
             # When the request arrived and the reply left, on this host's clock: with the collector's
             # send and receive times they give the clock offset between the two hosts (RUNBOOK 19.6).
             payload.setdefault("timing", {})["reader_t_recv"] = t_recv

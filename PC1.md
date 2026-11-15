@@ -1000,3 +1000,122 @@ the build is adopted, measure its latency and rerun all 109 captures on it.
 `run_bfrt.sh setup`, checked with the first cohort capture (9 / 9 packets, 40 of 40 windows inside the bounds);
 `enp5s0` down. `live_test/committee_replay/pc1_20261115_gtot.tar.xz`: the runs, `gtot_compare.csv`, the build's
 resource report and the setup logs.
+
+## Results, part 4e (PC1, 2026-11-15): all 109 captures on the gtot build
+
+The `gtot` build of part 4d is adopted; all 109 captures were rerun on it with `--global-totals 1`, twice.
+
+**First rerun, with part 4d's code (`runs_gtot_all/`).** Over the run's 44 windows the totals equal the packets and
+bytes sent in all 109 runs (1,469,778 packets), and the floods came out as in part 4d. But the calm captures got
+**worse** than on `basic_fix`: packets were missing from the 40 dataset windows in 76 of the 96, all of them in the
+curl, wget, ftp and telnet captures, and the median number of the 95 total-based columns equal to the published row
+fell from 95 to 25.5. The cause: `read_window(totals=True)` appended the seven totals to the batched sync of the flow
+registers, and they were synced last. The sync starts a median 1.3 ms after the window boundary in the calm runs
+but takes ~33 ms, so the totals were cut ~34 ms after each boundary, and a window's first ~34 ms counted in the window
+before. The cohort's first frame comes ~4.7 ms into dataset window 0, so it counted in window 3, which is dropped.
+(Part 4d's "1.4-10 ms after the boundary" was the snapshot's start, not the totals' cut.)
+
+**The fix (reader and collector; the P4 build, its latency and its line rate unchanged).**
+- `hybrid_collector.py --totals-cut boundary` (the new default): right after each window boundary, before it takes
+  the window's CPU reports, the collector sends the reader a request for the totals alone.
+- `batched_reader.read_window(totals=True)` reads the seven registers from hardware, without a sync, in one
+  ReadRequest of seven entities (2.7 ms median on the Wedge, 5.5 ms p99). The route is checked once against the
+  client's parser (parsed, then the parser's values, then parsed again must be in order), else one `entry_get` per
+  register. All 109 runs used the one request.
+- The read ends a median 4.75 ms after the boundary in the calm runs (3.9-5.9 ms by run), 4.45 ms in the floods.
+  18 of the 4,796 windows were cut more than 50 ms late (up to 488 ms), all at the start of a fan-out or sink flood
+  (syn_fan_40k/100k/150k, udp_fan_60k, syn_sink_40k), where the collector was still taking the previous window's
+  CPU reports (0.4-0.9 s of them) when the boundary passed.
+- `--totals-cut read` puts the totals in the window's read, before the flow sync; `--totals-cut snapshot` is part
+  4d's behaviour.
+- `live_test/replay_capture.py`: for a window with `net_gtot_used` 1 the self-check takes the totals' read as the cut,
+  and checks such a window even when it is overloaded (its totals no longer depend on the buckets read).
+- Tests: 181 run, with the switch's generated `bfruntime_pb2` on the path (`scripts/patches/NOTES_totals_cut.txt`);
+  the only error is the release's Python 3.9 operator (as in part 4).
+
+**Trial of six captures** (`runs_tfirst_trial/` with `read`, `runs_tbound_trial/` with `boundary`; 95 total
+columns equal to the published row):
+
+| capture | basic_fix | gtot, part 4d's cut | gtot, `read` | gtot, `boundary` |
+|---|---|---|---|---|
+| first cohort capture | 95 | 51 | 95 | 95 |
+| curl-net-amd64_dynamic | 95 | 5 | 95 | 95 |
+| curl-net-amd64_dynamic-2 | 63 | 22 | 63 | 63 |
+| bulk2000 | 41 | 23 | 43 | 44 |
+| syn_fan_100k | 4 | 10 | 20 | 20 |
+| goldeneye_p10 | 0 | 35 | 35 | 46 |
+
+`read` loses in the floods because the window's read starts only after the collector has taken thousands of reports.
+
+**Full rerun with the boundary cut (`runs_gtot_boundary/`, 16:20-17:43).** All 109 done; the totals equal the
+packets and bytes sent over the 44 windows in every run, and the self-check passes 44 of 44 windows in every run,
+floods included. Against `basic_fix` (the rows of `replay_rows_v3.csv`, found by row equality in `runs_probe2/`,
+`runs_probe/`, `runs_probe_trial/` and part 4's `runs/`) and the first rerun (`gtot_all_compare.csv`):
+
+| | basic_fix | gtot, part 4d's cut | gtot, boundary cut |
+|---|---|---|---|
+| **calm (96 captures, 618,805 packets)** | | | |
+| packets in the 40 windows | 618,805 | 612,001 | 618,805 |
+| captures with all of them | 96 | 20 | 96 |
+| 95 total columns equal: median / mean | 95 / 81.2 | 25.5 / 38.2 | 95 / 81.5 |
+| rows with all 95 equal | 61 | 13 | 63 |
+| all 145 columns equal: median / mean | 137 / 119.2 | 67 / 76.1 | 137 / 119.4 |
+| **overloaded on basic_fix (11 captures, 820,823 packets)** | | | |
+| packets in the 40 windows | 192,916 (23.5%) | 814,084 (99.2%) | 820,823 (100%) |
+| captures with all of them | 2 | 5 | 11 |
+| 95 total columns equal: median / mean | 4 / 10.3 | 20 / 26.2 | 41 / 39.1 |
+| their median relative error: median | 0.260 | 0.006 | 0.000 |
+| all 145 columns equal: median / mean | 11 / 17.2 | 34 / 33.0 | 49 / 46.1 |
+| overloaded / overrun windows | 285 / 17 | 284 / 18 | 279 / 16 |
+| **bulkup_200/400 (incomplete replays, 30,150 packets)** | | | |
+| 95 total columns equal: mean | 30.5 | 24.0 | 31.5 |
+
+The 50 per-flow columns come from the buckets read in all three and stay where they were (calm mean 38.0 / 37.9 /
+37.9; overloaded 6.9 / 6.8 / 7.0). The calm captures: 75 equal to `basic_fix` in the 95 columns, 16 better (slowloris_150
+39 -> 69, slowloris_300 39 -> 55, the session, dns and bulk captures +2 to +10, three cohort captures +8 or +9), 5 worse
+(the three udp_sink captures 67 -> 37, below; beacon_100 and bulk700 by one column). The overloaded ones:
+
+| capture | sent | in the 40 windows: basic_fix / 4d cut / boundary | 95 columns equal | median relative error |
+|---|---|---|---|---|
+| Chaos `d538053a` | 221,733 | 27,990 / 221,562 / 221,733 | 19 / 19 / 29 | 0.079 / 0.050 / 0.009 |
+| goldeneye_p10 | 37,617 | 24,536 / all / all | 0 / 35 / 45 | 0.355 / 0.001 / 0.000 |
+| goldeneye_r10 | 37,388 | 27,340 / all / all | 0 / 35 / 38 | 0.260 / 0.002 / 0.000 |
+| slowloris_500 | 11,087 | all / all / all | 17 / 37 / 46 | 0.006 / 0.000 / 0.000 |
+| slowloris_800 | 17,612 | all / all / all | 18 / 43 / 56 | 0.188 / 0.000 / 0.000 |
+| slowloris_1000 | 22,032 | 20,558 / all / all | 0 / 44 / 57 | 0.100 / 0.000 / 0.000 |
+| syn_sink_40k | 124,666 | 34,009 / 123,512 / 124,666 | 1 / 20 / 41 | 0.897 / 0.005 / 0.010 |
+| syn_fan_40k | 39,847 | 5,672 / 38,284 / 39,847 | 4 / 16 / 48 | 1.000 / 0.380 / 0.000 |
+| syn_fan_100k | 99,640 | 8,079 / 98,327 / 99,640 | 4 / 10 / 16 | 1.000 / 0.400 / 0.200 |
+| syn_fan_150k | 149,425 | 9,492 / 148,340 / 149,425 | 1 / 10 / 27 | 1.000 / 0.077 / 0.000 |
+| udp_fan_60k | 59,776 | 6,541 / 58,323 / 59,776 | 49 / 19 / 27 | 0.000 / 0.333 / 0.333 |
+
+**What is left (not fixed):**
+- **The seven registers are read one after another**, ~0.4 ms apart, in the one request. B->A is the total minus
+  A->B, so in a flood the A->B counter, read after the total, holds a few dozen packets more and the difference makes
+  B->A packets that were never sent: udp_sink_60k / 150k / 250k get 6 / 10 / 26, udp_fan_60k 17 (and two windows
+  with more A->B packets than packets in all), syn_fan_100k / 150k 4 / 8 more than the published 1 / 2. Out of
+  60,000-250,000 packets, but in a capture with no B->A traffic it costs the 30 B->A columns (packets, bytes, average
+  size, the two B->A ratios and down/up, five aggregates each): the udp_sink captures fall from 67 to 37 columns, and
+  udp_fan_60k loses the same 30 (49 -> 27: 34 columns lost, 30 of them B->A, and 12 gained). Only these six captures
+  have it; no window of the other 103 runs has more A->B packets than packets in all. A fix needs the P4:
+  count B->A in two of the registers in place of the packet and byte totals (total = A->B + B->A; the same seven
+  registers and stateful ALUs), so that B->A grows only with B->A packets.
+- **Direction comes from the flow's bucket** (`perf/variants/gtot/ingress.p4:331-339`): a packet whose ports match
+  neither the bucket's reference nor their reverse (two flows in one bucket) counts as A->B. Chaos has up to ~10,400
+  flows in a window over 65,536 buckets: its totals are exact, but 83,244 of its packets count as B->A against the
+  published 110,866, so 27,622 (25% of its B->A) counted as A->B, most likely through shared buckets. The same rule
+  holds in `basic_fix`'s buckets.
+- **The cut is still 4-5 ms after the boundary** (the request's round trip and the read), and later when the
+  collector falls behind on the reports (above): the boundary request waits for the loop. The fan-out floods last
+  ~0.7 s, so that and a replay up to 48 ms late still move part of them between two windows: syn_fan_100k 16 of 95.
+  A timer thread sending the boundary request would not wait for the reports.
+- The 50 per-flow columns are still sampled under overload, as before.
+
+**The rows for the thesis:** `replay_rows_gtot.csv` (109 rows from `runs_gtot_boundary/`, in `replay_rows_v3.csv`'s
+order) replaces `replay_rows_v3.csv`.
+
+**State after:** `basic_fix` running again (pid 25993 in `hz_sw`), ports 132/140, forwarding and mirror set by
+`run_bfrt.sh setup` (`setup_basic_fix_restored_4e/`), checked with the first cohort capture (9 / 9 packets, 40 of 40
+windows inside the bounds); `enp5s0` down. `live_test/committee_replay/pc1_20261115_gtot_all.tar.xz`: both reruns and
+both trials (rows, `rerun.log`, per run `summary.json`, `timing.jsonl`, `windows.csv`, `collector.log`),
+`gtot_all_compare.csv`, `replay_rows_gtot.csv`, the scripts and patches, the setup logs.

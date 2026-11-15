@@ -571,13 +571,22 @@ only the program differed.
 - **For the paper:** these are the numbers of the build it describes. Sections 3.2 and 4.1
   describe the build with the counter.
 
-### 5.6 Global totals (test build `gtot`, 15 November, tested on the switch, not deployed)
+### 5.6 Global totals (build `gtot`, 15 November, tested on the switch; the thesis replay rows use it)
 
 Under a flood the control plane reads ~500 buckets per 0.5 s window while ~30,000 are active, so window
 totals summed over the buckets read show 6–35% of the packets (PC1.md, part 4c). The test build adds seven
 one-entry registers that every counted packet updates, with the values the flow registers use: packets,
 bytes, A→B packets and bytes, SYN, ACK, RST. PC1.md part 4d has the collector side and the replays (floods
 97.6–100% of their packets seen instead of 6–73%).
+
+PC1.md part 4e reran all 109 captures on it, with the totals read from hardware in one request right after each
+window boundary (a reader and collector change; the P4 program is the one measured here). Every packet then
+counts in the 40 dataset windows in all 109 runs. The calm captures match the published rows as on `basic_fix`
+(median 95 of the 95 total-based columns). The 11 that overload `basic_fix` go from a median of 4 to 41 of those
+columns. Left open: the seven registers are read one after another, ~0.4 ms apart, so in a flood
+B→A = total − A→B picks up packets that were never sent (6–26 in six floods). Counting B→A in two of the
+registers in place of the packet and byte totals would avoid it, with the same seven registers. Between runs the
+switch runs `basic_fix`.
 - **Sources:** `perf/variants/gtot/`: the fixed build of Section 5.5 (`basic_fix`, same hashes) with the seven
   registers in `ingress.p4`; `-DP4_ENABLE_GLOBAL_TOTALS=0` compiles `basic_fix`. The instrumented copy for the
   latency is `perf/variants/hwl/make_hwl_sources.sh perf/variants/gtot OUT_DIR`; it differs from Section 5.5's

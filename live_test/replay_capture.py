@@ -196,26 +196,31 @@ def analyse(out, capture, anchor_offset, align_window, delay, report_latency, wi
     pk = [(t, n + header_bytes) for t, n in pk if n is not None]
     times, lens = [t for t, _ in pk], [n for _, n in pk]
     u = 0.0 if delta_min is None else delta_min / 2.0
-    snaps = {}
+    snaps, tots = {}, {}
     for r in records:
         c = r.get("clock") or {}
         if theta is not None and "reader_t_sync_start" in c and "reader_t_sync_end" in c:
             snaps[r["window"]] = (c["reader_t_sync_start"] - theta - u, c["reader_t_sync_end"] - theta + u)
+        if theta is not None and "reader_t_totals_start" in c and "reader_t_totals_end" in c:
+            tots[r["window"]] = (c["reader_t_totals_start"] - theta - u, c["reader_t_totals_end"] - theta + u)
     windows, checked, inside = [], 0, 0
     prev_hi = t0
     for k in sorted(rows):
         r = rows[k]
         b_k, b_next = t0 + k * window_sec, t0 + (k + 1) * window_sec
-        snap = snaps.get(k)
+        # --global-totals (PC1.md part 4e): a window's totals came from the global totals, so they are cut where
+        # those were read, whatever the buckets read; then an overloaded window is checked too
+        gtot = int(float(r.get("net_gtot_used") or 0)) == 1 and k in tots
+        snap = tots.get(k) if gtot else snaps.get(k)
         sw_p, sw_b = int(float(r.get("net_pkts_total_delta") or 0)), int(float(r.get("net_bytes_total_delta") or 0))
         w = {"window": k, "start": b_k, "snapshot": snap, "switch_pkts": sw_p, "switch_bytes": sw_b,
-             "overload": int(float(r.get("net_overload") or 0))}
+             "overload": int(float(r.get("net_overload") or 0)), "cut": "totals" if gtot else "snapshot"}
         w["sent_in_window_pkts"], w["sent_in_window_bytes"] = count_between(times, lens, b_k, b_next)
         if snap is not None:
             lo = count_between(times, lens, prev_hi, b_next - report_latency)
             hi = count_between(times, lens, b_k - report_latency, snap[1])
             w["certain_pkts"], w["certain_bytes"], w["possible_pkts"], w["possible_bytes"] = lo[0], lo[1], hi[0], hi[1]
-            if not w["overload"]:
+            if not w["overload"] or gtot:
                 checked += 1
                 ok = lo[0] <= sw_p <= hi[0] and lo[1] <= sw_b <= hi[1]
                 inside += int(ok)
@@ -238,6 +243,11 @@ def analyse(out, capture, anchor_offset, align_window, delay, report_latency, wi
                              "snapshot_start_after_window_end_ms": None if not snaps else {
                                  "median": round(statistics.median((snaps[k][0] - (t0 + (k + 1) * window_sec)) * 1000.0
                                                                    for k in snaps), 2)}}
+    if tots:
+        after = [(tots[k][1] - (t0 + (k + 1) * window_sec)) * 1000.0 for k in tots]
+        summary["self_check"]["windows_cut_by_the_totals"] = sum(1 for w in windows if w["cut"] == "totals")
+        summary["self_check"]["totals_read_end_after_window_end_ms"] = {
+            "median": round(statistics.median(after), 2), "max": round(max(after), 2)}
     summary["per_window"] = windows
     return summary
 
