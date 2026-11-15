@@ -663,7 +663,7 @@ accuracy with Table IV and Table V). Offline, with the switch rules emulated, th
 balanced accuracy and zero flips on the held-out split; the replay measures it on the hardware, including the
 read budget under overload, which the offline emulation only approximates.
 
-**Captures.** 110 in all, both sets sanitized (headers only, payload bytes zeroed):
+**Captures.** 110 in all (107 replayable), both sets sanitized (headers only, payload bytes zeroed):
 - the 77 cohort captures in `live_test/captures/cohort/` (rows 0-203 with traffic; Chaos `d538053a...` last:
   it overloads the reader in every window);
 - 33 new ones for the network attacks and network-benign rows (rows 204-239; the 3 null runs have no
@@ -674,6 +674,11 @@ read budget under overload, which the offline emulation only approximates.
 
   Its `manifest.csv` has the cohort's columns plus `attack_type`. Replay the 8 runs with `expect_overload` 1
   last (the fan-out floods, `slowloris_1000`, the two GoldenEye runs).
+- **Skip `bulkup_200`, `bulkup_400`, `bulkup_700`** (found 2026-11-15): they hold 4,370, 8,824 and 15,072 frames
+  larger than 1514 B (up to 65,226 B). The guest's capture took the upload's segments before the NIC split them
+  (transmit segmentation offload), so these frames cannot go out on a 1500-byte wire as they are, and the
+  dataset counted each as one packet where a switch would see up to ~45. Note them as not replayable; the other
+  30 extra captures and all 77 cohort captures stay under 1514 B.
 
 **The replay option (done, 2026-11-15).** `live_test/replay_capture.py --profile dataset` runs the collector
 with `--profile dataset --launcher shell --windows K+40` and the replayer with 0.5 s windows, so that collector
