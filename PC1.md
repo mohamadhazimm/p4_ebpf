@@ -721,3 +721,105 @@ datagram for both. Also record the governor (`cpupower frequency-info`) and whet
 
 **What comes back.** `summary.json`, `bench.jsonl`, `kernel.txt` and the `SOCKOWNER_HEALTH` lines
 (drops and errors must be 0).
+
+## Results, part 4 (PC1, 2026-11-15): 109 of the 110 captures through the Wedge
+
+**What ran.** p4_ebpf `eadb2ca`; release `live-validation` `3e7cb5f` (its `features/` is identical to `main`
+`ce7d51c`; `dataset/features.csv` `6d15da30...`). Per capture exactly the two commands above (`--profile dataset
+--anchor-offset ANCHOR_OFFSET_S --align-window 4`, then `dataset_row.py --skip-windows 4`, with `--release
+~/Desktop/hAZIM/p4-ebpf-malware-detection`: its default is `~/Desktop/p4-ebpf-malware-detection`), driven by
+`run_part4.py`. Order: the cohort in manifest order (Chaos last), then the extras, `expect_overload` 0 first and
+the 8 with 1 last. Our `basic_fix` switchd (up since 2026-11-08) on the switch, no other user; `enp5s0` up for
+the runs and down after; the collector resets the registers at the start of every run.
+
+**PC1's disk.** 146 MB free at the start (771 MB needed for the extras alone). After a cleanup (journal, apt
+caches, the old run directories archived to `perf/results/runs_20261029-1108.tar.xz`), 789 MB: still not the
+771 MB at once, so each extra was extracted alone (`tar --occurrence=1`), its SHA-256 checked against
+`SHA256SUMS` and the manifest, replayed, and deleted (the last 8 from `/dev/shm`). `tx.pcap` is gzipped after
+each run.
+
+**What comes back:** `live_test/committee_replay/pc1_20261115.tar.xz` (850 KB): `replay_rows.csv` (109 rows,
+sha256 `b4e973c8...`), per run `summary.json`, `timing.jsonl`, `windows.csv` and `collector.log`;
+`run_checks.csv`/`.json` (the checks below, per run); `progress.jsonl`, `driver.log`; the scripts
+`run_part4.py` and `check_runs.py`; and part 5's files.
+
+### The bulk uploads: bulkup_700 not replayed, bulkup_200 and bulkup_400 incomplete
+
+The three bulk uploads are the only captures with frames over 1,514 B: 4,370 of 14,266 (bulkup_200), 8,824 of
+29,078 (bulkup_400) and 15,072 of 49,940 frames (bulkup_700) are guest GSO super-frames of up to **65,226 B**.
+eth1 (MTU 1500) refuses them and `replay_absolute.py` counts them as failed (`9896 frames sent, 4370 failed`;
+`20254 frames sent, 8824 failed`). **The bulkup_200 and bulkup_400 rows hold only the frames that fit: the
+upload's data packets are missing; do not score them as replays.** bulkup_700 was skipped for the same reason.
+No Ethernet path carries 65 KB frames (Tofino and mlx5 jumbo frames end at ~9-10 KB): the dataset's extractor
+counts each super-frame as one packet where a switch on the wire would see ~44 segments. Resegmenting these
+captures (the switch's view, with different counts by design) or leaving the three rows out is the VM side's call.
+
+### Checks (`run_checks.csv`)
+
+- **All 109:** collector exit 0; `40 windows -> 1 row with 90 host and 145 network columns`; alignment error
+  median 1.05 ms, max 6.2 ms; snapshot interval 32-35 ms.
+- **The 98 runs without an overloaded window:** packets switch = sent in all 98; IPv4 bytes equal in 96:
+  bulk1600 and bulk2000 are 320 B short each, part 1's dormant-read race (the first five packets of a reused
+  5-tuple between the `reg_pkts` and `reg_bytes` syncs). 3,839 of 3,858 windows inside the self-check bounds
+  (session_1000 2, bulk1600 8, bulk2000 9). No overrun.
+- **The self-check under `--profile dataset` is off by 14 B per packet:** `replay_capture.py` compares the
+  switch's frame bytes (`byte_layer=frame`) with IPv4 bytes, so every window with traffic reads "outside" (first
+  run: switch 666 / sent 540 bytes for 9 packets, 126 = 9 x 14). The figures here take 14 B per packet off the switch's
+  bytes; the `self_check` in each `summary.json` is the uncorrected one.
+- **Overload** (read budget 0.7; switch/sent packets are the 40 windows' sums):
+
+| run | expect_overload | overloaded windows | overrun windows | switch / sent packets |
+|---|---|---|---|---|
+| Chaos `d538053a` | 1 | 40 | 0 | 28,320 / 221,733 |
+| slowloris_500 | **0** | 7 | 0 | 11,087 / 11,087 |
+| slowloris_800 | **0** | 8 | 0 | 17,270 / 17,612 |
+| syn_fan_40k | 1 | 8 | 4 | 6,263 / 39,847 |
+| syn_fan_100k | 1 | 14 | 14 | 16,430 / 99,640 |
+| syn_fan_150k | 1 | 21 | 9 | 11,113 / 149,425 |
+| syn_sink_40k | 1 | 9 | 1 | 44,200 / 124,666 |
+| udp_fan_60k | 1 | 17 | 2 | 7,654 / 59,776 |
+| slowloris_1000 | 1 | 8 | 0 | 18,469 / 22,032 |
+| goldeneye_p10 | 1 | 6 | 0 | 29,330 / 37,617 |
+| goldeneye_r10 | 1 | 7 | 1 | 28,080 / 37,388 |
+
+  Two runs the manifest expects to fit overload the reader at 0.5 s on the hardware (slowloris_500 and _800).
+  The overruns (31 windows) are all in the fan-out floods.
+- **Replay timing:** the per-run maximum lateness has a median of 2.1 ms. Over 20 ms: **syn_sink_40k (median
+  174 ms, max 412 ms: the Python replayer on PC1 does not keep up with its burst, so this run's windows are
+  shifted)**, syn_fan_40k (max 242 ms), syn_fan_100k 62, udp_fan_60k 57, udp_sink_250k 32.
+- **First look at the rows** (the scoring is `score_switch_replay.py`'s): in the 98 rows without overload a median
+  of 137 of the 145 network columns equal the published row (relative 1e-9); the flow durations equal it in one
+  row only (the switch's timestamps against the capture's).
+
+### Failures
+
+None of the 109 failed. A trial of the first cohort capture before the loop (`committee_replay/trial1`) is not
+in the rows. State after: `enp5s0` down, our switchd untouched, `/dev/shm` clean, `cohort-extra/` holds only
+its four metadata files.
+
+## Results, part 5 (PC1, 2026-11-15): the socket tracer's cost
+
+- **Build:** `DEP=/usr CLANG=clang ebpf_perf/sockowner/build.sh` with `BPFTOOL=` a bootstrap bpftool v7.3.0 built
+  from `libbpf-bootstrap/bpftool` (PC1 has none installed; the version `hostmon_agg` was built with); clang
+  10.0.0-4ubuntu1. `sockowner` sha256 `fbecfc11...`.
+- **Run:** `bench_cost.sh` with one change, `bench_cost_pc1.sh` in the tarball: the tracer attaches to
+  `/sys/fs/cgroup/unified`, PC1's cgroup-v2 root (hybrid layout; `/sys/fs/cgroup` is the v1 tmpfs there, the
+  collector's `--sockowner-attach` would be the same path). 10 rounds, 66 s.
+- **Not bare metal:** PC1 is a KVM guest (QEMU vCPU, 2 vCPUs, kernel 5.15.0-139-generic). The guest has no
+  cpufreq interface, so no governor; not pinned; VS Code and Firefox were running.
+
+| 200,000 datagrams | off, median (range) | on, median (range) | added per datagram | per round, on - off |
+|---|---|---|---|---|
+| one 5-tuple | 7,393 ns (7,228-7,812) | 8,014 ns (7,894-8,204) | **+621 ns** | +381 to +935 ns |
+| 50,000 new 5-tuples | 7,331 ns (7,230-7,638) | 9,250 ns (8,335-10,207) | **+1,919 ns** | +1,019 to +2,568 ns |
+
+- **Health:** `SOCKOWNER_HEALTH,0,0,0` in all 10 rounds, 0 failed sends; every round's log holds all 50,000 FLOW
+  events of the 50,000-tuple run. The two ranges do not overlap for either load, and on is slower in every round.
+
+## Unit tests (PC1, 2026-11-15)
+
+`python3 -m unittest discover -s thesis-hybrid-ebpf-p4/python/tests`: 150 run, 6 skipped (no generated
+`bfruntime_pb2`), **1 error**: `test_sockjoin.WindowJoinTests.test_socket_join_recovers_each_program_alone`,
+`TypeError: unsupported operand type(s) for |: 'dict' and 'dict'` in the release's `features/switch_model.py`
+line 109 (`dict.fromkeys(COUNTERS, 0) | {...}` needs Python 3.9; PC1 has 3.8.10, on `main` too). PC1's runs do
+not reach it (`dataset_row.py` reads only `FEATURES`).
