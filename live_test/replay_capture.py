@@ -31,7 +31,8 @@ Steps:
     register snapshot that ends it (mapped onto this host's clock), and a self-check.
 
 The self-check counts IPv4 TCP/UDP first fragments in the sent capture (bytes = IPv4 total
-length), as ingress.p4 does. A window k's register values are cut in the snapshot interval
+length), as ingress.p4 does; under --profile dataset it adds 14 B per packet to the sent bytes,
+because that profile's collector reports Ethernet frame bytes (byte_layer frame). A window k's register values are cut in the snapshot interval
 [s_k_lo, s_k_hi] after its end, not at its boundary, and a new flow's first packets count in the
 window of its CPU report, which arrives up to L (--report-latency) after the packet. So, with b_k
 the window's start:
@@ -151,7 +152,9 @@ def count_between(times, lens, lo, hi):
     return b - a, sum(lens[a:b])
 
 
-def analyse(out, capture, anchor_offset, align_window, delay, report_latency, window_sec):
+def analyse(out, capture, anchor_offset, align_window, delay, report_latency, window_sec, header_bytes=0):
+    """header_bytes: added to each sent packet's IPv4 length, so that the sent bytes are counted as the
+    collector reports them (self_check_header_bytes)."""
     cap = read_pcap(capture, snap=96)
     tx = read_pcap(out / "tx.pcap")
     records = [json.loads(l) for l in open(out / "timing.jsonl") if l.strip()]
@@ -188,9 +191,9 @@ def analyse(out, capture, anchor_offset, align_window, delay, report_latency, wi
     summary["clock_offset_reader_minus_here_s"] = theta
     summary["round_trip_min_ms"] = None if delta_min is None else round(delta_min * 1000.0, 3)
     summary["round_trip_median_ms"] = None if delta_med is None else round(delta_med * 1000.0, 3)
-    # sent IPv4 TCP/UDP packets, as ingress.p4 counts them
+    # sent IPv4 TCP/UDP packets, as ingress.p4 counts them, in the collector's byte layer
     pk = [(t, ipv4_l4_len(f)) for t, f in tx]
-    pk = [(t, n) for t, n in pk if n is not None]
+    pk = [(t, n + header_bytes) for t, n in pk if n is not None]
     times, lens = [t for t, _ in pk], [n for _, n in pk]
     u = 0.0 if delta_min is None else delta_min / 2.0
     snaps = {}
@@ -221,7 +224,9 @@ def analyse(out, capture, anchor_offset, align_window, delay, report_latency, wi
                 w["check"] = "overload"
             prev_hi = snap[1]
         windows.append(w)
-    summary["self_check"] = {"report_latency_bound_s": report_latency, "windows_checked": checked,
+    summary["self_check"] = {"report_latency_bound_s": report_latency,
+                             "byte_layer": "frame" if header_bytes else "ipv4", "header_bytes_per_packet": header_bytes,
+                             "windows_checked": checked,
                              "windows_inside_bounds": inside,
                              "switch_pkts_total": sum(w["switch_pkts"] for w in windows),
                              "sent_pkts_total": len(times),
@@ -248,6 +253,17 @@ def profile_settings(profile, align_window):
         # K windows before the anchor, then the dataset's 40; the shell launcher, because the
         # scenario is the replayer, not a program whose start-up the dataset rows include
         return 0.5, ["--profile", "dataset", "--launcher", "shell", "--windows", str(align_window + DATASET_WINDOWS)]
+    raise ValueError("unknown profile %r" % profile)
+
+
+def self_check_header_bytes(profile):
+    """Bytes per packet the profile's collector adds to the IPv4 lengths the switch counts: the dataset
+    profile reports Ethernet frame bytes (hybrid_collector.py PROFILES["dataset"]["byte_layer"] "frame",
+    ETHERNET_HEADER_BYTES 14), the switch profile IPv4 bytes."""
+    if profile == "dataset":
+        return 14
+    if profile == "switch":
+        return 0
     raise ValueError("unknown profile %r" % profile)
 
 
@@ -327,7 +343,8 @@ def main():
         tcpdump.kill()
     if rc != 0:
         print("[replay] the collector exited with %d; see %s" % (rc, out / "collector.log"))
-    summary = analyse(out, capture, args.anchor_offset, args.align_window, delay, args.report_latency, window_sec)
+    summary = analyse(out, capture, args.anchor_offset, args.align_window, delay, args.report_latency, window_sec,
+                      header_bytes=self_check_header_bytes(args.profile))
     summary["collector_exit_code"] = rc
     (out / "summary.json").write_text(json.dumps(summary, indent=1) + "\n")
     uid, gid = os.environ.get("SUDO_UID"), os.environ.get("SUDO_GID")

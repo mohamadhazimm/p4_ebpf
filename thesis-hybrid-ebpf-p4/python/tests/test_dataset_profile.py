@@ -186,6 +186,20 @@ class ActiveFilterTests(unittest.TestCase):
         self.assertEqual([w["net_pkts_total_delta"] for w in s], [15, 2, 4])
         self.assertEqual(s[2]["net_bytes_total_delta"], 400, "the resumed flow's delta counts from its old registers")
 
+    def test_a_torn_dormant_read_keeps_its_bytes_for_the_window_that_counts_its_packets(self):
+        # PC1.md part 4 (bulk1600, bulk2000: 320 B short): a dormant bucket's reused 5-tuple sends five
+        # packets (320 B) between the reg_pkts sync and the reg_bytes sync of window 1. Window 1 reads
+        # pkts unchanged (the bucket stays dormant) but bytes +320; window 2 reads pkts +5, bytes +0.
+        w0 = {"rows": [mkrow(2, 5, nbytes=500)], "active_after_read_indexes": [2]}
+        w1 = {"rows": [mkrow(2, 5, nbytes=820, bytes_ab=820)], "active_after_read_indexes": []}
+        w2 = {"rows": [mkrow(2, 10, nbytes=820, pkts_ab=10, bytes_ab=820)], "active_after_read_indexes": [2]}
+        for layer, header in (("ipv4", 0), ("frame", 14)):
+            s = hc.build_net_summaries([w0, w1, w2], 0.5, byte_layer=layer)
+            self.assertEqual([w["net_pkts_total_delta"] for w in s], [5, 0, 5], layer)
+            self.assertEqual(s[2]["net_bytes_total_delta"], 320 + 5 * header, layer)
+            self.assertEqual(s[2]["net_bytes_ab_delta"], 320 + 5 * header, layer)
+            self.assertEqual(sum(w["net_bytes_total_delta"] for w in s), 820 + 10 * header, layer)
+
     def test_without_the_key_every_row_read_counts(self):
         s = hc.build_net_summaries([{"rows": [mkrow(1, 10), mkrow(2, 5)]}], 0.5)
         self.assertEqual(s[0]["net_flow_count_seen"], 2)

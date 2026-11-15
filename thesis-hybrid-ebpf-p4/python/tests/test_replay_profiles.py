@@ -1,6 +1,8 @@
 """live_test/replay_capture.py --profile and live_test/dataset_row.py --skip-windows (PC1.md Part 4)."""
 import csv
 import importlib.util
+import json
+import struct
 import subprocess
 import sys
 import tempfile
@@ -48,6 +50,73 @@ class ReplayProfiles(unittest.TestCase):
         self.assertEqual(args.launcher, "shell")
         self.assertEqual(args.byte_layer, "frame")
         self.assertEqual(args.duration_unit, "s")
+
+
+def write_pcap(path, frames):
+    """A classic little-endian microsecond pcap of (time, frame) records."""
+    with open(path, "wb") as f:
+        f.write(struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1))
+        for t, frame in frames:
+            sec = int(t)
+            f.write(struct.pack("<IIII", sec, int(round((t - sec) * 1e6)), len(frame), len(frame)))
+            f.write(frame)
+
+
+def tcp_frame(sport):
+    """An Ethernet + IPv4 + TCP frame without payload (IPv4 total length 40), padded to 60 B."""
+    eth = b"\x02\x00\x00\x00\x00\x01" + b"\x02\x00\x00\x00\x00\x02" + b"\x08\x00"
+    ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 40, 1, 0, 64, 6, 0, bytes([10, 0, 0, 10]), bytes([10, 0, 0, 1]))
+    tcp = struct.pack("!HHIIBBHHH", sport, 80, 1, 0, 0x50, 0x02, 1024, 0, 0)
+    return (eth + ip + tcp).ljust(60, b"\x00")
+
+
+class SelfCheckByteLayer(unittest.TestCase):
+    """PC1.md part 4: under --profile dataset the collector reports frame bytes (+14 B per packet), so
+    the self-check has to count the sent bytes the same way, or every window with traffic is 'outside'."""
+
+    def setUp(self):
+        self.rc = load("replay_capture", REPO / "live_test" / "replay_capture.py")
+
+    def test_the_header_matches_the_collectors_profiles(self):
+        sys.path.insert(0, str(REPO))
+        import hybrid_collector as hc
+        self.assertEqual(hc.PROFILES["dataset"]["byte_layer"], "frame")
+        self.assertEqual(self.rc.self_check_header_bytes("dataset"), hc.ETHERNET_HEADER_BYTES)
+        self.assertNotEqual(hc.PROFILES["switch"].get("byte_layer", "ipv4"), "frame")
+        self.assertEqual(self.rc.self_check_header_bytes("switch"), 0)
+        with self.assertRaises(ValueError):
+            self.rc.self_check_header_bytes("model")
+
+    def test_frame_bytes_of_the_collector_fall_inside_the_bounds(self):
+        t0, window = 1000.0, 0.5
+        sent = [(1000.10, tcp_frame(1001)), (1000.20, tcp_frame(1002)), (1000.70, tcp_frame(1003))]
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d)
+            write_pcap(out / "cap.pcap", [(t - 990.0, f) for t, f in sent])
+            write_pcap(out / "tx.pcap", sent)
+            with open(out / "timing.jsonl", "w") as f:
+                for k in (0, 1):
+                    end = t0 + (k + 1) * window
+                    clock = {"collector_t_sent": end + 0.001, "reader_t_recv": end + 0.0015,
+                             "reader_t_send": end + 0.0025, "collector_t_reply": end + 0.003,
+                             "reader_t_sync_start": end + 0.0016, "reader_t_sync_end": end + 0.0020}
+                    f.write(json.dumps({"window": k, "t_window_end": end, "clock": clock}) + "\n")
+            with open(out / "windows.csv", "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=["net_window_id", "net_pkts_total_delta", "net_bytes_total_delta",
+                                                  "net_overload"])
+                w.writeheader()
+                w.writerow({"net_window_id": 0, "net_pkts_total_delta": 2, "net_bytes_total_delta": 2 * 54,
+                            "net_overload": 0})
+                w.writerow({"net_window_id": 1, "net_pkts_total_delta": 1, "net_bytes_total_delta": 54,
+                            "net_overload": 0})
+            frame = self.rc.analyse(out, out / "cap.pcap", 0.0, 0, None, 0.02, window,
+                                    header_bytes=self.rc.self_check_header_bytes("dataset"))
+            ipv4 = self.rc.analyse(out, out / "cap.pcap", 0.0, 0, None, 0.02, window)
+        sc = frame["self_check"]
+        self.assertEqual((sc["windows_checked"], sc["windows_inside_bounds"]), (2, 2))
+        self.assertEqual((sc["sent_bytes_total"], sc["switch_bytes_total"], sc["byte_layer"]), (162, 162, "frame"))
+        self.assertEqual(ipv4["self_check"]["windows_inside_bounds"], 0, "IPv4 bytes against frame bytes: the old miss")
+        self.assertEqual(ipv4["self_check"]["sent_bytes_total"], 120)
 
 
 @unittest.skipUnless((RELEASE / "features" / "summary.py").exists(), "release repository not next to p4_ebpf")

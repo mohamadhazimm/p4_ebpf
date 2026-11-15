@@ -1889,12 +1889,17 @@ class NetSummarizer:
             if pkts != prev_pkts:
                 self.last_change_span[idx] = (prev_read_w, w)
             self.last_read_window[idx] = w
-            prev_by_idx[idx] = row
 
             # A row counts in this window if its bucket is active once this read is known, or
             # if it changed in this window (a dormant flow that resumed).
             if active_set is not None and idx not in active_set and pkts_delta == 0:
+                # Keep the old baseline. No new packet in reg_pkts, but a register synced later in
+                # the same snapshot (reg_bytes, ~2 ms after reg_pkts) can already hold packets that
+                # arrived between the two syncs; they count with their packets, in the window whose
+                # reg_pkts sees them. Taking this row as the baseline lost their bytes (PC1.md
+                # part 4: bulk1600 and bulk2000 320 B short).
                 continue
+            prev_by_idx[idx] = row
             if owned_set is not None and idx not in owned_set:
                 continue
             n_active += 1

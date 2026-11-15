@@ -823,3 +823,44 @@ its four metadata files.
 `TypeError: unsupported operand type(s) for |: 'dict' and 'dict'` in the release's `features/switch_model.py`
 line 109 (`dict.fromkeys(COUNTERS, 0) | {...}` needs Python 3.9; PC1 has 3.8.10, on `main` too). PC1's runs do
 not reach it (`dataset_row.py` reads only `FEATURES`).
+
+## Results, part 4b (PC1, 2026-11-15): two fixes, rechecked and rerun
+
+**1. The self-check counts the sent bytes in the collector's byte layer** (`live_test/replay_capture.py`): under
+`--profile dataset` it adds 14 B per sent packet (`self_check_header_bytes`; `self_check` now names its
+`byte_layer`). Tests: `test_replay_profiles.SelfCheckByteLayer` (the 14 B equal `PROFILES["dataset"]` and
+`ETHERNET_HEADER_BYTES`; a synthetic run whose frame bytes fall inside the bounds only with the fix).
+Rechecked offline for all 109 runs (`recheck_selfcheck.py`: windows, timing log and `tx.pcap` of each run; the
+original `summary.json` kept, the new one is `summary_fixed.json`): 3,905 of 4,151 windows checked lie inside
+the bounds; 108 runs give part 4's corrected counts exactly, slowloris_800 20 instead of 19 (part 4 took 14 B
+per switch packet off, the fix adds 14 B per sent packet to the bounds: they differ only where the packet counts
+differ, here in an overloaded run).
+
+**2. A torn dormant read no longer loses bytes** (`hybrid_collector.py`, `NetSummarizer.add`): a dormant row with
+no new packet in `reg_pkts` keeps the old baseline instead of becoming it, so bytes that `reg_bytes` (synced
+~2 ms later) already holds count with their packets in the window whose `reg_pkts` sees them. Test:
+`test_dataset_profile.ActiveFilterTests.test_a_torn_dormant_read_keeps_its_bytes_for_the_window_that_counts_its_packets`
+(fails on the old code with `0 != 320`). Rerun on the Wedge, 3 times each with the fixed collector:
+
+| run | packets switch / sent | bytes switch / sent (frame) |
+|---|---|---|
+| bulk1600 x3 | 19,362 / 19,362 each | **2,026,476 / 2,026,476** each (part 4: 320 short) |
+| bulk2000 x3 | 24,000 / 24,000 each | **2,520,000 / 2,520,000** each (part 4: 320 short) |
+
+`replay_rows_v2.csv` is `replay_rows.csv` with these two rows from the first rerun (the other 107 rows were
+collected with the old collector; none of the calm runs' totals showed a shortfall, the overloaded runs' cannot
+show one). The two new rows differ from the old ones in ~90 network columns: another replay, other window cuts,
+not only the 320 B. Suite: 153 run, 6 skipped, 1 error (the release's Python 3.9 operator, above).
+
+**Found while checking, not fixed: resumed dormant flows count late.** The rest of the windows outside the bounds
+in the bulk runs come in pairs, one short and the next over by the same 25-250 packets (bulk2000 rerun 2,
+windows 23/24: 27 under, 27 over). A reused 5-tuple lands in its dormant bucket (occupied, so no CPU report);
+the collector sees it only when the round robin re-reads that bucket, and the allowance left after the active
+set reads ~220-250 of 700-900 dormant buckets per window (bulk2000: 172 resumed buckets). Totals stay exact;
+the per-window distribution shifts, so per-window features (max, std) can differ. The read budget is the limit:
+the timing logs give **0.54-0.68 ms per bucket read** (fits over bulk2000, syn_fan_150k, udp_fan_60k), about 500
+buckets per 0.5 s window at budget 0.7.
+
+Files: `live_test/committee_replay/pc1_20261115_fix.tar.xz`: `replay_rows_v2.csv`, the six reruns (summary,
+timing, windows, collector log) and their rows, every run's `summary_fixed.json`, and the scripts. State after:
+`enp5s0` down, our switchd untouched.
