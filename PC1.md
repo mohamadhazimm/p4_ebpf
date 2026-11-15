@@ -649,3 +649,75 @@ State after this part: services on PC2 stopped and their files removed; `enp5s0`
 switchd untouched; both cgroups and the fixtures removed. Scripts, manifest, per-run CSVs and logs,
 `rows_pf.csv`, `score_pf.txt`, `compare_parts.txt` and the two tables' outputs stay in
 `perf/results/dataset_v1/prologuefree/` (git-ignored).
+
+## Part 4 (ready, 2026-11-15): every capture through the Wedge, for the thesis committee
+
+*Reopens the cohort replays closed on 2026-11-08, because the committee asks for detection measured on the
+switch's own register reads.*
+
+**Goal.** Replay every dataset capture that carries IPv4 TCP/UDP traffic through the Wedge into
+`hybrid_collector.py --profile dataset` (0.5 s windows, the published detectors' window), turn each run into
+a dataset row, and send the rows back. The VM side scores them against the software model
+(`committee-eval-20261113/switchgap/score_switch_replay.py`: per-feature agreement, decision flips, balanced
+accuracy with Table IV and Table V). Offline, with the switch rules emulated, the gap is at most 0.006 in
+balanced accuracy and zero flips on the held-out split; the replay measures it on the hardware, including the
+read budget under overload, which the offline emulation only approximates.
+
+**Captures.** 110 in all, both sets sanitized (headers only, payload bytes zeroed):
+- the 77 cohort captures in `live_test/captures/cohort/` (rows 0-203 with traffic; Chaos `d538053a...` last:
+  it overloads the reader in every window);
+- 33 new ones for the network attacks and network-benign rows (rows 204-239; the 3 null runs have no
+  traffic): `live_test/captures/cohort-extra.tar.gz` (26 MB; 771 MB unpacked, git-ignored). Unpack first:
+
+      tar xzf live_test/captures/cohort-extra.tar.gz -C live_test/captures
+      (cd live_test/captures/cohort-extra && sha256sum -c SHA256SUMS)
+
+  Its `manifest.csv` has the cohort's columns plus `attack_type`. Replay the 8 runs with `expect_overload` 1
+  last (the fan-out floods, `slowloris_1000`, the two GoldenEye runs).
+
+**The replay option (done, 2026-11-15).** `live_test/replay_capture.py --profile dataset` runs the collector
+with `--profile dataset --launcher shell --windows K+40` and the replayer with 0.5 s windows, so that collector
+windows K..K+39 are the dataset's 40 windows (`--profile switch`, the default, is unchanged).
+`live_test/dataset_row.py --skip-windows K` takes those 40 windows. Tests:
+`thesis-hybrid-ebpf-p4/python/tests/test_replay_profiles.py`.
+
+**Per capture** (manifest columns `execution_id`, `category`, `label`, `anchor_offset_s`):
+
+    sudo python3 live_test/replay_capture.py CAPTURE --out DIR --profile dataset \
+        --anchor-offset ANCHOR_OFFSET_S --align-window 4
+    python3 live_test/dataset_row.py DIR/windows.csv --execution-id ID --category CAT --label L \
+        --skip-windows 4 --out perf/results/committee_replay/replay_rows.csv
+
+(`--align-window` must leave at least 0.5 s before the anchor; 4 windows of 0.5 s is 2 s. Every
+`anchor_offset_s` is between -5.1 and 0 s: the anchor lies before the first kept frame.)
+
+**What comes back.** `replay_rows.csv` (110 rows; only its network columns are used), each run's
+`summary.json` (alignment error, replay timing error, snapshot intervals, self-check) and `timing.jsonl`, and a
+note of any run whose replay or collector failed. Do not rerun a failed capture silently: report it.
+
+## Part 5 (ready, 2026-11-15): the socket tracer's cost on bare metal
+
+*For the committee's socket-level attribution (item 4). In the analysis VM the tracer attributed every flow
+correctly (2,841 of 2,841 alone, 8,517 of 8,517 beside three malware samples), but its per-packet cost could
+not be resolved: the VM's run-to-run spread (0.3-4.5 us per datagram) was larger than any difference.*
+
+**What it is.** `ebpf_perf/sockowner/`: two `cgroup_skb` programs record the first packet of each 5-tuple on a
+socket, two `cgroup/sock_create`/`sock_release` programs record the creating process (README there).
+`sockjoin.py` and `hybrid_collector.py --sockowner` join the switch's flows to it; tests
+`thesis-hybrid-ebpf-p4/python/tests/test_sockjoin.py`.
+
+**Build** (no root; PC1's own toolchain, as for `hostmon_agg`):
+
+    DEP=/usr CLANG=clang ebpf_perf/sockowner/build.sh
+
+**Measure** (root; loopback only, nothing leaves the host; about 10 minutes):
+
+    sudo ebpf_perf/sockowner/bench/bench_cost.sh perf/results/sockowner_cost 10
+
+Each round sends 200,000 datagrams to a closed port on 127.0.0.1 with one 5-tuple (the steady state: one hash
+lookup per packet) and with 50,000 (a FLOW event for each of the first 50,000), first with the tracer off, then
+on, attached to the root cgroup as the collector attaches it. `summary.json` gives the added nanoseconds per
+datagram for both. Also record the governor (`cpupower frequency-info`) and whether the run was pinned.
+
+**What comes back.** `summary.json`, `bench.jsonl`, `kernel.txt` and the `SOCKOWNER_HEALTH` lines
+(drops and errors must be 0).

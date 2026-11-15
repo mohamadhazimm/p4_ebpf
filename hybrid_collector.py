@@ -514,6 +514,37 @@ def start_hostmon_agg(hostmon_path: str, output_path: str, window_sec: float, cg
     return proc
 
 
+def start_sockowner(sockowner_path: str, output_path: str, attach_cgroup: str = "/sys/fs/cgroup",
+                    use_sudo: Optional[bool] = None) -> subprocess.Popen:
+    """Start ebpf_perf/sockowner on attach_cgroup (the root: every process). It prints
+    SOCKOWNER_READY, then one line per socket and per new 5-tuple, and SOCKOWNER_HEALTH when it
+    is stopped (stop_hostmon: SIGINT first)."""
+    fout = open(output_path, "w")
+    if use_sudo is None:
+        use_sudo = os.geteuid() != 0
+    cmd = (["sudo"] if use_sudo else []) + [sockowner_path, str(attach_cgroup)]
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=fout, stderr=subprocess.STDOUT, text=True,
+                            start_new_session=True)
+    proc._collector_file = fout
+    return proc
+
+
+def sockowner_health(path: str) -> Optional[Dict[str, int]]:
+    """The SOCKOWNER_HEALTH line: ring-buffer drops, flow-map errors, failed."""
+    try:
+        lines = Path(path).read_text(errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if line.startswith("SOCKOWNER_HEALTH,"):
+            parts = line.split(",")
+            try:
+                return {"ringbuf_drops": int(parts[1]), "flow_map_errors": int(parts[2]), "failed": int(parts[3])}
+            except (IndexError, ValueError):
+                return None
+    return None
+
+
 def send_hostmon_start(proc: subprocess.Popen, start_monotonic: float) -> None:
     assert proc.stdin is not None
     proc.stdin.write(repr(float(start_monotonic)) + "\n")
@@ -1592,6 +1623,11 @@ def collect_windows_live(
             "skipped_count": len(skipped_idxs),
             "overload": bool(agg["net_overload"]),
             "report_count": len(reports),
+            # [idx, proto, src, sport, dst, dport] of each report: the flow of each newly reported bucket,
+            # for the socket-level join (--sockowner, sockjoin.socket_join_windows)
+            "report_keys": [[safe_int(r.get("idx")), safe_int(r.get("proto")), str(r.get("src_ip")),
+                             safe_int(r.get("sport")), str(r.get("dst_ip")), safe_int(r.get("dport"))]
+                            for r in reports],
             "report_aggregates": agg,
             "index_mismatches": mismatches,
             "rows": payload.get("rows", []),
@@ -1769,6 +1805,10 @@ class NetSummarizer:
         # (collect_windows_live with dormant reads). Without the key, every row read is active.
         active_filter = win.get("active_after_read_indexes")
         active_set = {safe_int(x) for x in active_filter} if active_filter is not None else None
+        # The socket-level join (sockjoin.socket_join_windows): only the buckets whose flow belongs to the
+        # monitored execution count. Without the key every bucket counts (the window-level join).
+        owned_filter = win.get("owned_indexes")
+        owned_set = {safe_int(x) for x in owned_filter} if owned_filter is not None else None
 
         summary = dict(NET_ZERO)
         summary["net_new_conn_dst_max"] = new_conn_max
@@ -1854,6 +1894,8 @@ class NetSummarizer:
             # A row counts in this window if its bucket is active once this read is known, or
             # if it changed in this window (a dormant flow that resumed).
             if active_set is not None and idx not in active_set and pkts_delta == 0:
+                continue
+            if owned_set is not None and idx not in owned_set:
                 continue
             n_active += 1
 
@@ -2088,6 +2130,32 @@ class RunWriter:
         return None
 
 
+def socket_join_rows(args, run_id: str, cgroup_path: Optional[Path], global_t0: float,
+                     host_windows: List[Dict[str, object]], net_windows: List[Dict[str, object]],
+                     monotonic_minus_wall_ns: Optional[int] = None) -> List[Dict[str, object]]:
+    """The run's rows with the socket-level join's network features: only the buckets whose flow's
+    socket is in the monitored cgroup count (sockjoin.py). The host columns are the same as in the
+    window-level rows."""
+    import sockjoin
+    if monotonic_minus_wall_ns is None:
+        monotonic_minus_wall_ns = time.monotonic_ns() - time.time_ns()
+    log = sockjoin.read_log(args.sockowner_log)
+    health = log.health
+    print(f"[INFO] sockowner: {len(log.sightings)} flow sightings, {len(log.sockets)} sockets, health {health}")
+    if health is None or health["ringbuf_drops"] or health["flow_map_errors"] or health["failed"]:
+        print("[WARN] sockowner reported drops, map errors or a failure (or no health line): the socket-level "
+              "join may miss flows")
+    cgroup_id = os.stat(cgroup_path).st_ino if cgroup_path is not None else 0
+    table = sockjoin.OwnerTable(log)
+    joined = sockjoin.socket_join_windows(net_windows, table, sockjoin.Selector(cgroup_ids={cgroup_id}),
+                                          global_t0, monotonic_minus_wall_ns)
+    owned = sum(len(w["owned_indexes"]) for w in joined)
+    print(f"[INFO] socket-level join: cgroup {cgroup_id}, {owned} owned bucket-windows over {len(joined)} windows")
+    summaries = build_net_summaries(joined, args.window_sec, byte_layer=args.byte_layer,
+                                    duration_unit=args.duration_unit)
+    return [dict(row, join="socket") for row in build_rows(args, run_id, host_windows, joined, summaries)]
+
+
 # ============================================================
 # MAIN
 # ============================================================
@@ -2202,6 +2270,17 @@ def build_arg_parser(profile: Optional[str] = None) -> argparse.ArgumentParser:
                          "start time one second ahead, so host and network windows share one origin. Without this "
                          "option --hostmon is the streaming monitor started as before")
 
+    ap.add_argument("--sockowner",
+                    help="socket-level join: run ebpf_perf/sockowner (path to its binary) during the run. It records "
+                         "which socket, process and cgroup each 5-tuple belongs to; the flows whose socket is in the "
+                         "--hostmon-cgroup give a second set of network features, written to --socket-join-csv. "
+                         "Needs --hostmon-cgroup")
+    ap.add_argument("--sockowner-log", default="sockowner.log")
+    ap.add_argument("--sockowner-attach", default="/sys/fs/cgroup",
+                    help="cgroup-v2 directory sockowner attaches to (default: the root, so every process is seen)")
+    ap.add_argument("--socket-join-csv",
+                    help="output CSV of the socket-level join (default: --out-csv with .socket before the suffix)")
+
     ap.add_argument("--dormant-reads", type=int, default=0, choices=[0, 1],
                     help="1: a bucket that leaves the active set is not cleared but read again, round robin, with the "
                          "allowance left after the active set, so a flow that pauses and resumes keeps its registers "
@@ -2252,6 +2331,8 @@ def main() -> None:
     if args.hostmon_cgroup and args.mode != "command":
         ap.error("--hostmon-cgroup applies to --mode command (the replayed packets have no local process to monitor)")
 
+    if args.sockowner and not args.hostmon_cgroup:
+        ap.error("--sockowner needs --hostmon-cgroup: the socket-level join selects the flows of that cgroup")
     if args.mode == "pcap" and not args.pcap:
         ap.error("--pcap is required when --mode pcap")
     if args.launcher == "dataset" and args.mode != "command":
@@ -2274,6 +2355,8 @@ def main() -> None:
         raise FileNotFoundError(f"Replay script not found: {args.replay_script}")
 
     host_proc = None
+    sock_proc = None
+    clock_offset_ns: Optional[int] = None
     workload_proc = None
     report_collector = None
     batched_reader = None
@@ -2379,6 +2462,10 @@ def main() -> None:
             # the scenario starts inside the cgroup at that instant, and both the
             # host windows and the network windows are anchored there.
             cgroup_path, cgroup_created = ensure_cgroup(args.hostmon_cgroup)
+            if args.sockowner:
+                print(f"[INFO] Starting sockowner {args.sockowner} on {args.sockowner_attach}")
+                sock_proc = start_sockowner(args.sockowner, args.sockowner_log, args.sockowner_attach)
+                print("[INFO] " + wait_for_line(args.sockowner_log, "SOCKOWNER_READY", 30.0, sock_proc))
             print(f"[INFO] Starting the in-kernel monitor {args.hostmon} on {cgroup_path} with window_sec={args.window_sec}")
             host_proc = start_hostmon_agg(args.hostmon, args.hostmon_log, args.window_sec, cgroup_path)
             print("[INFO] " + wait_for_line(args.hostmon_log, "HOSTMON_READY", 30.0, host_proc))
@@ -2386,6 +2473,7 @@ def main() -> None:
             send_hostmon_start(host_proc, start_mono)
             time.sleep(max(0.0, start_mono - time.monotonic()))
             global_t0 = time.time()
+            clock_offset_ns = time.monotonic_ns() - time.time_ns()   # sockowner's clock vs the windows' wall clock
             os.environ["HYBRID_T0"] = repr(global_t0)   # the window origin, for the scenario (RUNBOOK 19.6)
             workload_proc = launch()
         else:
@@ -2468,6 +2556,14 @@ def main() -> None:
 
         host_windows = read_host_windows(args.hostmon_log)
 
+        socket_rows: Optional[List[Dict[str, object]]] = None
+        if sock_proc is not None:
+            print("[INFO] Stopping sockowner")
+            stop_hostmon(sock_proc)
+            sock_proc = None
+            socket_rows = socket_join_rows(args, run_id, cgroup_path, global_t0, host_windows, net_windows,
+                                           clock_offset_ns)
+
         if host_windows:
             print(
                 f"[DEBUG] host first={host_windows[0]['host_window_start_sec']:.3f} "
@@ -2497,6 +2593,11 @@ def main() -> None:
 
         writer.commit()
         committed = True
+        if socket_rows is not None:
+            out = Path(args.socket_join_csv) if args.socket_join_csv else \
+                Path(args.out_csv).with_name(Path(args.out_csv).stem + ".socket" + Path(args.out_csv).suffix)
+            append_csv_rows(str(out), socket_rows)
+            print(f"[OK] Added {len(socket_rows)} socket-join rows to {out}")
 
         print(f"[OK] Added {writer.count} rows to {args.out_csv}")
         print(f"[OK] run_id: {run_id}")
@@ -2515,6 +2616,9 @@ def main() -> None:
 
         if host_proc is not None:
             stop_hostmon(host_proc)
+
+        if sock_proc is not None:
+            stop_hostmon(sock_proc)
 
         if report_collector is not None:
             report_collector.stop()

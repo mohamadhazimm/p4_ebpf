@@ -37,3 +37,5 @@ __pycache__/
 /test_ebpf_logs/
 /veth_sw_ext
 /veth_sw_int
+# The extra captures unpacked from live_test/captures/cohort-extra.tar.gz (771 MB; PC1.md Part 4)
+/live_test/captures/cohort-extra/
