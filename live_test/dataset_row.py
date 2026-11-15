@@ -5,13 +5,16 @@ release's dataset/features.csv, so that validation/hybrid/score.py scores the ru
 detectors.
 
     python3 live_test/dataset_row.py COLLECTOR.csv --execution-id ID --category CAT --label 0|1 --out ROWS.csv
-        [--run-id RUN] [--windows 40] [--durations s|ns] [--release ~/Desktop/p4-ebpf-malware-detection]
+        [--run-id RUN] [--windows 40] [--skip-windows K] [--durations s|ns]
+        [--release ~/Desktop/p4-ebpf-malware-detection]
 
 The 29 network and 18 host window features are taken by name from the collector's columns
 (net_new_conn_dst_max and the collector's extra host columns are ignored). --durations ns divides
 the two duration features by 1e9 first (runs made without --duration-unit s). The statistics are
 the release's features/summary.py: mean, max, sum, population std and active_windows over the
-windows. ROWS.csv is created with the dataset's column names or appended to.
+windows. ROWS.csv is created with the dataset's column names or appended to. --skip-windows K
+starts at the collector's window K: a replay anchored on window K (live_test/replay_capture.py
+--profile dataset --align-window K) has the dataset's 40 windows in collector windows K..K+39.
 """
 import argparse
 import csv
@@ -42,6 +45,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--run-id", help="the run to take when the collector CSV holds several")
     ap.add_argument("--windows", type=int, default=40)
+    ap.add_argument("--skip-windows", type=int, default=0,
+                    help="collector windows before the dataset's first (a replay's --align-window)")
     ap.add_argument("--durations", choices=["s", "ns"], default="s", help="unit of the collector's duration columns")
     ap.add_argument("--release", default=str(DEFAULT_RELEASE))
     ap.add_argument("--return-code", default="")
@@ -62,9 +67,11 @@ def main():
     if not rows:
         sys.exit("no rows for that run")
     rows.sort(key=lambda r: int(float(r["window_id"])))
-    if len(rows) < args.windows:
-        sys.exit(f"the run has {len(rows)} windows, {args.windows} are needed")
-    rows = rows[:args.windows]
+    if args.skip_windows < 0:
+        sys.exit("--skip-windows must be 0 or more")
+    if len(rows) < args.skip_windows + args.windows:
+        sys.exit(f"the run has {len(rows)} windows, {args.skip_windows + args.windows} are needed")
+    rows = rows[args.skip_windows:args.skip_windows + args.windows]
 
     windows = []
     for r in rows:

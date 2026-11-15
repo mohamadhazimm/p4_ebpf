@@ -2,9 +2,15 @@
 """Replay one capture through the Wedge100BF-32X with the collector, and record what a
 window-by-window comparison with an offline extractor needs (RUNBOOK 19.6).
 
-    sudo python3 live_test/replay_capture.py CAPTURE --out DIR [--anchor-offset S] [--align-window K]
-        [--start-latency S] [--report-latency S] [--tx-iface eth1] [--switch-ssh root@172.168.1.2]
-        [-- extra hybrid_collector.py options]
+    sudo python3 live_test/replay_capture.py CAPTURE --out DIR [--profile switch|dataset]
+        [--anchor-offset S] [--align-window K] [--start-latency S] [--report-latency S]
+        [--tx-iface eth1] [--switch-ssh root@172.168.1.2] [-- extra hybrid_collector.py options]
+
+--profile switch (the default) runs the collector with 1 s windows (RUNBOOK 19.6). --profile
+dataset runs it with the dataset's definitions (RUNBOOK 19.9: 0.5 s windows, frame bytes,
+durations in seconds, dormant reads) for K + 40 windows, so that collector windows K..K+39 are
+the dataset's 40 windows; live_test/dataset_row.py --skip-windows K turns them into a row. The
+replay has no program to launch, so the collector's launcher stays the shell one.
 
 Steps:
  1. The run's window anchor is --anchor-offset seconds after the capture's first frame: the
@@ -13,7 +19,7 @@ Steps:
  2. What this host sends on --tx-iface is captured (tcpdump -Q out), so that the comparison uses
     the replayed timing, not the capture's: tcpreplay does not reproduce it exactly.
  3. hybrid_collector.py --profile switch (1 s windows, TTL 3, --clear-expired, immediate-mode
-    report capture) runs the replay as its scenario, so that the anchor falls on the start of
+    report capture; or --profile dataset, above) runs the replay as its scenario, so that the anchor falls on the start of
     collector window K: collector window K + j is dataset window j. The default replayer
     (live_test/replay_absolute.py) sends every frame at its recorded time from a start computed
     from the collector's window origin (HYBRID_T0); --replayer tcpreplay runs
@@ -231,10 +237,26 @@ def analyse(out, capture, anchor_offset, align_window, delay, report_latency, wi
     return summary
 
 
+DATASET_WINDOWS = 40
+
+
+def profile_settings(profile, align_window):
+    """The collector window and the collector options of a replay with this profile."""
+    if profile == "switch":
+        return 1.0, ["--profile", "switch"]
+    if profile == "dataset":
+        # K windows before the anchor, then the dataset's 40; the shell launcher, because the
+        # scenario is the replayer, not a program whose start-up the dataset rows include
+        return 0.5, ["--profile", "dataset", "--launcher", "shell", "--windows", str(align_window + DATASET_WINDOWS)]
+    raise ValueError("unknown profile %r" % profile)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("capture")
     ap.add_argument("--out", required=True, help="new directory for this replay's files")
+    ap.add_argument("--profile", choices=["switch", "dataset"], default="switch",
+                    help="collector definitions: switch (1 s windows) or dataset (0.5 s windows, RUNBOOK 19.9)")
     ap.add_argument("--anchor-offset", type=float, default=1.0,
                     help="seconds from the capture's first frame to the run's window anchor (sample_started_wall_us)")
     ap.add_argument("--align-window", type=int, default=2, help="collector window whose start the anchor should hit")
@@ -260,7 +282,7 @@ def main():
     if (out / "windows.csv").exists():
         sys.exit("%s already holds a replay; use a new --out" % out)
     out.mkdir(parents=True, exist_ok=True)
-    window_sec = 1.0
+    window_sec, profile_args = profile_settings(args.profile, args.align_window)
     delay = None
     if args.replayer == "tcpreplay":
         delay = args.align_window * window_sec - args.anchor_offset - args.start_latency
@@ -270,9 +292,10 @@ def main():
     else:
         if args.align_window * window_sec - args.anchor_offset < 0.5:
             sys.exit("the anchor cannot reach window %d: raise --align-window" % args.align_window)
-        scenario = "exec %s %s --iface %s --align-window %d --anchor-offset %.6f %s" % (
+        scenario = "exec %s %s --iface %s --align-window %d --anchor-offset %.6f --window-sec %s %s" % (
             shlex.quote(sys.executable), shlex.quote(str(REPO / "live_test" / "replay_absolute.py")),
-            shlex.quote(args.tx_iface), args.align_window, args.anchor_offset, shlex.quote(str(capture)))
+            shlex.quote(args.tx_iface), args.align_window, args.anchor_offset, repr(window_sec),
+            shlex.quote(str(capture)))
     stub = out / "hostmon_stub"
     stub.write_text("#!/bin/sh\n# stand-in HostMon: the host side of a replay comes from the recorded run\nexec sleep 86400\n")
     stub.chmod(0o755)
@@ -283,7 +306,7 @@ def main():
     if not ok:
         tcpdump.kill()
         sys.exit("the send capture did not start: %s" % "; ".join(said))
-    cmd = [sys.executable, str(REPO / "hybrid_collector.py"), "--profile", "switch", "--mode", "command",
+    cmd = [sys.executable, str(REPO / "hybrid_collector.py")] + profile_args + ["--mode", "command",
            "--scenario-name", capture.stem, "--label", args.label, "--command", scenario,
            "--out-csv", str(out / "windows.csv"), "--switch-ssh", args.switch_ssh,
            "--forward-int-port", args.int_port, "--forward-ext-port", args.ext_port, "--cpu-iface", args.cpu_iface,
@@ -291,8 +314,9 @@ def main():
            "--hostmon", str(stub), "--hostmon-log", str(out / "hostmon.log"),
            "--p4-reader", str(PYDIR / "read_registers_with_index.py"),
            "--p4-forwarder", str(PYDIR / "program_forwarding.py")] + extra
-    print("[replay] %s -> %s (%s, anchor at collector window %d)" % (
-        capture.name, out, "absolute replay" if delay is None else "tcpreplay after %.3f s" % delay, args.align_window))
+    print("[replay] %s -> %s (%s, profile %s, %.1f s windows, anchor at collector window %d)" % (
+        capture.name, out, "absolute replay" if delay is None else "tcpreplay after %.3f s" % delay, args.profile,
+        window_sec, args.align_window))
     with open(out / "collector.log", "w") as log:
         rc = subprocess.call(cmd, cwd=str(out), stdout=log, stderr=subprocess.STDOUT)
     time.sleep(0.5)

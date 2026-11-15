@@ -82,3 +82,11 @@ python3 live_test/pcap_truth.py live_test/captures/syn_fan_40k.pcap --truth live
 ```
 
 The totals agree with an independent scapy pass over both captures.
+
+## The dataset's other captures
+
+- `cohort/`: the 77 malware and CLI-benign runs with traffic (RUNBOOK 19.7.3, `package_cohort.py`).
+- `cohort-extra.tar.gz`: the 33 network-attack and network-benign runs, sanitized the same way
+  (771 MB unpacked, so committed as a tarball; unpack with
+  `tar xzf live_test/captures/cohort-extra.tar.gz -C live_test/captures`; its `README.md` has the
+  details). With `cohort/` they are the 110 captures of PC1.md Part 4.
