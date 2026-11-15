@@ -721,3 +721,52 @@ datagram for both. Also record the governor (`cpupower frequency-info`) and whet
 
 **What comes back.** `summary.json`, `bench.jsonl`, `kernel.txt` and the `SOCKOWNER_HEALTH` lines
 (drops and errors must be 0).
+
+## Part 6 (ready, 2026-11-15): the dataset's own static benign programs, live
+
+*Why. Live, PC1's own benign programs (Ubuntu 20.04 builds and busybox, parts 2 and 3) are flagged by the host
+and stacked detectors in 19 of 47 executions, far more than the dataset's benign rows. Two explanations remain:
+the live pipeline differs from the dataset's collector, or PC1's programs differ from the dataset's. The
+dataset's static programs carry their own C library, so running them here separates the two: if their live rows
+are their dataset rows, the pipeline is faithful and the gap comes from PC1's programs.*
+
+**The programs.** 66 static benign programs of the dataset without a network task (45 amd64, 21 i386; GNU
+coreutils, diffutils, gzip, m4, cpio, bzip2, brotli, lz4, ncompress, xxHash, xmlwf, sqlite3), each the exact
+binary of its dataset run, with the input files of its task. They come as `static-benign.tar.gz` (107 MB,
+SHA-256 `e011e8cabb36d2c8b25d8ad1aee5c704bf7187fc048ad9e07daaeac1756372e9`), not committed (compiled GPL programs): copy it from the lab workstation
+(`vbox-runs/hybrid-rf-study-20261010/data/versioned-collector/additional-study-review-20261022/pc1-static-benign/`).
+
+    mkdir -p perf/results/static_benign && cd perf/results/static_benign
+    scp WORKSTATION:.../pc1-static-benign/static-benign.tar.gz . && sha256sum static-benign.tar.gz
+    tar xzf static-benign.tar.gz && cd ../../..
+    (cd perf/results/static_benign/static-benign && python3 -c 'import hashlib,json; m=json.load(open("manifest.json")); bad=[f for f,h in m["files"].items() if hashlib.sha256(open(f,"rb").read()).hexdigest()!=h]; print("bad:", bad or "none")')
+
+The i386 programs need the kernel's 32-bit support (standard in Ubuntu's kernels).
+
+**Run** (from p4_ebpf; about 25 minutes; `--only 2` first as a trial):
+
+    python3 live_test/static_benign/run_static_benign.py --root perf/results/static_benign/static-benign \
+        --out perf/results/static_benign/runs --startup-free [--pfexec PATH_OF_PART_3_PFEXEC]
+
+`--startup-free` starts each program as part 3 did: `pfexec` (built from `live_test/prologuefree/pfexec.c`)
+moves it into `/sys/fs/cgroup/unified/hazim_prog` at its exec, the launcher's bash stays in `hazim_launch`,
+and the runner writes part 3's two-line `hostmon_agg` wrapper itself. Each case is the common collector
+command C of section 0 with `--command "pfexec ... -o OUT/ID.stdout PROGRAM ARGS"` (every path absolute), then
+`dataset_row.py` with the case's dataset `execution_id`. Without `--startup-free` it runs as part 2 (the
+launcher in the cgroup, `bin/outto` for stdout); compare those rows with the published table instead.
+
+**Compare:**
+
+    ../venv/bin/python3 live_test/static_benign/compare_static_benign.py perf/results/static_benign/runs/rows.csv \
+        --dataset live_test/prologuefree/features_05s_prologuefree.csv --json perf/results/static_benign/compare.json
+
+Per program: the live and dataset system-call counts, how many of the 90 host columns agree within 1% and 10%,
+and the four detectors' scores (host-only, network-only, concatenated, stacked; trained on the 240 start-up-free
+rows *without the program's project*) for the live row and for its dataset twin, side by side. The dataset
+twins themselves are flagged by host 6, network 0, concatenated 6, stacked 2 of 66 (checked on the workstation:
+the script given the dataset's own rows reproduces them exactly, 90 of 90 host columns, identical scores). So a
+faithful pipeline gives about those numbers; part 3's 19 of 47 would show as many more live flags here.
+
+**What comes back.** The comparison's printed table and `compare.json`, `runs/rows.csv`, and any case whose
+collector failed or whose exit code differs from `cases.tsv` (the runner prints both). Expected differences
+worth noting rather than fixing: a few calls from PC1's kernel, and programs whose count depends on timing.
