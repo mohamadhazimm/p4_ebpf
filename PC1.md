@@ -823,3 +823,26 @@ and the share of the attack dropped. Then the same with three benign replays (`b
 
 **What comes back.** Step 1's first-alarm windows; for step 3 the per-run times and counts, the `stream.jsonl`
 files, the compiler's resource lines for the variant with the table, and any failure.
+
+## Part 8 (proposed, 2026-11-15): several hosts behind the switch
+
+*For the committee's item 9 (several hosts behind the Tofino, with background traffic). Needs a testbed change on
+PC1, so run it only if the user agrees.*
+
+**What the collector can do now.** `hybrid_collector.py --scope-ip ADDR` (repeatable) writes, next to the run's
+rows, one more CSV per address (`<out-csv stem>.scoped-ADDR.csv`) whose network features count only the flows
+with ADDR as source or destination (`sockjoin.ip_scope_windows`: a bucket's flow is the 5-tuple of its latest CPU
+report; cleared buckets lose their owner until they report again). Tested: two hosts' flows partition each window
+(their packet and byte deltas add up to the whole window's), and the server's address gives back the
+window-level join (`test_sockjoin.py`, the collector suite is 152 OK).
+
+**Proposed run.** With only PC1 and PC2 every flow touches both, so the hosts are two client namespaces on PC1
+bridged onto `eth1`, with their own addresses (A 10.0.0.11, B 10.0.0.12), talking to `validation/hybrid/servers.py`
+on PC2 (10.0.0.2):
+1. A alone (`http_poll`), B alone (`http_bulk`), each one collector run with `--scope-ip` its address;
+2. A and B at the same time, one collector run with `--scope-ip 10.0.0.11 --scope-ip 10.0.0.12`;
+3. step 2 again with background traffic from a third namespace (`bulk2000` replayed from it).
+Compare per host, window by window, the scoped rows of steps 2 and 3 with the solo rows of step 1, and with the
+window-level rows (every flow); score all three with `validation/hybrid/score.py`'s network detector. Expected:
+scoped equals solo up to timing, the window-level rows mix the hosts. The host side stays this machine's monitor
+on the monitored host's cgroup (a per-host monitor on each host is the deployment, not tested here).

@@ -2156,6 +2156,25 @@ def socket_join_rows(args, run_id: str, cgroup_path: Optional[Path], global_t0: 
     return [dict(row, join="socket") for row in build_rows(args, run_id, host_windows, joined, summaries)]
 
 
+def ip_scope_rows(args, run_id: str, host_windows: List[Dict[str, object]],
+                  net_windows: List[Dict[str, object]], address: str) -> List[Dict[str, object]]:
+    """The run's rows with the host-level join's network features for one host: only the buckets whose flow
+    has `address` as source or destination count (sockjoin.ip_scope_windows). The host columns are the same
+    as in the window-level rows (they come from this machine's monitor)."""
+    import sockjoin
+    scoped = sockjoin.ip_scope_windows(net_windows, [address])
+    owned = sum(len(w["owned_indexes"]) for w in scoped)
+    print(f"[INFO] host-level join on {address}: {owned} owned bucket-windows over {len(scoped)} windows")
+    summaries = build_net_summaries(scoped, args.window_sec, byte_layer=args.byte_layer,
+                                    duration_unit=args.duration_unit)
+    return [dict(row, join="ip:" + address) for row in build_rows(args, run_id, host_windows, scoped, summaries)]
+
+
+def scoped_csv_path(out_csv: str, address: str) -> Path:
+    out = Path(out_csv)
+    return out.with_name(f"{out.stem}.scoped-{address}{out.suffix}")
+
+
 # ============================================================
 # MAIN
 # ============================================================
@@ -2276,6 +2295,10 @@ def build_arg_parser(profile: Optional[str] = None) -> argparse.ArgumentParser:
                          "--hostmon-cgroup give a second set of network features, written to --socket-join-csv. "
                          "Needs --hostmon-cgroup")
     ap.add_argument("--sockowner-log", default="sockowner.log")
+    ap.add_argument("--scope-ip", action="append", default=[],
+                    help="host-level join (several hosts behind the switch): also write, for this address, rows "
+                         "whose network features count only the flows with it as source or destination, to the "
+                         "--out-csv name with .scoped-ADDRESS before the suffix (repeatable: one file per address)")
     ap.add_argument("--sockowner-attach", default="/sys/fs/cgroup",
                     help="cgroup-v2 directory sockowner attaches to (default: the root, so every process is seen)")
     ap.add_argument("--socket-join-csv",
@@ -2598,6 +2621,11 @@ def main() -> None:
                 Path(args.out_csv).with_name(Path(args.out_csv).stem + ".socket" + Path(args.out_csv).suffix)
             append_csv_rows(str(out), socket_rows)
             print(f"[OK] Added {len(socket_rows)} socket-join rows to {out}")
+        for address in args.scope_ip:
+            scoped_rows = ip_scope_rows(args, run_id, host_windows, net_windows, address)
+            out = scoped_csv_path(args.out_csv, address)
+            append_csv_rows(str(out), scoped_rows)
+            print(f"[OK] Added {len(scoped_rows)} host-level join rows to {out}")
 
         print(f"[OK] Added {writer.count} rows to {args.out_csv}")
         print(f"[OK] run_id: {run_id}")
