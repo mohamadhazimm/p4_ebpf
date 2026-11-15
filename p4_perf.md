@@ -571,6 +571,44 @@ only the program differed.
 - **For the paper:** these are the numbers of the build it describes. Sections 3.2 and 4.1
   describe the build with the counter.
 
+### 5.6 Global totals (test build `gtot`, 15 November, tested on the switch, not deployed)
+
+Under a flood the control plane reads ~500 buckets per 0.5 s window while ~30,000 are active, so window
+totals summed over the buckets read show 6–35% of the packets (PC1.md, part 4c). The test build adds seven
+one-entry registers that every counted packet updates, with the values the flow registers use: packets,
+bytes, A→B packets and bytes, SYN, ACK, RST. PC1.md part 4d has the collector side and the replays (floods
+97.6–100% of their packets seen instead of 6–73%).
+- **Sources:** `perf/variants/gtot/`: the fixed build of Section 5.5 (`basic_fix`, same hashes) with the seven
+  registers in `ingress.p4`; `-DP4_ENABLE_GLOBAL_TOTALS=0` compiles `basic_fix`. The instrumented copy for the
+  latency is `perf/variants/hwl/make_hwl_sources.sh perf/variants/gtot OUT_DIR`; it differs from Section 5.5's
+  instrumented build only by the seven registers.
+- **Compile** (bf-p4c 9.6.0; `perf/results/gtot_build_20261115/`, `perf/results/latency_gtot_20261115/builds/`):
+
+  | Build | Stages ig/eg | SRAM | Map RAM | Stateful ALUs | Latency ig/eg (cycles) |
+  |---|---|---|---|---|---|
+  | basic_fix (Section 5.5) | 5/1 | 197 (20.5%) | 196 (34.0%) | 14 (29.2%) | 131/170 |
+  | gtot | 6/1 | 211 (22.0%) | 210 (36.5%) | 21 (43.8%) | 135/170 |
+  | basic_fix, Section 4.1 instrumentation | 5/2 | 197 | 196 | 14 | 131/172 |
+  | gtot, Section 4.1 instrumentation | 6/2 | 211 | 210 | 21 | 135/172 |
+
+  Each one-entry register takes 2 RAMs, 2 map RAMs and one stateful ALU. The compiler adds one ingress stage,
+  moves five flow registers one stage later (`reg_pkts`, `reg_bytes`, `reg_pkts_ab`, `reg_bytes_ab`,
+  `reg_min_len`) and `reg_first_ts` from stage 0 to stage 3; the critical path stays at 4 stages.
+- **Latency** (Section 4.1's method as Section 5.5 ran it: hairpin, 1010 probes at 100 pkt/s, 10 warm-up
+  probes excluded, 3 runs per program, all three programs on the same day, `hwl_runs.sh`; every run had
+  1010 of 1010 reports, none malformed or missing):
+
+  | Program | min | median | mean | p99 | max (ns) |
+  |---|---|---|---|---|---|
+  | Baseline | 244 | 246 | 245.59–245.62 | 247 | 247–248 |
+  | basic_fix (detector without the counter) | 314 | 315 | 315.39–315.43 | 319 | 319–322 |
+  | gtot | 317 | 319 | 318.66–318.70 | 322 | 323–324 |
+
+  - **The global totals cost 4 ns** (median 319 vs 315 ns; 3.3 ns in the mean), the compiler's 4 cycles. The
+    detector's cost over the baseline goes from 69 to 73 ns.
+  - The baseline and `basic_fix` reproduce Section 5.5's values to the nanosecond.
+- **Not measured:** the line rate (Section 3.2) of `gtot`. The switch runs `basic_fix` again.
+
 ## 6. Switch CPU side
 
 These two measurements cover the switch CPU and its driver, not the P4 program. The P4

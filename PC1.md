@@ -940,8 +940,9 @@ plus seven one-entry registers (`reg_g_pkts`, `reg_g_bytes`, `reg_g_pkts_ab`, `r
 | SRAM / map RAM | 20.5% / 34.0% | 22.0% / 36.5% (2 + 2 per one-entry register) |
 | ingress MAU latency (compiler estimate) | 131 cycles | 135 cycles |
 
-The compiler moved some flow registers one stage later; what they count is unchanged. The latency was not measured
-on the switch (it would be, as in p4_perf section 5.5, if the build were adopted).
+The compiler moved some flow registers one stage later; what they count is unchanged. **Latency, measured the same
+day with p4_perf section 4.1's method (p4_perf section 5.6): median 319 ns against basic_fix's 315 ns and the
+baseline's 246 ns, so the totals cost 4 ns.**
 
 **The software:** `batched_reader.read_window(totals=True)` syncs the seven registers with the flow registers (one
 snapshot) and reads them through the client's own parser; `reset_registers.py` clears them at the start of a run
