@@ -386,6 +386,81 @@ class UnconditionalClearTests(unittest.TestCase):
         self.assertEqual(legacy["cleared"], [])
 
 
+class DormantProbeTests(unittest.TestCase):
+    """read_window(probe=): reg_pkts of the collector's dormant buckets only, from the window's snapshot, and the
+    changed ones read in full in the same window (PC1.md part 4b: a flow that resumes in its occupied dormant
+    bucket sends no CPU report, so only a read shows it)."""
+
+    def setUp(self):
+        self.sw = bfrt_mock.MockSwitch()
+        play_known_answer(self.sw)                          # KNOWN_IDX: 100 packets
+        for idx, n in ((11, 3), (12, 5)):
+            for k in range(n):
+                self.sw.packet(idx, 0, 60, 1000 + idx, 80, 6, 0x10, 1000 + k)
+
+    def spy(self, reader):
+        calls = []
+        read_table = reader._read_table
+
+        def recorded(t, indexes, from_hw, timing):
+            calls.append((t.name, list(indexes)))
+            return read_table(t, indexes, from_hw, timing)
+
+        reader._read_table = recorded
+        return calls
+
+    def test_only_reg_pkts_is_probed_and_only_the_changed_bucket_is_read_in_full(self):
+        reference = run_batched(make_batched(self.sw, addr="mock:ref"), [11, KNOWN_IDX])
+        reader = make_batched(self.sw)
+        calls = self.spy(reader)
+        payload = json.loads(json.dumps(reader.read_window([11], probe={KNOWN_IDX: 90, 12: 5})))
+        self.assertEqual(payload["resumed"], [KNOWN_IDX], "12 still holds the 5 packets the caller saw")
+        self.assertEqual(payload["rows"], reference["rows"], "the resumed bucket's row is a full row")
+        self.assertEqual(calls[0], ("reg_pkts", [12, KNOWN_IDX]))
+        self.assertEqual(len(calls), 1 + len(batched_reader.REG_NAMES))
+        self.assertTrue(all(idxs == [11, KNOWN_IDX] for _name, idxs in calls[1:]), "12 is never read in full")
+        t = payload["timing"]
+        self.assertEqual((t["probed"], t["probe_resumed"], t["active"]), (2, 1, 1))
+        self.assertGreaterEqual(t["probe_ms"], 0.0)
+        self.assertEqual(list(payload)[-3:], ["resumed", "deferred", "rows"])
+        self.assertEqual(payload["deferred"], [])
+
+    def test_the_probe_reads_the_windows_snapshot_and_alone_still_syncs(self):
+        reader = make_batched(self.sw)
+        for k in range(2):                                   # two more packets, in hardware only
+            self.sw.packet(12, 0, 60, 1012, 80, 6, 0x10, 2000 + k)
+        payload = run_batched_probe(reader, {12: 5})
+        self.assertGreater(payload["timing"]["sync_rpcs"], 0, "a probe without indexes still takes the snapshot")
+        self.assertEqual(([r["idx"] for r in payload["rows"]], payload["rows"][0]["pkts"]), ([12], 7))
+        self.sw.packet(12, 0, 60, 1012, 80, 6, 0x10, 3000)  # after the snapshot: not in a shadow read
+        payload = run_batched_probe(reader, {12: 7}, snapshot="shadow")
+        self.assertEqual((payload["resumed"], payload["rows"]), ([], []))
+
+    def test_probe_max_full_reads_that_many_changed_buckets_and_defers_the_rest(self):
+        # PC1.md part 4c: under a fan-out flood thousands of dormant buckets change at once
+        reader = make_batched(self.sw)
+        payload = run_batched_probe(reader, {11: 0, 12: 0, KNOWN_IDX: 0}, indexes=[], snapshot="sync")
+        self.assertEqual(payload["resumed"], [11, 12, KNOWN_IDX], "no cap: all read in full")
+        payload = json.loads(json.dumps(reader.read_window([], [], {}, "sync", "batched gRPC", [],
+                                                           probe={11: 0, 12: 0, KNOWN_IDX: 0}, probe_max_full=1)))
+        self.assertEqual((payload["resumed"], payload["deferred"]), ([11], [12, KNOWN_IDX]))
+        self.assertEqual([r["idx"] for r in payload["rows"]], [11])
+        self.assertEqual(payload["timing"]["probe_deferred"], 2)
+        payload = json.loads(json.dumps(reader.read_window([], [], {}, "sync", "batched gRPC", [],
+                                                           probe={11: 0}, probe_max_full=0)))
+        self.assertEqual((payload["resumed"], payload["deferred"], payload["rows"]), ([], [11], []))
+
+    def test_without_a_probe_the_payload_is_unchanged(self):
+        payload = make_batched(self.sw).read_window([11])
+        self.assertNotIn("resumed", payload)
+        self.assertNotIn("probe_ms", payload["timing"])
+
+
+def run_batched_probe(reader, probe, indexes=(), snapshot="sync"):
+    payload = reader.read_window(list(indexes), [], {}, snapshot, "batched gRPC", [], probe=probe)
+    return json.loads(json.dumps(payload))
+
+
 class KnownAnswerTests(unittest.TestCase):
     def check_row(self, row):
         for key, value in KNOWN_ROW.items():
@@ -690,6 +765,19 @@ class ServeProtocolTests(unittest.TestCase):
             self.assertEqual(payload["cleared"], [KNOWN_IDX])
             self.assertEqual(proc.read([KNOWN_IDX], timeout=30)["rows"][0]["pkts"], 0)
             self.assertEqual(proc.starts, 1)
+        finally:
+            proc.stop()
+
+    def test_the_serve_protocol_carries_the_dormant_probe(self):
+        proc = hc.BatchedReaderProcess(self.script, grpc_addr="mock:serve", echo=False,
+                                       extra_args=["--mock-cells", self.cells])
+        try:
+            proc.start()
+            payload = proc.read([], probe={KNOWN_IDX: 1}, timeout=30)
+            self.assertEqual((payload["resumed"], [r["pkts"] for r in payload["rows"]]), ([KNOWN_IDX], [100]))
+            payload = proc.read([], probe={KNOWN_IDX: 100}, timeout=30)
+            self.assertEqual((payload["resumed"], payload["rows"], payload["timing"]["probed"]), ([], [], 1))
+            self.assertNotIn("resumed", proc.read([KNOWN_IDX], timeout=30))
         finally:
             proc.stop()
 

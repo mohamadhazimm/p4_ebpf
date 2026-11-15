@@ -823,7 +823,8 @@ class BatchedReaderProcess:
     def read(self, indexes: List[int], dst_indexes: Optional[List[int]] = None,
              clear_if_unchanged: Optional[Dict[int, int]] = None, snapshot: str = "sync",
              timeout: Optional[float] = None, source: str = "batched gRPC",
-             clear_indexes: Optional[List[int]] = None) -> Dict[str, Any]:
+             clear_indexes: Optional[List[int]] = None, probe: Optional[Dict[int, int]] = None,
+             probe_max_full: Optional[int] = None) -> Dict[str, Any]:
         if self._proc is None or self._proc.poll() is not None:
             self.start()
         assert self._proc is not None and self._proc.stdin is not None
@@ -831,6 +832,11 @@ class BatchedReaderProcess:
                    "clear_if_unchanged": {str(int(k)): int(v) for k, v in (clear_if_unchanged or {}).items()},
                    "clear_indexes": [int(i) for i in (clear_indexes or [])],
                    "snapshot": snapshot, "source": source}
+        if probe:
+            # dormant buckets: reg_pkts only, the changed ones in full (batched_reader.read_window)
+            request["probe"] = {str(int(k)): int(v) for k, v in probe.items()}
+            if probe_max_full is not None:
+                request["probe_max_full"] = int(probe_max_full)
         t_sent = time.time()
         self._proc.stdin.write(json.dumps(request) + "\n")
         self._proc.stdin.flush()
@@ -1017,12 +1023,14 @@ PROFILES: Dict[str, Dict[str, Any]] = {
                 "reader_raw_wire": True, "reader_sync_batched": True, "p4_snapshot": "sync",
                 "read_budget_frac": 0.7, "max_dst_reads": 256, "forward_report_port": 192,
                 "clear_expired": 0, "clear_budget_frac": 0.5,
-                "dormant_reads": 1, "byte_layer": "frame", "duration_unit": "s", "windows": 40,
+                "dormant_reads": 1, "dormant_probe": 1, "byte_layer": "frame", "duration_unit": "s", "windows": 40,
                 "launcher": "dataset"},
 }
 
 # Ethernet header bytes: the dataset counted frame bytes, the switch counts IPv4 totalLen.
 ETHERNET_HEADER_BYTES = 14
+# Dormant probes leave room for this many full bucket reads: the dormant buckets found changed.
+DORMANT_RESUME_RESERVE = 8
 # The flow timestamps are the low 32 bits of a ns clock.
 TS_WRAP_S = (1 << 32) / 1e9
 
@@ -1063,8 +1071,9 @@ def payload_timing_ms(payload: Dict[str, Any], wall_ms: float) -> Dict[str, floa
     sync_ms = float(timing.get("sync_ms", sync_s * 1000.0))
     read_ms = float(timing.get("read_ms", max(0.0, read_s - sync_s) * 1000.0))
     clear_ms = float(timing.get("clear_ms", clear_s * 1000.0))
-    return {"sync_ms": sync_ms, "read_ms": read_ms, "clear_ms": clear_ms,
-            "overhead_ms": max(0.0, wall_ms - sync_ms - read_ms - clear_ms)}
+    probe_ms = float(timing.get("probe_ms", 0.0))
+    return {"sync_ms": sync_ms, "read_ms": read_ms, "clear_ms": clear_ms, "probe_ms": probe_ms,
+            "overhead_ms": max(0.0, wall_ms - sync_ms - read_ms - clear_ms - probe_ms)}
 
 
 class ReadCostModel:
@@ -1087,15 +1096,23 @@ class ReadCostModel:
     clear_fixed_ms (its Write RPC); these per-request parts are taken off before
     the per-bucket costs are learned, and reads or clears of fewer than
     min_rate_units buckets do not move the per-bucket costs at all (their time is
-    almost all request overhead)."""
+    almost all request overhead).
+
+    A dormant probe (collect_windows_live's dormant_probe) reads one register
+    entity per bucket, reg_pkts, like a reg_newconn_dst read: probe_ms_per_bucket
+    starts at DST_WEIGHT of a flow bucket and is learned from the reader's
+    probe_ms."""
 
     DST_WEIGHT = 0.15
 
     def __init__(self, fixed_ms: float = 70.0, read_ms_per_bucket: float = 1.3,
                  clear_ms_per_bucket: float = 0.7, alpha: float = 0.3, route: str = "fast",
-                 read_fixed_ms: float = 0.0, clear_fixed_ms: float = 0.0, min_rate_units: float = 0.0):
+                 read_fixed_ms: float = 0.0, clear_fixed_ms: float = 0.0, min_rate_units: float = 0.0,
+                 probe_ms_per_bucket: Optional[float] = None):
         self.fixed_ms = fixed_ms
         self.read_ms_per_bucket = read_ms_per_bucket
+        self.probe_ms_per_bucket = (self.DST_WEIGHT * read_ms_per_bucket if probe_ms_per_bucket is None
+                                    else probe_ms_per_bucket)
         self.clear_ms_per_bucket = clear_ms_per_bucket
         self.read_fixed_ms = read_fixed_ms        # per read with at least one bucket: its Read RPCs
         self.clear_fixed_ms = clear_fixed_ms      # per read with at least one clear: its Write RPC
@@ -1116,12 +1133,14 @@ class ReadCostModel:
         a = self.alpha if alpha is None else alpha
         return old + a * (new - old)
 
-    def update(self, n_read: int, n_cleared: int, timing: Dict[str, float], n_dst: int = 0) -> None:
+    def update(self, n_read: int, n_cleared: int, timing: Dict[str, float], n_dst: int = 0,
+               n_probe: int = 0) -> None:
         # How much longer than predicted (with the estimates the read was planned
         # with) this read took; only overshoots count, so the margin decays to 0
         # while the predictions hold.
-        observed = timing["sync_ms"] + timing["read_ms"] + timing["clear_ms"] + timing["overhead_ms"]
-        overshoot = observed - self.predict_ms(n_read, n_cleared, n_dst)
+        probe_ms = timing.get("probe_ms", 0.0)
+        observed = timing["sync_ms"] + timing["read_ms"] + timing["clear_ms"] + timing["overhead_ms"] + probe_ms
+        overshoot = observed - self.predict_ms(n_read, n_cleared, n_dst, n_probe)
         self.margin_ms = self._ema(self.margin_ms, max(0.0, overshoot))
         self.windows_seen += 1
         self.fixed_ms = self._ema(self.fixed_ms, timing["sync_ms"] + timing["overhead_ms"])
@@ -1132,6 +1151,8 @@ class ReadCostModel:
         if n_cleared > 0 and n_cleared >= self.min_rate_units:
             self.clear_ms_per_bucket = self._ema(self.clear_ms_per_bucket,
                                                  max(0.0, timing["clear_ms"] - self.clear_fixed_ms) / n_cleared)
+        if n_probe > 0 and n_probe >= self.min_rate_units:
+            self.probe_ms_per_bucket = self._ema(self.probe_ms_per_bucket, max(0.0, probe_ms) / n_probe)
 
     def update_processing(self, prep_ms: float, post_ms: float, select_ms: float = 0.0) -> None:
         """The collector's own time before, around and after the read (faster
@@ -1140,10 +1161,17 @@ class ReadCostModel:
         self.select_ms = self._ema(self.select_ms, max(0.0, select_ms), alpha=0.5)
         self.post_ms = self._ema(self.post_ms, max(0.0, post_ms), alpha=0.5)
 
-    def predict_ms(self, n_read: int, n_cleared: int = 0, n_dst: int = 0) -> float:
+    def predict_ms(self, n_read: int, n_cleared: int = 0, n_dst: int = 0, n_probe: int = 0) -> float:
         units = n_read + self.DST_WEIGHT * n_dst
         return (self.fixed_ms + (self.read_fixed_ms if units > 0 else 0.0) + units * self.read_ms_per_bucket
-                + (self.clear_fixed_ms if n_cleared > 0 else 0.0) + n_cleared * self.clear_ms_per_bucket)
+                + (self.clear_fixed_ms if n_cleared > 0 else 0.0) + n_cleared * self.clear_ms_per_bucket
+                + n_probe * self.probe_ms_per_bucket)
+
+    def probes_within(self, ms: float) -> int:
+        """How many dormant buckets can be probed (reg_pkts only) in ms."""
+        if ms <= 0 or self.probe_ms_per_bucket <= 0:
+            return 0
+        return int(ms // self.probe_ms_per_bucket)
 
     def buckets_within(self, budget_ms: float, n_cleared: int = 0, n_dst: int = 0) -> int:
         """How many flow buckets a read can cover inside budget_ms, next to
@@ -1168,6 +1196,7 @@ class ReadCostModel:
                 "read_ms_per_bucket": round(self.read_ms_per_bucket, 4),
                 "clear_fixed_ms": round(self.clear_fixed_ms, 2),
                 "clear_ms_per_bucket": round(self.clear_ms_per_bucket, 4),
+                "probe_ms_per_bucket": round(self.probe_ms_per_bucket, 4),
                 "prep_ms": round(self.prep_ms, 2), "select_ms": round(self.select_ms, 2),
                 "post_ms": round(self.post_ms, 2), "margin_ms": round(self.margin_ms, 2),
                 "windows_seen": self.windows_seen}
@@ -1295,6 +1324,7 @@ def collect_windows_live(
     clear_budget_frac: float = 0.5,
     clock: Any = None,
     dormant_reads: bool = False,
+    dormant_probe: bool = False,
     max_windows: int = 0,
     stop_fn: Optional[Callable[[], None]] = None,
 ) -> List[Dict[str, object]]:
@@ -1339,6 +1369,27 @@ def collect_windows_live(
     end of the run. Each window records "active_after_read_indexes" (the active
     set once this read's changes are known; NetSummarizer counts those rows),
     "dormant_count" and "dormant_read_indexes".
+
+    dormant_probe (with dormant_reads and a read_fn that takes probe=, the
+    batched reader): instead of reading a few dormant buckets in full, round
+    robin, every window probes as many as the allowance fits, oldest probed
+    first (usually all of them): only reg_pkts, one register entity per bucket,
+    from the window's snapshot, and the reader reads in full, in the same window,
+    those whose count changed. A reused 5-tuple lands in its occupied dormant
+    bucket and sends no CPU report; with round-robin reads its packets counted
+    only when the bucket's turn came, windows later (PC1.md part 4b). A few
+    buckets' full reads (DORMANT_RESUME_RESERVE) are kept free for the resumed
+    ones, and the reader reads in full only as many changed buckets as the
+    allowance left after the probes fits (probe_max_full); the others are
+    active again and read with the active set from the next window, under its
+    budget (a fan-out flood changes thousands of occupied dormant buckets at
+    once: read all in full, the reads overran the window, PC1.md part 4c). Each
+    window also records "dormant_probed_count", "dormant_resumed_indexes" and
+    "dormant_deferred_indexes".
+
+    A program without reg_newconn_dst (the deployed basic_fix) answers its reads
+    with an error and no rows: from then on no destination bucket is requested
+    (nor counted as skipped), and the cost model learns only from the rows read.
 
     max_windows: the run has exactly that many windows whether or not the
     scenario has ended (the dataset's observation was fixed: 40 windows of
@@ -1393,6 +1444,14 @@ def collect_windows_live(
     dormant_resumed = 0
     dormant_reads_total = 0
     dormant_max = 0
+    if dormant_probe and (not dormant_reads or read_fn is None):
+        print("[WARN] --dormant-probe needs --dormant-reads and the batched reader; dormant buckets are read "
+              "round robin")
+        dormant_probe = False
+    dormant_probes_total = 0
+    dormant_probe_resumed_total = 0
+    dormant_deferred_total = 0
+    dst_missing = False
 
     w = 0
     proc_done = False
@@ -1487,6 +1546,8 @@ def collect_windows_live(
             read_dst_idxs = sorted(ranked_dst[:max_dst_reads])
         else:
             read_dst_idxs = active_dst_idxs
+        if dst_missing:
+            read_dst_idxs = []   # the program has no reg_newconn_dst: nothing to read, and no overload
         # Expired buckets cleared in this read, oldest first, within their share
         # of the allowance that is left after the fixed cost.
         clear_now: List[int] = []
@@ -1513,7 +1574,31 @@ def collect_windows_live(
 
         # Dormant buckets read with what the allowance leaves after the active set, oldest read first.
         dormant_now: List[int] = []
-        if dormant_reads and dormant and not skipped_idxs:
+        probe_now: Dict[int, int] = {}
+        probe_max_full: Optional[int] = None
+        if dormant_probe and dormant and not skipped_idxs:
+            # Probe reg_pkts of as many dormant buckets as fit, oldest probed first; the reader reads the
+            # changed ones in full, as many as the allowance still fits, so a resumed flow counts in this
+            # window; the other changed ones are deferred.
+            n_probe = len(dormant)
+            if allow_ms is not None:
+                # the allowance after the active reads (the Read RPCs' fixed part counted even without an
+                # active bucket: the changed dormant ones are read the same way)
+                avail_ms = (allow_ms - cost.margin_ms
+                            - cost.predict_ms(len(read_idxs), len(clear_now) + idle_estimate, len(read_dst_idxs))
+                            - (cost.read_fixed_ms if not read_idxs else 0.0))
+                n_probe = max(0, min(n_probe, cost.probes_within(
+                    avail_ms - DORMANT_RESUME_RESERVE * cost.read_ms_per_bucket)))
+                left_ms = avail_ms - n_probe * cost.probe_ms_per_bucket
+                probe_max_full = (max(0, int(left_ms // cost.read_ms_per_bucket)) if cost.read_ms_per_bucket > 0
+                                  else DORMANT_RESUME_RESERVE)
+            probe_list = list(dormant)[:n_probe]
+            for idx in probe_list:
+                dormant.move_to_end(idx)
+            # a bucket never read has no known count: -1 differs from any, so it is read in full
+            probe_now = {idx: last_pkts.get(idx, -1) for idx in probe_list}
+            dormant_probes_total += len(probe_now)
+        elif dormant_reads and dormant and not skipped_idxs:
             n_dormant = len(dormant)
             if allow_ms is not None:
                 fit = cost.buckets_within(allow_ms, n_cleared=len(clear_now) + idle_estimate, n_dst=len(read_dst_idxs))
@@ -1536,6 +1621,10 @@ def collect_windows_live(
             }
 
         extra: Dict[str, Any] = {"clear_indexes": clear_now} if clear_now else {}
+        if probe_now:
+            extra["probe"] = probe_now
+            if probe_max_full is not None:
+                extra["probe_max_full"] = probe_max_full
         read_start = clk.time()
         if read_fn is None:
             payload = read_p4_with_retries(reader_path, request_idxs, w, retries=read_retries, timeout=read_timeout,
@@ -1545,25 +1634,37 @@ def collect_windows_live(
             payload = read_fn(request_idxs, w, snapshot=snapshot, clear_if_unchanged=clear_candidates,
                               dst_indexes=read_dst_idxs, **extra)
         read_end = clk.time()
+        resumed_now = sorted(safe_int(i) for i in (payload.get("resumed") or []))
+        deferred_now = sorted(safe_int(i) for i in (payload.get("deferred") or []))
+        dormant_probe_resumed_total += len(resumed_now)
+        dormant_deferred_total += len(deferred_now)
+        dst_rows_read = len(payload.get("dst_rows") or [])
+        if (read_dst_idxs and not dst_rows_read
+                and any("reg_newconn_dst" in str(e) and "missing" in str(e).lower() for e in (payload.get("errors") or []))):
+            dst_missing = True
+            print("[INFO] the program has no reg_newconn_dst: destination buckets are not read from now on")
         if timing_log is not None:
             if dormant_reads:
+                fields = {"active_read": len(read_idxs), "dormant": len(dormant), "dormant_read": len(dormant_now)}
+                if dormant_probe:
+                    fields.update(dormant_probed=len(probe_now), dormant_probe_resumed=len(resumed_now),
+                                  dormant_probe_deferred=len(deferred_now))
                 timing_log(w, payload, read_start, read_end, len(request_idxs), len(read_dst_idxs),
-                           window_end=win_end_abs,
-                           extra={"active_read": len(read_idxs), "dormant": len(dormant), "dormant_read": len(dormant_now)})
+                           window_end=win_end_abs, extra=fields)
             else:
                 timing_log(w, payload, read_start, read_end, len(request_idxs), len(read_dst_idxs), window_end=win_end_abs)
         wall_ms = (read_end - read_start) * 1000.0
-        cost.update(len(request_idxs), len(payload.get("cleared") or []), payload_timing_ms(payload, wall_ms),
-                    n_dst=len(read_dst_idxs))
+        cost.update(len(request_idxs) + len(resumed_now), len(payload.get("cleared") or []),
+                    payload_timing_ms(payload, wall_ms), n_dst=dst_rows_read, n_probe=len(probe_now))
         overrun = read_end > win_end_abs + window_sec
+        dst_skipped = 0 if dst_missing else len(active_dst_idxs) - len(read_dst_idxs)
         overruns += int(overrun)
         agg.update({
-            "net_overload": int(bool(skipped_idxs) or len(read_dst_idxs) < len(active_dst_idxs)
-                                or len(clear_now) < len(pending_clear)),
+            "net_overload": int(bool(skipped_idxs) or dst_skipped > 0 or len(clear_now) < len(pending_clear)),
             "net_buckets_active": len(active_idxs),
             "net_buckets_read": len(read_idxs),
             "net_buckets_skipped": len(skipped_idxs),
-            "net_dst_buckets_skipped": len(active_dst_idxs) - len(read_dst_idxs),
+            "net_dst_buckets_skipped": dst_skipped,
             "net_read_budget_ms": round(budget_ms, 1) if budget_ms is not None else 0.0,
             "net_read_allow_ms": round(allow_ms, 1) if allow_ms is not None else 0.0,
             "net_read_late_ms": round(late_ms, 1),
@@ -1582,6 +1683,13 @@ def collect_windows_live(
             else:
                 idle_reads[idx] = idle_reads.get(idx, 0) + 1
             last_pkts[idx] = pkts
+        # Dormant buckets the probe found changed but could not read in full within the allowance: active
+        # again (they are), read with the active set from the next window on, under its budget.
+        for idx in deferred_now:
+            active_idx_last_seen[idx] = w
+            if idx in dormant:
+                del dormant[idx]
+                dormant_resumed += 1
         # The active set once this read's changes are known (before this read's clears take effect:
         # a bucket cleared after this read still counts in this window).
         active_after_read = sorted(active_idx_last_seen)
@@ -1641,6 +1749,9 @@ def collect_windows_live(
             "active_after_read_indexes": active_after_read,
             "dormant_count": len(dormant),
             "dormant_read_indexes": sorted(dormant_now),
+            "dormant_probed_count": len(probe_now),
+            "dormant_resumed_indexes": resumed_now,
+            "dormant_deferred_indexes": deferred_now,
             "p4_snapshot": payload.get("snapshot"),
             "p4_read_start_sec": round(read_start - global_t0, 3),
             "p4_read_sec": round(read_end - read_start, 3),
@@ -1715,8 +1826,11 @@ def collect_windows_live(
         print(f"[INFO] read budget: {skipped_total} bucket reads skipped over {sum(1 for win in windows if win['overload'])} "
               f"overloaded window(s); final cost estimate {cost.as_dict()}")
     if dormant_reads:
+        how = (f"{dormant_probes_total} dormant probes (reg_pkts), {dormant_probe_resumed_total} of them changed and "
+               f"read in full, {dormant_deferred_total} changed and deferred to the active set"
+               if dormant_probe else f"{dormant_reads_total} dormant reads")
         print(f"[INFO] dormant buckets: {expired_total} left the active set and were kept, at most {dormant_max} at a "
-              f"time; {dormant_reads_total} dormant reads over {len(windows)} windows; {dormant_resumed} resumed "
+              f"time; {how} over {len(windows)} windows; {dormant_resumed} resumed "
               f"and counted again with their registers intact; all cleared at the end of the run")
     elif expired_total:
         print(f"[INFO] {expired_total} bucket(s) left the active set without an idle clear; "
@@ -2291,6 +2405,11 @@ def build_arg_parser(profile: Optional[str] = None) -> argparse.ArgumentParser:
                          "allowance left after the active set, so a flow that pauses and resumes keeps its registers "
                          "(the dataset's extractor never ends a flow); every tracked bucket is cleared at the end of "
                          "the run, and --clear-expired is not applied during it (RUNBOOK 19.9.1)")
+    ap.add_argument("--dormant-probe", type=int, default=0, choices=[0, 1],
+                    help="with --dormant-reads and the batched reader: probe reg_pkts of every dormant bucket that "
+                         "fits the allowance each window and read the changed ones in full, instead of a few full "
+                         "reads round robin, so a flow that resumes in its dormant bucket counts in that window "
+                         "(PC1.md part 4b); on in --profile dataset")
     ap.add_argument("--byte-layer", choices=["ipv4", "frame"], default="ipv4",
                     help="'frame' adds 14 B per packet to the byte counts and the packet lengths: the dataset counted "
                          "Ethernet frames, the switch counts IPv4 totalLen (RUNBOOK 19.9.1)")
@@ -2530,6 +2649,7 @@ def main() -> None:
             clear_expired=bool(args.clear_expired),
             clear_budget_frac=args.clear_budget_frac,
             dormant_reads=bool(args.dormant_reads),
+            dormant_probe=bool(args.dormant_probe),
             max_windows=args.windows,
             stop_fn=stop_fn if args.windows else None,
         )

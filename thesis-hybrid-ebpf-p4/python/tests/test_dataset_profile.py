@@ -1,6 +1,8 @@
 """Tests of the dataset profile of hybrid_collector.py (RUNBOOK 19.9): frame bytes, durations in seconds with the
 32-bit wrap resolved, dormant reads instead of clears, a fixed number of windows with the scenario stopped after the
 last read, the dataset's launcher, and the timing log's extra fields. No switch, no BPF, no root."""
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -39,13 +41,13 @@ class FakeClock:
 
 
 class FakeCollector:
-    def __init__(self, reports_by_window, t0, window_sec):
-        self.reports, self.t0, self.window_sec = reports_by_window, t0, window_sec
+    def __init__(self, reports_by_window, t0, window_sec, proto=17):
+        self.reports, self.t0, self.window_sec, self.proto = reports_by_window, t0, window_sec, proto
 
     def take(self, start, end):
         w = round((start - self.t0) / self.window_sec)
         return [{"idx": i, "idx_source": "report", "idx_computed": i, "src_ip": "10.0.0.1", "dst_ip": "10.0.0.2",
-                 "sport": 1000 + i, "dport": 80, "proto": 17} for i in self.reports.get(w, [])]
+                 "sport": 1000 + i, "dport": 80, "proto": self.proto} for i in self.reports.get(w, [])]
 
 
 class NeverEndingProc:
@@ -57,20 +59,40 @@ class Reader:
     """Register reader: pkts_fn(window, idx) gives a bucket's packet count; fixed sync 10 ms and 5 ms per bucket,
     taken from the clock when given. Every clear requested succeeds."""
 
-    SYNC_MS, READ_MS = 10.0, 5.0
+    SYNC_MS, READ_MS, PROBE_MS = 10.0, 5.0, 0.5
 
-    def __init__(self, pkts_fn, clock=None):
-        self.pkts_fn, self.clock, self.calls = pkts_fn, clock, []
+    def __init__(self, pkts_fn, clock=None, read_ms=None, has_dst=True):
+        self.pkts_fn, self.clock, self.calls, self.has_dst = pkts_fn, clock, [], has_dst
+        if read_ms is not None:
+            self.READ_MS = read_ms
 
-    def __call__(self, indexes, w, snapshot="sync", clear_if_unchanged=None, dst_indexes=None, clear_indexes=None):
+    def __call__(self, indexes, w, snapshot="sync", clear_if_unchanged=None, dst_indexes=None, clear_indexes=None,
+                 probe=None, probe_max_full=None):
         self.calls.append({"w": w, "indexes": list(indexes), "clear": dict(clear_if_unchanged or {}),
-                           "clear_indexes": list(clear_indexes or [])})
-        read_ms = self.READ_MS * len(indexes)
+                           "clear_indexes": list(clear_indexes or []), "probe": dict(probe or {}),
+                           "probe_max_full": probe_max_full, "dst": list(dst_indexes or [])})
+        # batched_reader.read_window's probe: the buckets whose count differs are read in full as well, at most
+        # probe_max_full of them; the others are deferred
+        changed = sorted(i for i, last in (probe or {}).items() if self.pkts_fn(w, i) != last and i not in indexes)
+        n = len(changed) if probe_max_full is None else probe_max_full
+        resumed, deferred = changed[:n], changed[n:]
+        read = sorted(set(indexes) | set(resumed))
+        read_ms, probe_ms = self.READ_MS * len(read), self.PROBE_MS * len(probe or {})
         if self.clock is not None:
-            self.clock.advance((self.SYNC_MS + read_ms) / 1000.0)
+            self.clock.advance((self.SYNC_MS + read_ms + probe_ms) / 1000.0)
         cleared = sorted(set(clear_if_unchanged or {}) | set(clear_indexes or []))
-        return {"rows": [mkrow(i, self.pkts_fn(w, i)) for i in indexes], "dst_rows": [], "cleared": cleared,
-                "snapshot": snapshot, "timing": {"sync_ms": self.SYNC_MS, "read_ms": read_ms, "clear_ms": 0.0}}
+        errors, dst_rows = [], []
+        if dst_indexes:
+            if self.has_dst:
+                dst_rows = [{"idx": i, "new_conn": 1, "pipes": [0]} for i in dst_indexes]
+            else:   # the deployed basic_fix: batched_reader's error, no rows, no time
+                errors.append("Register is missing from pipeline: reg_newconn_dst")
+        payload = {"rows": [mkrow(i, self.pkts_fn(w, i)) for i in read], "dst_rows": dst_rows, "cleared": cleared,
+                   "snapshot": snapshot, "errors": errors,
+                   "timing": {"sync_ms": self.SYNC_MS, "read_ms": read_ms, "clear_ms": 0.0, "probe_ms": probe_ms}}
+        if probe:
+            payload["resumed"], payload["deferred"] = resumed, deferred
+        return payload
 
 
 def run_live(reports, reader, n_windows, window_sec=0.5, clock=None, **kw):
@@ -94,13 +116,13 @@ class ProfileTests(unittest.TestCase):
                          (0.5, 40, 3, 0))
         self.assertEqual((args.reader, args.reader_raw_wire, args.reader_sync_batched, args.read_budget_frac),
                          ("batched", True, True, 0.7))
-        self.assertEqual((args.clear_expired, args.dormant_reads), (0, 1))
+        self.assertEqual((args.clear_expired, args.dormant_reads, args.dormant_probe), (0, 1, 1))
         self.assertEqual((args.byte_layer, args.duration_unit, args.launcher), ("frame", "s", "dataset"))
 
     def test_the_new_options_default_to_the_old_behaviour(self):
         plain = hc.build_arg_parser().parse_args(self.BASE)
-        self.assertEqual((plain.dormant_reads, plain.byte_layer, plain.duration_unit, plain.windows, plain.launcher),
-                         (0, "ipv4", "ns", 0, "shell"))
+        self.assertEqual((plain.dormant_reads, plain.dormant_probe, plain.byte_layer, plain.duration_unit, plain.windows,
+                          plain.launcher), (0, 0, "ipv4", "ns", 0, "shell"))
 
 
 class FrameBytesTests(unittest.TestCase):
@@ -255,6 +277,114 @@ class DormantReadTests(unittest.TestCase):
         self.assertTrue(all(w["overload"] is False and w["p4_read_overrun"] is False for w in windows))
         self.assertEqual([w["dormant_read_indexes"] for w in windows[:4]], [[]] * 4)
 
+    def resume_scenario(self, dormant_probe):
+        # PC1.md part 4b. 30 buckets (100-129) report in window 0 and go quiet: dormant from window 4, when 8
+        # new ones (20-27) report and keep changing. Exact costs: 5 ms per read, 2 ms per bucket, probes 0.3 ms
+        # (DST_WEIGHT of a bucket), a 70 ms allowance: 32 bucket reads fit, so round robin reads 24 of the 30
+        # dormant buckets per window; the probes (all 30) fit next to the 8 active and the 8-read reserve.
+        # Bucket 120 resumes in window 5, where round robin does not reach it (it reads 124-129 and 100-117).
+        def pkts(w, idx):
+            if idx >= 100:
+                return 9 if (idx == 120 and w >= 5) else 7
+            return 10 * (w + 1)
+
+        clock = FakeClock()
+        reader = Reader(pkts, clock=clock, read_ms=2.0)
+        cost = hc.ReadCostModel(fixed_ms=5.0, read_ms_per_bucket=2.0, clear_ms_per_bucket=1.0, alpha=0.0)
+        windows, _ = run_live({0: list(range(100, 130)), 4: list(range(20, 28))}, reader, 8, window_sec=0.1,
+                              clock=clock, dormant_reads=True, dormant_probe=dormant_probe, read_budget_frac=0.7,
+                              cost_model=cost)
+        return windows, reader, hc.build_net_summaries(windows, 0.1)
+
+    def test_round_robin_counts_a_resumed_dormant_flow_late(self):
+        windows, reader, s = self.resume_scenario(False)
+        self.assertEqual([len(w["dormant_read_indexes"]) for w in windows[4:7]], [24, 24, 24])
+        self.assertNotIn(120, windows[5]["dormant_read_indexes"])
+        self.assertEqual([s[k]["net_pkts_total_delta"] for k in (5, 6)], [80, 82], "120's 2 packets come a window late")
+        self.assertTrue(all(not c["probe"] for c in reader.calls))
+
+    def test_the_dormant_probe_counts_it_in_its_own_window(self):
+        windows, reader, s = self.resume_scenario(True)
+        self.assertEqual([sorted(c["probe"]) for c in reader.calls[4:6]], [list(range(100, 130))] * 2,
+                         "every dormant bucket is probed every window")
+        self.assertEqual(sorted(reader.calls[6]["probe"]), [i for i in range(100, 130) if i != 120])
+        self.assertEqual([c["probe"][100] for c in reader.calls[4:7]], [7, 7, 7], "with the count last read")
+        self.assertEqual(windows[5]["dormant_resumed_indexes"], [120])
+        self.assertIn(120, windows[5]["active_after_read_indexes"])
+        self.assertNotIn(120, reader.calls[6]["probe"], "active again, so read, not probed")
+        self.assertIn(120, reader.calls[6]["indexes"])
+        self.assertEqual([s[k]["net_pkts_total_delta"] for k in (5, 6)], [82, 80])
+        self.assertEqual([w["dormant_read_indexes"] for w in windows], [[]] * 8, "no round-robin full reads")
+        self.assertEqual([w["dormant_probed_count"] for w in windows[4:7]], [30, 30, 29])
+        self.assertTrue(all(w["overload"] is False and w["p4_read_overrun"] is False for w in windows))
+
+    def test_the_probes_stop_where_the_allowance_ends_round_robin(self):
+        # The allowance (70 ms) less 8 active reads, the 8-read reserve and the fixed part (5 + 16 x 2 = 37 ms)
+        # leaves 33 ms: at 3.25 ms per probe, 10 of the 30 dormant buckets per window, oldest probed first.
+        def pkts(w, idx):
+            return 7 if idx >= 100 else 10 * (w + 1)
+
+        clock = FakeClock()
+        reader = Reader(pkts, clock=clock, read_ms=2.0)
+        cost = hc.ReadCostModel(fixed_ms=5.0, read_ms_per_bucket=2.0, clear_ms_per_bucket=1.0, alpha=0.0,
+                                probe_ms_per_bucket=3.25)
+        self.assertEqual(hc.DORMANT_RESUME_RESERVE, 8)
+        windows, _ = run_live({0: list(range(100, 130)), 4: list(range(20, 28))}, reader, 8, window_sec=0.1,
+                              clock=clock, dormant_reads=True, dormant_probe=True, read_budget_frac=0.7,
+                              cost_model=cost)
+        self.assertEqual([sorted(c["probe"]) for c in reader.calls[4:8]],
+                         [list(range(100, 110)), list(range(110, 120)), list(range(120, 130)), list(range(100, 110))])
+        self.assertTrue(all(w["overload"] is False for w in windows), "probes are never counted as overload")
+
+    def test_changed_dormant_buckets_beyond_the_allowance_are_deferred_not_read(self):
+        # PC1.md part 4c: a fan-out flood changes thousands of occupied dormant buckets at once, and reading them
+        # all in full overran the window. Here all 30 dormant buckets change in window 5; the allowance after the
+        # 8 active reads and the 30 probes (69.999 - 21 - 9 ms: 70% of 100 ms in floating point) fits 19 full
+        # reads at 2 ms.
+        def pkts(w, idx):
+            if idx >= 100:
+                return 9 if w >= 5 else 7
+            return 10 * (w + 1)
+
+        clock = FakeClock()
+        reader = Reader(pkts, clock=clock, read_ms=2.0)
+        cost = hc.ReadCostModel(fixed_ms=5.0, read_ms_per_bucket=2.0, clear_ms_per_bucket=1.0, alpha=0.0)
+        windows, _ = run_live({0: list(range(100, 130)), 4: list(range(20, 28))}, reader, 10, window_sec=0.1,
+                              clock=clock, dormant_reads=True, dormant_probe=True, read_budget_frac=0.7,
+                              cost_model=cost)
+        self.assertEqual(reader.calls[5]["probe_max_full"], 19)
+        resumed, deferred = windows[5]["dormant_resumed_indexes"], windows[5]["dormant_deferred_indexes"]
+        self.assertEqual((len(resumed), len(deferred)), (19, 11))
+        self.assertEqual(sorted(resumed + deferred), list(range(100, 130)))
+        self.assertTrue(set(deferred) <= set(windows[5]["active_after_read_indexes"]), "deferred: active again")
+        self.assertEqual(windows[6]["dormant_count"], 0)
+        # read later with the active set (38 active, 32 fit: windows 6-8 are overloaded), or, for those the
+        # budget's ranking left out until they expired, probed again and read in full in window 9
+        later = set().union(*(set(c["indexes"]) for c in reader.calls[6:10]),
+                            *(set(w["dormant_resumed_indexes"]) for w in windows[6:10]))
+        self.assertTrue(set(deferred) <= later)
+        self.assertEqual([w["overload"] for w in windows[5:10]], [False, True, True, True, False])
+        self.assertTrue(all(w["p4_read_overrun"] is False for w in windows), "no read past the next boundary")
+        s = hc.build_net_summaries(windows, 0.1)
+        self.assertEqual(sum(x["net_pkts_total_delta"] for x in s), 30 * 9 + 8 * 100, "every packet counted once")
+        self.assertTrue(all(c["probe_max_full"] is None or c["probe_max_full"] >= 0 for c in reader.calls))
+
+    def test_the_cost_model_learns_the_probe_cost_apart(self):
+        cost = hc.ReadCostModel(fixed_ms=5.0, read_ms_per_bucket=2.0, alpha=1.0, min_rate_units=20)
+        self.assertAlmostEqual(cost.probe_ms_per_bucket, hc.ReadCostModel.DST_WEIGHT * 2.0)
+        self.assertAlmostEqual(cost.predict_ms(10, n_probe=100), 5.0 + 20.0 + 30.0)
+        timing = hc.payload_timing_ms({"timing": {"sync_ms": 4.0, "read_ms": 20.0, "clear_ms": 0.0,
+                                                  "probe_ms": 8.0}}, wall_ms=33.0)
+        self.assertEqual((timing["probe_ms"], timing["overhead_ms"]), (8.0, 1.0), "the probe is not overhead")
+        cost.update(10, 0, timing, n_probe=100)
+        self.assertAlmostEqual(cost.probe_ms_per_bucket, 0.08)
+        self.assertAlmostEqual(cost.read_ms_per_bucket, 2.0)
+        self.assertAlmostEqual(cost.fixed_ms, 5.0)
+        cost.update(10, 0, dict(timing, probe_ms=1.0), n_probe=5)
+        self.assertAlmostEqual(cost.probe_ms_per_bucket, 0.08, msg="too few probes to learn from")
+        self.assertEqual(cost.probes_within(1.0), 12)
+        self.assertEqual(cost.probes_within(0.0), 0)
+
     def test_the_timing_log_gets_the_dormant_fields(self):
         records = []
         reader = Reader(lambda w, idx: 7)
@@ -276,6 +406,38 @@ class DormantReadTests(unittest.TestCase):
             hc.make_timing_logger("batched", path)(3, payload, 0.0, 0.01, 2, 0, extra={"dormant": 5})
             record = json.loads(Path(path).read_text().splitlines()[0])
             self.assertEqual((record["window"], record["dormant"]), (3, 5))
+
+
+class MissingDestinationRegisterTests(unittest.TestCase):
+    """PC1.md part 4c: the deployed basic_fix has no reg_newconn_dst. Its reads return an error and no rows in no
+    time, yet each counted DST_WEIGHT of a bucket in the cost model: in windows with destination buckets but few
+    flow buckets the per-bucket estimate fell from 0.56 to 0.19 ms, and a later read of 955 buckets took 605 ms."""
+
+    def run_tcp(self, has_dst):
+        clock = FakeClock()
+        reader = Reader(lambda w, idx: 10 * (w + 1), clock=clock, has_dst=has_dst)
+        cost = hc.ReadCostModel(fixed_ms=5.0, read_ms_per_bucket=5.0, clear_ms_per_bucket=1.0, alpha=1.0)
+        t0 = clock.time()
+        windows = hc.collect_windows_live(FakeCollector({0: [1, 2], 2: [3]}, t0, 0.5, proto=6), NeverEndingProc(),
+                                          0.5, 0.0, t0, "reader.py", active_ttl_windows=3, clear_idle_windows=0,
+                                          read_fn=reader, clock=clock, max_windows=6, read_budget_frac=0.7,
+                                          cost_model=cost)
+        return windows, reader, cost
+
+    def test_after_the_first_error_no_destination_bucket_is_requested_or_counted(self):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            windows, reader, cost = self.run_tcp(has_dst=False)
+        self.assertTrue(reader.calls[0]["dst"], "window 0 asks for its destination buckets")
+        self.assertEqual([c["dst"] for c in reader.calls[1:6]], [[]] * 5)
+        self.assertIn("no reg_newconn_dst", out.getvalue())
+        self.assertTrue(all(w["overload"] is False for w in windows), "an absent register is not an overload")
+        self.assertTrue(all(w["report_aggregates"]["net_dst_buckets_skipped"] == 0 for w in windows))
+        self.assertEqual(cost.read_ms_per_bucket, 5.0, "learned from the flow buckets read, not from absent rows")
+
+    def test_a_program_with_the_register_keeps_reading_it(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            windows, reader, cost = self.run_tcp(has_dst=True)
+        self.assertTrue(all(c["dst"] for c in reader.calls[:4]))
 
 
 class LauncherTests(unittest.TestCase):

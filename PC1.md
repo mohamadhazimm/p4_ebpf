@@ -864,3 +864,57 @@ buckets per 0.5 s window at budget 0.7.
 Files: `live_test/committee_replay/pc1_20261115_fix.tar.xz`: `replay_rows_v2.csv`, the six reruns (summary,
 timing, windows, collector log) and their rows, every run's `summary_fixed.json`, and the scripts. State after:
 `enp5s0` down, our switchd untouched.
+
+## Results, part 4c (PC1, 2026-11-15): dormant buckets probed; the flood read budget kept
+
+**The limitation (part 4b).** A flow that resumes in its dormant bucket (a reused 5-tuple, or a new flow hashed into
+an occupied bucket) sends no CPU report. The collector read only ~220-250 of 700-1,700 dormant buckets per window,
+round robin, so such packets counted windows late.
+
+**The fix** (`batched_reader.py` `read_window(probe=..., probe_max_full=...)`, `hybrid_collector.py
+--dormant-probe`, on in `--profile dataset`; the P4 program is unchanged):
+- each window the collector sends the dormant buckets with the packet count it last read; the reader reads only
+  `reg_pkts` for them, from the window's snapshot (one register entity per bucket: **0.047 ms per bucket** on the
+  Wedge, fitted over bulk2000 and bulk1600, against ~0.55 ms for a full read), and reads in full, in the same
+  window, those whose count changed;
+- it reads in full at most `probe_max_full` of them (what the allowance leaves after the active reads and the
+  probes); the other changed ones are active again and read with the active set from the next window, under its
+  budget (`deferred`). The cost model learns the probe cost on its own and keeps 8 full reads in reserve;
+- **a second, older bug:** `basic_fix` has no `reg_newconn_dst`, yet every window requested its buckets; the reads
+  returned an error and no rows in no time, and each counted 0.15 of a bucket in the cost model, whose per-bucket
+  estimate fell from 0.56 to 0.19 ms in windows with destination buckets and few flow buckets. Part 4's
+  syn_fan_100k then read 3,933 buckets in one window (2.1 s). Now, after the first "missing" error, no destination
+  bucket is requested (nor counted as skipped), and the model learns only from rows read.
+- Tests: 12 new (165 run on PC1; the one error is the release's Python 3.9 operator). One replays the round-robin
+  case (a resumed flow counted a window late) against the probe (counted in its window); one checks that every
+  packet is counted once when changed buckets are deferred.
+
+**Rerun on the Wedge** (`basic_fix`): the 47 captures with resumed dormant buckets in part 4 and Chaos (48; part 4's
+run of each against its rerun; `probe_compare.csv`):
+
+| | part 4 | probe |
+|---|---|---|
+| 37 runs without overload: windows inside the self-check bounds | 1,424 / 1,443 | **1,443 / 1,443** |
+| the same: packet and frame-byte totals exact | 35 of 37 | **37 of 37** |
+| bulk2000, bulk1600: windows inside the bounds | 29-34 / 40 | **40 / 40** |
+| bulk2000: dormant buckets covered per window | ~230 of up to 1,743 | **all** (probed) |
+| bulk2000: read time median / max | 335 / 388 ms | **212 / 302 ms** |
+| longest read over the 48 runs | 2,120 ms | 524 ms |
+
+**Floods: the read budget is the ceiling.** A first version without `probe_max_full` read every changed dormant bucket
+in full: syn_sink_40k then counted 124,666 of 124,666 packets, but reads took up to 4.0 s and 17-34 windows of the
+fan-out floods overran. With the cap and the cost-model fix the reads stay within the window (overrun windows
+syn_fan_100k 14 -> 7, syn_fan_150k 9 -> 3, syn_fan_40k 4 -> 2) and the floods count fewer packets than in part 4
+(syn_fan_100k 16,430 -> 8,079 of 99,640, syn_sink_40k 44,200 -> 34,009 of 124,666, GoldenEye p10 29,330 -> 24,536 of
+37,617), because part 4's counts came partly from reads that ran into the next windows. The total read time per
+run is the same (11-14 s of 20 s) and full bucket reads within the budget total 13,000-16,000 per run, so no read
+schedule counts a 40,000-150,000-packet flood: that is what part 4d's global totals are for. Overloaded windows are
+more frequent (GoldenEye p10 6 -> 30) because a changed dormant bucket that does not fit is now an active bucket
+left unread, which part 4 did not know about.
+
+**Files:** `live_test/committee_replay/pc1_20261115_probe.tar.xz`: `replay_rows_v3.csv` (`replay_rows_v2.csv` with the
+48 reruns' rows, the latest run of each capture), `probe_compare.csv`, and each rerun's `summary.json`,
+`timing.jsonl`, `windows.csv` and `collector.log`. The first 45 reruns (`runs_probe`, `runs_probe_trial`) used the
+uncapped probe and still the old destination requests; the 14 of `runs_probe2` (Chaos, the 10 overloaded runs,
+bulk2000, session_1000, the first cohort capture) the final code; for those 14 captures the rows are
+`runs_probe2`'s.

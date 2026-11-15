@@ -38,7 +38,10 @@ so the payload has the same keys, the same values and the same row order:
      "t_switch", "errors", "dst_rows", "cleared", "timing", "rows"}
 
 "timing" is new (per-window instrumentation: milliseconds per phase and RPC
-counts); hybrid_collector.py prints it with --reader-timing.
+counts); hybrid_collector.py prints it with --reader-timing. With a probe
+(read_window's probe, the collector's dormant buckets) the payload also has
+"resumed", before "rows": the probed buckets whose reg_pkts changed and that
+were therefore read in full.
 
 Three routes between the key lists and the per-pipe values:
 
@@ -803,15 +806,26 @@ class BatchedRegisterReader(object):
     # ---------------------------------------------------------------- window
 
     def read_window(self, indexes, dst_indexes=None, clear_if_unchanged=None, snapshot="sync",
-                    source="batched gRPC", clear_indexes=None):
+                    source="batched gRPC", clear_indexes=None, probe=None, probe_max_full=None):
         """snapshot: "sync" (register sync, then shadow reads), "hw" (hardware
         reads, no sync) or "shadow" (shadow reads without a sync; benchmarks).
         clear_indexes: buckets cleared unconditionally after the read (they need
-        not be read; one Write RPC with the clear_if_unchanged clears)."""
+        not be read; one Write RPC with the clear_if_unchanged clears).
+        probe: {bucket: packet count the caller last saw} (the collector's dormant
+        buckets): only reg_pkts of these buckets is read, from the same snapshot,
+        and every bucket whose count differs (or is missing) is read in full with
+        the indexes, so a dormant flow that resumed is seen in this window. One
+        register entity per bucket instead of fourteen; the payload names the
+        buckets read that way in "resumed", the timing has probe_ms and probed.
+        probe_max_full: at most that many changed buckets are read in full (the
+        caller's read allowance); the others are named in "deferred" (changed,
+        not read: under a fan-out flood new flows land in occupied dormant
+        buckets by the thousand, and reading them all overran the window)."""
         indexes = [int(i) for i in indexes]
         dst_indexes = [int(i) for i in (dst_indexes or [])]
         clear_if_unchanged = clear_if_unchanged or {}
         clear_indexes = [int(i) for i in (clear_indexes or [])]
+        probe = dict((int(k), int(v)) for k, v in (probe or {}).items())
         timing = OrderedDict([("active", len(indexes)), ("dst", len(dst_indexes)),
                               ("sync_ms", 0.0), ("sync_rpcs", 0), ("read_ms", 0.0), ("read_rpcs", 0),
                               ("read_entities", 0), ("clear_ms", 0.0), ("clear_rpcs", 0),
@@ -822,7 +836,7 @@ class BatchedRegisterReader(object):
         sync_tables = list(self.flow_tables)
         if dst_indexes and self.dst_table is not None:
             sync_tables.append(self.dst_table)
-        if snapshot == "sync" and not indexes and not dst_indexes:
+        if snapshot == "sync" and not indexes and not dst_indexes and not probe:
             sync_s = 0.0          # nothing to read: a clear needs no snapshot
         elif snapshot == "sync":
             try:
@@ -839,6 +853,36 @@ class BatchedRegisterReader(object):
             if not ok:
                 snapshot = "hw"
         from_hw = snapshot == "hw"
+
+        resumed, deferred = [], []
+        if probe:
+            t_probe = time.time()
+            probe_idxs = sorted(probe)
+            pkts_table = self.tables.get("reg_pkts")
+            try:
+                values = self._read_table(pkts_table, probe_idxs, from_hw, timing) if pkts_table is not None else {}
+            except Exception as error:
+                # Nothing is known about these buckets this window; they stay dormant for the caller.
+                errors.append("probe reg_pkts: %s" % error)
+                values = None
+            if values is not None:
+                wanted = set(indexes)
+                changed = []
+                for idx in probe_idxs:
+                    v = values.get(idx)
+                    # combine() sums reg_pkts over the pipes that hold the flow; the others hold 0
+                    if (v is None or sum(v) != probe[idx]) and idx not in wanted:
+                        changed.append(idx)
+                if probe_max_full is not None and len(changed) > max(0, int(probe_max_full)):
+                    n = max(0, int(probe_max_full))
+                    resumed, deferred = changed[:n], changed[n:]
+                else:
+                    resumed = changed
+                indexes = sorted(wanted | set(resumed))
+            timing["probe_ms"] = round((time.time() - t_probe) * 1000.0, 3)
+            timing["probed"] = len(probe_idxs)
+            timing["probe_resumed"] = len(resumed)
+            timing["probe_deferred"] = len(deferred)
 
         t_read = time.time()
         per_idx = dict((idx, {}) for idx in indexes)
@@ -909,7 +953,7 @@ class BatchedRegisterReader(object):
         timing["cleared"] = len(cleared)
         self.windows += 1
 
-        return OrderedDict([
+        payload = OrderedDict([
             ("source", source),
             ("flow_count", len(rows)),
             ("snapshot", snapshot),
@@ -921,8 +965,12 @@ class BatchedRegisterReader(object):
             ("dst_rows", dst_rows),
             ("cleared", cleared),
             ("timing", timing),
-            ("rows", rows),
         ])
+        if probe:
+            payload["resumed"] = resumed   # only with a probe: the legacy payload has no such key
+            payload["deferred"] = deferred
+        payload["rows"] = rows             # last: hybrid_collector's fallback parser needs this
+        return payload
 
     def close(self):
         try:
@@ -1013,7 +1061,9 @@ def serve(args):
         try:
             payload = reader.read_window(req.get("indexes") or [], req.get("dst_indexes") or [],
                                          req.get("clear_if_unchanged") or {}, req.get("snapshot", "sync"),
-                                         req.get("source", "batched gRPC"), req.get("clear_indexes") or [])
+                                         req.get("source", "batched gRPC"), req.get("clear_indexes") or [],
+                                         probe=req.get("probe") or None,
+                                         probe_max_full=req.get("probe_max_full"))
             # When the request arrived and the reply left, on this host's clock: with the collector's
             # send and receive times they give the clock offset between the two hosts (RUNBOOK 19.6).
             payload.setdefault("timing", {})["reader_t_recv"] = t_recv
