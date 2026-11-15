@@ -52,6 +52,8 @@ SRC_MAC = b"\x02\x00\x00\x00\x07\x01"
 PKTS_PER_TRIGGER = 65536
 TIMER_NS = 1000
 MASK32 = (1 << 32) - 1
+# the one-entry global totals of the test build perf/variants/gtot (--global-totals)
+GLOBAL_TOTALS = ["reg_g_pkts", "reg_g_bytes", "reg_g_pkts_ab", "reg_g_bytes_ab", "reg_g_syn", "reg_g_ack", "reg_g_rst"]
 
 
 def checksum(raw):
@@ -88,6 +90,10 @@ def main():
     ap.add_argument("--apps", type=int, default=1)
     ap.add_argument("--client-id", type=int, default=9)
     ap.add_argument("--cleanup", action="store_true")
+    ap.add_argument("--global-totals", action="store_true",
+                    help="also count the seven one-entry totals of the test build perf/variants/gtot (reg_g_*, "
+                         "cell 0, every pipe): pipe PIPE must grow by the generated packets, pipe 0 by the "
+                         "looped-back ones, the byte totals as the flow's reg_bytes (mod 2^32)")
     a = ap.parse_args()
     apps = [(2 * i, 68 + i, 128 * a.pipe + 68 + i) for i in range(a.apps)]   # (app_id, local port, dev_port)
     out = {"prog": a.prog, "size": a.size, "pipe": a.pipe, "apps": apps, "sink_port": a.sink_port,
@@ -233,6 +239,11 @@ def main():
                 tbl = info.table_get("pipe.Ingress." + name)
                 d = get_dict(tbl, t_all, tbl.make_key([gc.KeyTuple("$REGISTER_INDEX", a.flow_index)]))
                 s[name] = [int(x) for x in d.get("Ingress.%s.f1" % name, [])]
+        if a.global_totals:
+            for name in GLOBAL_TOTALS:
+                tbl = info.table_get("pipe.Ingress." + name)
+                d = get_dict(tbl, t_all, tbl.make_key([gc.KeyTuple("$REGISTER_INDEX", 0)]))
+                s[name] = [int(x) for x in d.get("Ingress.%s.f1" % name, [])]
         return s
 
     before = snapshot()
@@ -269,6 +280,9 @@ def main():
     if a.flow_index >= 0:
         out["reg_pkts_delta"] = [(x - y) & MASK32 for x, y in zip(after["reg_pkts"], before["reg_pkts"])]
         out["reg_bytes_delta"] = [(x - y) & MASK32 for x, y in zip(after["reg_bytes"], before["reg_bytes"])]
+    if a.global_totals:
+        out["global_delta"] = dict((name[len("reg_g_"):], [(x - y) & MASK32 for x, y in zip(after[name], before[name])])
+                                   for name in GLOBAL_TOTALS)
     print("HZJSON " + json.dumps(out, sort_keys=True))
     json.dump(out, open(a.out, "w"), indent=2, sort_keys=True)
 

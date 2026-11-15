@@ -607,7 +607,29 @@ bytes, A→B packets and bytes, SYN, ACK, RST. PC1.md part 4d has the collector 
   - **The global totals cost 4 ns** (median 319 vs 315 ns; 3.3 ns in the mean), the compiler's 4 cycles. The
     detector's cost over the baseline goes from 69 to 73 ns.
   - The baseline and `basic_fix` reproduce Section 5.5's values to the nanosecond.
-- **Not measured:** the line rate (Section 3.2) of `gtot`. The switch runs `basic_fix` again.
+- **Line rate** (Section 3.2's matrix as Section 5.5 ran it: 27 runs, 10 s measured each;
+  `sw_pktgen_run.py --global-totals` also reads the seven totals before and after each run;
+  `perf/results/linerate_gtot_20261115/`):
+
+  | Frame (B) | Paced, gtot (3 runs) | Paced, basic_fix (Section 5.5) | Saturating: offered / sent, gtot |
+  |---|---|---|---|
+  | 64 | 91.09% / 91.09% / 91.09% (generator maximum) | 91.09% | – |
+  | 128 | 99.88% / 99.88% / 99.88% | 99.88% | 111% / 100.00% |
+  | 256 | 99.89% / 99.89% / 99.89% | 99.89% | 128% / 100.00% |
+  | 512 | 99.87% / 99.87% / 99.87% | 99.87% | 140% / 100.00% |
+  | 1024 | 99.89% / 99.89% / 99.89% | 99.89% | 148% / 100.00% |
+  | 1280 | 99.88% / 99.88% / 99.88% | 99.88% | 149% / 100.00% |
+  | 1518 | 99.88% / 99.88% / 99.88% | 99.88% | 150% / 100.00% |
+
+  - **Same rates as `basic_fix`**, within 0.01 points, and lossless: in every paced run and at 64 B, generated
+    = transmitted = received and the TM dropped nothing; in the saturating runs it dropped exactly the excess.
+  - **The totals count exactly at line rate.** In all 27 runs (13.1 billion packets) the pipe-1 totals grew by
+    exactly the generated packets, the pipe-0 totals by exactly the looped-back ones, the byte totals as the
+    flow's `reg_bytes` (mod 2³²), `pkts_ab` and `bytes_ab` as `pkts` and `bytes` (one flow, one direction) and
+    SYN/ACK/RST not at all (UDP). The flow's `reg_pkts` in pipe 1 equalled the generated count as well.
+  - **Wrap:** at 99.9 Gbps a 32-bit byte total wraps every 0.34 s; the collector's 0.5 s windows would see an
+    ambiguous difference above ~69 Gbps per pipe (Section 5.6 is a test build for the dataset's traffic).
+- The switch runs `basic_fix` again (checked with a replay, 9 of 9 packets).
 
 ## 6. Switch CPU side
 

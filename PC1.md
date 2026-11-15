@@ -942,7 +942,8 @@ plus seven one-entry registers (`reg_g_pkts`, `reg_g_bytes`, `reg_g_pkts_ab`, `r
 
 The compiler moved some flow registers one stage later; what they count is unchanged. **Latency, measured the same
 day with p4_perf section 4.1's method (p4_perf section 5.6): median 319 ns against basic_fix's 315 ns and the
-baseline's 246 ns, so the totals cost 4 ns.**
+baseline's 246 ns, so the totals cost 4 ns. Line rate (p4_perf section 3.2's matrix, 27 runs): the same rates as
+basic_fix within 0.01 points, lossless, and the totals exact for all 13.1 billion packets.**
 
 **The software:** `batched_reader.read_window(totals=True)` syncs the seven registers with the flow registers (one
 snapshot) and reads them through the client's own parser; `reset_registers.py` clears them at the start of a run
