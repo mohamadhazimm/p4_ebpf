@@ -26,8 +26,11 @@ from bfshell_run import DEFAULT_REMOTE_SDE_INSTALL, BfshellError, default_bfshel
 
 REGISTERS = ["reg_pkts", "reg_bytes", "reg_pkts_ab", "reg_bytes_ab", "reg_ref_src_port",
              "reg_ref_dst_port", "reg_dir_valid", "reg_min_len", "reg_max_len", "reg_first_ts",
-             "reg_last_ts", "reg_syn", "reg_ack", "reg_rst", "reg_newconn_dst"]
-# Cells read back after each clear (both registers have 65,536 buckets).
+             "reg_last_ts", "reg_syn", "reg_ack", "reg_rst", "reg_newconn_dst",
+             # the one-entry global totals of the test build perf/variants/gtot (skipped where absent)
+             "reg_g_pkts", "reg_g_bytes", "reg_g_pkts_ab", "reg_g_bytes_ab", "reg_g_syn", "reg_g_ack", "reg_g_rst"]
+# Cells read back after each clear (the flow and destination registers have 65,536 buckets; the one-entry
+# reg_g_* only cell 0).
 CHECK_INDEXES = [0, 1, 32767, 65535]
 
 # Runs inside bfrt_python: SDE 9.6 embeds Python 3.4 (no f-strings) and runs a
@@ -65,7 +68,8 @@ def _reset_registers_main():
         t = time.time()
         reg.clear()
         bfrt.complete_operations()
-        left = [idx for idx in check if any(cell(reg, idx))]
+        idxs = [0] if name.startswith("reg_g_") else check
+        left = [idx for idx in idxs if any(cell(reg, idx))]
         if left:
             print("[RESET-FAIL] %s is not zero at %s after clear()" % (name, left))
             return

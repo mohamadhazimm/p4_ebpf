@@ -408,6 +408,86 @@ class DormantReadTests(unittest.TestCase):
             self.assertEqual((record["window"], record["dormant"]), (3, 5))
 
 
+def totals(pkts, nbytes, pkts_ab=None, bytes_ab=None, syn=0, ack=0, rst=0):
+    return {"pkts": pkts, "bytes": nbytes, "pkts_ab": pkts if pkts_ab is None else pkts_ab,
+            "bytes_ab": nbytes if bytes_ab is None else bytes_ab, "syn": syn, "ack": ack, "rst": rst}
+
+
+class GlobalTotalsSummaryTests(unittest.TestCase):
+    """NetSummarizer(global_totals=True), PC1.md part 4d: the window totals from the gtot build's one-entry totals."""
+
+    def test_in_a_window_the_buckets_cover_the_totals_change_nothing(self):
+        w0 = {"rows": [mkrow(1, 10, nbytes=1000, pkts_ab=6, bytes_ab=600)], "totals": totals(10, 1000, 6, 600)}
+        w1 = {"rows": [mkrow(1, 15, nbytes=1500, pkts_ab=9, bytes_ab=900)], "totals": totals(15, 1500, 9, 900)}
+        for layer in ("ipv4", "frame"):
+            plain = hc.build_net_summaries([w0, w1], 0.5, byte_layer=layer)
+            gtot = hc.build_net_summaries([w0, w1], 0.5, byte_layer=layer, global_totals=True)
+            for a, b in zip(plain, gtot):
+                self.assertEqual(a, {k: v for k, v in b.items() if not k.startswith("net_gtot_")}, layer)
+            self.assertEqual([s["net_gtot_used"] for s in gtot], [1, 1])
+            self.assertEqual([s["net_gtot_bucket_pkts_delta"] for s in gtot], [10, 5])
+
+    def test_an_overloaded_window_takes_its_totals_from_the_registers(self):
+        # one bucket read of a flood that put 1,000 packets (60 B, 400 SYN) through the switch in the window
+        w0 = {"rows": [mkrow(1, 2, nbytes=120)], "totals": totals(1000, 60000, 1000, 60000, syn=400)}
+        s = hc.build_net_summaries([w0], 0.5, byte_layer="frame", global_totals=True)[0]
+        self.assertEqual((s["net_pkts_total_delta"], s["net_bytes_total_delta"], s["net_syn_delta"]),
+                         (1000, 60000 + 14 * 1000, 400))
+        self.assertEqual((s["net_pkts_ba_delta"], s["net_bytes_ba_delta"]), (0, 0))
+        self.assertAlmostEqual(s["net_pkts_per_sec_delta"], 2000.0)
+        self.assertAlmostEqual(s["net_avg_pkt_size_delta"], 74.0)
+        self.assertEqual((s["net_gtot_bucket_pkts_delta"], s["net_gtot_bucket_bytes_delta"]), (2, 120 + 28))
+        self.assertEqual(s["net_flow_count_seen"], 1, "per-flow features still come from the buckets read")
+
+    def test_differences_wrap_at_32_bits_and_a_lost_window_only_resets_the_baseline(self):
+        wrap = (1 << 32) - 5
+        ws = [{"rows": [mkrow(1, 1)], "totals": totals(wrap, wrap)},
+              {"rows": [mkrow(1, 2)], "totals": totals(5, 5)},              # wrapped: +10 each
+              {"rows": [mkrow(1, 3)], "totals": None},                       # read failed
+              {"rows": [mkrow(1, 4)], "totals": totals(100, 100)},          # only the baseline
+              {"rows": [mkrow(1, 5)], "totals": totals(130, 160)}]
+        s = hc.build_net_summaries(ws, 0.5, global_totals=True)
+        self.assertEqual([x["net_gtot_used"] for x in s], [1, 1, 0, 0, 1])
+        self.assertEqual([x["net_pkts_total_delta"] for x in s], [wrap, 10, 1, 1, 30],
+                         "windows without usable totals keep the bucket sums")
+        self.assertEqual(s[4]["net_bytes_total_delta"], 60)
+
+    def test_every_row_has_the_same_columns_and_the_socket_join_ignores_the_totals(self):
+        ws = [{"rows": [], "totals": totals(0, 0)}, {"rows": [mkrow(1, 3)], "totals": totals(3, 300)},
+              {"rows": [mkrow(1, 3)], "totals": totals(9, 900), "owned_indexes": [1]}]
+        s = hc.build_net_summaries(ws, 0.5, global_totals=True)
+        self.assertEqual(len({tuple(x) for x in s}), 1, "one CSV layout")
+        self.assertEqual(s[2]["net_pkts_total_delta"], 0, "an execution's own flows: the totals are the switch's")
+        self.assertEqual(s[2]["net_gtot_used"], 0)
+        self.assertNotIn("net_gtot_used", hc.build_net_summaries(ws, 0.5)[1])
+
+    def test_the_collector_asks_for_the_totals_and_keeps_them(self):
+        clock = FakeClock()
+        calls = []
+
+        def reader(indexes, w, **kw):
+            calls.append(kw)
+            return {"rows": [mkrow(i, 10 * (w + 1)) for i in indexes], "dst_rows": [], "cleared": [], "errors": [],
+                    "timing": {"sync_ms": 1.0, "read_ms": 1.0, "clear_ms": 0.0}, "totals": totals(10 * (w + 1), 0)}
+
+        t0 = clock.time()
+        windows = hc.collect_windows_live(FakeCollector({0: [1]}, t0, 0.5), NeverEndingProc(), 0.5, 0.0, t0, "r.py",
+                                          active_ttl_windows=3, clear_idle_windows=0, read_fn=reader, clock=clock,
+                                          max_windows=3, global_totals=True)
+        self.assertTrue(all(c.get("totals") is True for c in calls[:3]))
+        self.assertEqual([w["totals"]["pkts"] for w in windows], [10, 20, 30])
+        with contextlib.redirect_stdout(io.StringIO()):
+            plain = hc.collect_windows_live(FakeCollector({0: [1]}, t0, 0.5), NeverEndingProc(), 0.5, 0.0,
+                                            clock.time(), "r.py", active_ttl_windows=3, clear_idle_windows=0,
+                                            read_fn=reader, clock=clock, max_windows=2)
+        self.assertIsNone(plain[0]["totals"])
+
+    def test_the_option(self):
+        args = hc.build_arg_parser("dataset").parse_args(ProfileTests.BASE + ["--profile", "dataset", "--global-totals", "1"])
+        self.assertEqual(args.global_totals, 1)
+        self.assertEqual(hc.build_arg_parser().parse_args(ProfileTests.BASE).global_totals, 0)
+
+
 class MissingDestinationRegisterTests(unittest.TestCase):
     """PC1.md part 4c: the deployed basic_fix has no reg_newconn_dst. Its reads return an error and no rows in no
     time, yet each counted DST_WEIGHT of a bucket in the cost model: in windows with destination buckets but few

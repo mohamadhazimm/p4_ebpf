@@ -918,3 +918,83 @@ left unread, which part 4 did not know about.
 uncapped probe and still the old destination requests; the 14 of `runs_probe2` (Chaos, the 10 overloaded runs,
 bulk2000, session_1000, the first cohort capture) the final code; for those 14 captures the rows are
 `runs_probe2`'s.
+
+## Results, part 4d (PC1, 2026-11-15): global totals in the data plane, a test build
+
+**Why.** Under a flood the control plane reads ~500 buckets per 0.5 s window (part 4c: 13,000-16,000 full reads per
+run) while the flood keeps ~30,000 active, so the window totals, summed over the buckets read, showed 6-35% of the
+packets. 19 of the 29 per-window features (95 of the 145 columns: packets, bytes and their A->B / B->A parts, the
+three average sizes, packets and bytes per second, the five ratios, SYN, ACK, RST) are sums over all of the window's
+packets in `switch_model.py`, so seven whole-switch counters give them exactly.
+
+**The build** (`perf/variants/gtot/`): the sources of the deployed `basic_fix` (hashes as in its `compile_meta.txt`)
+plus seven one-entry registers (`reg_g_pkts`, `reg_g_bytes`, `reg_g_pkts_ab`, `reg_g_bytes_ab`, `reg_g_syn`,
+`reg_g_ack`, `reg_g_rst`) updated in the same branch as the flow registers with the same values (`pkt_len`,
+`dir_ab`, the TCP flags); `-DP4_ENABLE_GLOBAL_TOTALS=0` compiles `basic_fix` itself. bf-p4c 9.6.0 on the switch,
+21.9 s (`perf/results/gtot_build_20261115/resources.md`):
+
+| | basic_fix | gtot |
+|---|---|---|
+| ingress stages | 5 | 6 |
+| stateful ALUs | 14 / 48 | 21 / 48 |
+| SRAM / map RAM | 20.5% / 34.0% | 22.0% / 36.5% (2 + 2 per one-entry register) |
+| ingress MAU latency (compiler estimate) | 131 cycles | 135 cycles |
+
+The compiler moved some flow registers one stage later; what they count is unchanged. The latency was not measured
+on the switch (it would be, as in p4_perf section 5.5, if the build were adopted).
+
+**The software:** `batched_reader.read_window(totals=True)` syncs the seven registers with the flow registers (one
+snapshot) and reads them through the client's own parser; `reset_registers.py` clears them at the start of a run
+(checked at cell 0); `hybrid_collector.py --global-totals 1` takes the window's packet, byte and flag totals from
+their differences (modulo 2^32) and adds `net_gtot_used`, `net_gtot_bucket_pkts_delta`, `net_gtot_bucket_bytes_delta`
+to every row; the per-flow features still come from the buckets read; the socket-level join ignores the totals.
+Tests: 11 new, 176 run.
+
+**On the switch.** Our `basic_fix` switchd stopped, `gtot` started in `hz_sw`; `run_switchd.sh` did not add the
+ports, so `run_bfrt.sh ... setup --ports 132,140 --fwd 132:140,140:132 --mirror-sid 1` did (a first bulk2000 run
+before it went out on a link without carrier and is discarded). The 10 overloaded captures, Chaos and three calm ones
+with `--global-totals 1` (`runs_gtot/`), against the same captures on `basic_fix` with the same code
+(`runs_probe2/`; `gtot_compare.csv`):
+
+| capture | sent | seen, gtot | seen, basic_fix | 95 total columns equal to the published row | median relative error |
+|---|---|---|---|---|---|
+| Chaos `d538053a` | 221,733 | **99.9%** | 12.6% | 19 / 19 | **0.018** / 0.079 |
+| goldeneye_p10 | 37,617 | **100%** | 65.2% | 35 / 0 | **0.001** / 0.355 |
+| goldeneye_r10 | 37,388 | **100%** | 73.1% | 35 / 0 | **0.001** / 0.260 |
+| slowloris_1000 | 22,032 | **100%** | 93.3% | 44 / 0 | **0.001** / 0.100 |
+| slowloris_500 | 11,087 | 100% | 100% | 37 / 17 | 0.000 / 0.006 |
+| slowloris_800 | 17,612 | 100% | 100% | 43 / 18 | 0.000 / 0.188 |
+| syn_sink_40k | 124,666 | **99.1%** | 27.3% | 20 / 1 | **0.005** / 0.897 |
+| syn_fan_40k | 39,847 | **98.0%** | 14.2% | 16 / 4 | **0.408** / 1.000 |
+| syn_fan_100k | 99,640 | **98.7%** | 8.1% | 10 / 4 | **0.400** / 1.000 |
+| syn_fan_150k | 149,425 | **99.1%** | 6.4% | 10 / 1 | **0.077** / 1.000 |
+| udp_fan_60k | 59,776 | **97.6%** | 10.9% | 19 / 49 | 0.333 / 0.000 |
+| bulk2000 | 24,000 | 99.8% | 100% | 24 / 41 | 0.000 / 0.000 |
+| session_1000 | 12,000 | 99.9% | 100% | 6 / 49 | 0.011 / 0.000 |
+| first cohort capture | 9 | 88.9% | 100% | 51 / 95 | 0.000 / 0.000 |
+
+("seen": the 40 dataset windows; gtot / basic_fix in the last two columns.) Overloaded windows, overruns and read
+times are about the same in both builds, since they depend on the buckets read, not on the totals (the fan-out
+floods: 28-33 overloaded windows and 1-8 overruns in both; the longest read 391-521 ms against 417-524 ms).
+
+- **Every packet is counted.** Over the run's 44 windows the totals equal the packets sent in all 14 runs. The 0.1-2.4%
+  missing from the 40 dataset windows are packets of the first milliseconds of dataset window 0 that window 3's
+  snapshot already holds: each snapshot starts 1.4-10 ms after its window boundary in the calm runs and 30-36 ms in
+  the floods (the collector takes thousands of reports first), and packets in that gap count in the earlier window.
+- **Calm runs:** the totals are as good (median errors 0.000-0.011) but equal the published values in fewer columns,
+  because the window cuts move: the bucket path counts a new flow's first packets in the window of its CPU report,
+  which here puts dataset window 0's first packets where the dataset has them.
+- **Floods:** the total-based columns go from median errors of 0.1-1.0 to 0.001-0.02 for Chaos, GoldenEye, slowloris
+  and the SYN sink. The SYN and UDP fan-outs stay at 0.08-0.41: their whole flood lasts ~0.7 s, so a cut a few to
+  36 ms off the dataset's boundary (plus a replay up to 48 ms late) moves a large part of it between two windows.
+- **Not changed:** the 10 per-flow features (flow counts, `dir_valid_count`, flows with A->B / B->A, the length
+  statistics, durations) still come from the buckets read and stay sampled under overload.
+
+**Possible next steps (not done):** sync the seven totals first, at the window boundary, before the reports are taken
+(the cut would move from up to 36 ms to ~1 ms after the boundary); or use the totals only in overloaded windows; if
+the build is adopted, measure its latency and rerun all 109 captures on it.
+
+**State after:** `basic_fix` running again (pid 21258 in `hz_sw`), ports 132/140, forwarding and mirror set by
+`run_bfrt.sh setup`, checked with the first cohort capture (9 / 9 packets, 40 of 40 windows inside the bounds);
+`enp5s0` down. `live_test/committee_replay/pc1_20261115_gtot.tar.xz`: the runs, `gtot_compare.csv`, the build's
+resource report and the setup logs.

@@ -113,6 +113,9 @@ REQUIRED = ["reg_pkts", "reg_bytes", "reg_pkts_ab", "reg_bytes_ab"]
 CLEAR_FIRST = ["reg_ref_src_port", "reg_ref_dst_port", "reg_dir_valid"]
 SUMMED = ["reg_pkts", "reg_bytes", "reg_pkts_ab", "reg_bytes_ab", "reg_syn", "reg_ack", "reg_rst"]
 DST_REG_NAME = "reg_newconn_dst"
+# The one-entry global totals of the test build perf/variants/gtot; payload "totals" uses the names without reg_g_.
+GLOBAL_NAMES = ["reg_g_pkts", "reg_g_bytes", "reg_g_pkts_ab", "reg_g_bytes_ab", "reg_g_syn", "reg_g_ack",
+                "reg_g_rst"]
 TABLE_PREFIX = "pipe.Ingress."
 DATA_PREFIX = "Ingress."
 KEY_FIELD = "$REGISTER_INDEX"
@@ -601,6 +604,14 @@ class BatchedRegisterReader(object):
             self.dst_table = RegisterTable(DST_REG_NAME, info.table_get(TABLE_PREFIX + DST_REG_NAME))
         except KeyError:
             self.dst_table = None
+        # perf/variants/gtot: all seven one-entry totals, or none
+        self.global_tables = OrderedDict()
+        for name in GLOBAL_NAMES:
+            try:
+                self.global_tables[name] = RegisterTable(name, info.table_get(TABLE_PREFIX + name))
+            except KeyError:
+                self.global_tables = OrderedDict()
+                break
         self.flow_tables = [t for t in self.tables.values() if t is not None]
         self.clear_tables = ([self.tables[n] for n in CLEAR_FIRST if self.tables.get(n) is not None]
                              + [t for t in self.flow_tables if t.name not in CLEAR_FIRST])
@@ -806,7 +817,7 @@ class BatchedRegisterReader(object):
     # ---------------------------------------------------------------- window
 
     def read_window(self, indexes, dst_indexes=None, clear_if_unchanged=None, snapshot="sync",
-                    source="batched gRPC", clear_indexes=None, probe=None, probe_max_full=None):
+                    source="batched gRPC", clear_indexes=None, probe=None, probe_max_full=None, totals=False):
         """snapshot: "sync" (register sync, then shadow reads), "hw" (hardware
         reads, no sync) or "shadow" (shadow reads without a sync; benchmarks).
         clear_indexes: buckets cleared unconditionally after the read (they need
@@ -820,7 +831,12 @@ class BatchedRegisterReader(object):
         probe_max_full: at most that many changed buckets are read in full (the
         caller's read allowance); the others are named in "deferred" (changed,
         not read: under a fan-out flood new flows land in occupied dormant
-        buckets by the thousand, and reading them all overran the window)."""
+        buckets by the thousand, and reading them all overran the window).
+        totals: also sync and read the seven one-entry global totals of the test
+        build perf/variants/gtot, in the same snapshot, through the client's own
+        parser (seven entities); payload "totals" = {pkts, bytes, pkts_ab,
+        bytes_ab, syn, ack, rst}, each summed over the pipes (None if a read
+        failed), or an error when the program has no totals."""
         indexes = [int(i) for i in indexes]
         dst_indexes = [int(i) for i in (dst_indexes or [])]
         clear_if_unchanged = clear_if_unchanged or {}
@@ -836,7 +852,9 @@ class BatchedRegisterReader(object):
         sync_tables = list(self.flow_tables)
         if dst_indexes and self.dst_table is not None:
             sync_tables.append(self.dst_table)
-        if snapshot == "sync" and not indexes and not dst_indexes and not probe:
+        if totals and self.global_tables:
+            sync_tables.extend(self.global_tables.values())
+        if snapshot == "sync" and not indexes and not dst_indexes and not probe and not totals:
             sync_s = 0.0          # nothing to read: a clear needs no snapshot
         elif snapshot == "sync":
             try:
@@ -924,6 +942,22 @@ class BatchedRegisterReader(object):
                         continue
                     dst_rows.append(make_dst_row(idx, list(v)))
         timing["read_ms"] = round((time.time() - t_read) * 1000.0, 3)
+
+        totals_out = None
+        if totals:
+            if not self.global_tables:
+                errors.append("global totals are not in this program (perf/variants/gtot)")
+            else:
+                t_tot = time.time()
+                totals_out = OrderedDict()
+                for name, t in self.global_tables.items():
+                    try:
+                        v = self._read_safe(t, [0], from_hw, timing).get(0)
+                    except Exception as error:
+                        errors.append("%s: %s" % (name, error))
+                        v = None
+                    totals_out[name[len("reg_g_"):]] = sum(v) if v is not None else None
+                timing["totals_ms"] = round((time.time() - t_tot) * 1000.0, 3)
         read_s = round(time.time() - t_start, 4)
 
         # Clear idle buckets whose packet count is still what the caller saw,
@@ -969,6 +1003,8 @@ class BatchedRegisterReader(object):
         if probe:
             payload["resumed"] = resumed   # only with a probe: the legacy payload has no such key
             payload["deferred"] = deferred
+        if totals:
+            payload["totals"] = totals_out  # only when asked for (perf/variants/gtot)
         payload["rows"] = rows             # last: hybrid_collector's fallback parser needs this
         return payload
 
@@ -1019,6 +1055,7 @@ def describe(reader):
         ("tables", [t.name for t in reader.flow_tables]),
         ("missing", [n for n, t in reader.tables.items() if t is None]),
         ("dst_table", reader.dst_table is not None),
+        ("global_totals", list(reader.global_tables)),
         ("sync_ops", dict((t.name, t.sync_op) for t in reader.flow_tables)),
         ("fast", reader.fast),
         ("raw", reader.raw),
@@ -1063,7 +1100,8 @@ def serve(args):
                                          req.get("clear_if_unchanged") or {}, req.get("snapshot", "sync"),
                                          req.get("source", "batched gRPC"), req.get("clear_indexes") or [],
                                          probe=req.get("probe") or None,
-                                         probe_max_full=req.get("probe_max_full"))
+                                         probe_max_full=req.get("probe_max_full"),
+                                         totals=bool(req.get("totals")))
             # When the request arrived and the reply left, on this host's clock: with the collector's
             # send and receive times they give the clock offset between the two hosts (RUNBOOK 19.6).
             payload.setdefault("timing", {})["reader_t_recv"] = t_recv

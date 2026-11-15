@@ -824,7 +824,7 @@ class BatchedReaderProcess:
              clear_if_unchanged: Optional[Dict[int, int]] = None, snapshot: str = "sync",
              timeout: Optional[float] = None, source: str = "batched gRPC",
              clear_indexes: Optional[List[int]] = None, probe: Optional[Dict[int, int]] = None,
-             probe_max_full: Optional[int] = None) -> Dict[str, Any]:
+             probe_max_full: Optional[int] = None, totals: bool = False) -> Dict[str, Any]:
         if self._proc is None or self._proc.poll() is not None:
             self.start()
         assert self._proc is not None and self._proc.stdin is not None
@@ -837,6 +837,8 @@ class BatchedReaderProcess:
             request["probe"] = {str(int(k)): int(v) for k, v in probe.items()}
             if probe_max_full is not None:
                 request["probe_max_full"] = int(probe_max_full)
+        if totals:
+            request["totals"] = True    # the gtot build's one-entry totals (batched_reader.read_window)
         t_sent = time.time()
         self._proc.stdin.write(json.dumps(request) + "\n")
         self._proc.stdin.flush()
@@ -1031,6 +1033,9 @@ PROFILES: Dict[str, Dict[str, Any]] = {
 ETHERNET_HEADER_BYTES = 14
 # Dormant probes leave room for this many full bucket reads: the dormant buckets found changed.
 DORMANT_RESUME_RESERVE = 8
+# The one-entry global totals of the test build perf/variants/gtot (reg_g_<key>), per window as the reader sums
+# them over the pipes; --global-totals takes the window totals from them (PC1.md part 4d).
+GTOT_KEYS = ["pkts", "bytes", "pkts_ab", "bytes_ab", "syn", "ack", "rst"]
 # The flow timestamps are the low 32 bits of a ns clock.
 TS_WRAP_S = (1 << 32) / 1e9
 
@@ -1325,6 +1330,7 @@ def collect_windows_live(
     clock: Any = None,
     dormant_reads: bool = False,
     dormant_probe: bool = False,
+    global_totals: bool = False,
     max_windows: int = 0,
     stop_fn: Optional[Callable[[], None]] = None,
 ) -> List[Dict[str, object]]:
@@ -1386,6 +1392,11 @@ def collect_windows_live(
     once: read all in full, the reads overran the window, PC1.md part 4c). Each
     window also records "dormant_probed_count", "dormant_resumed_indexes" and
     "dormant_deferred_indexes".
+
+    global_totals (the test build perf/variants/gtot and the batched reader):
+    every read also returns the seven one-entry totals from the same snapshot
+    (window["totals"]); NetSummarizer(global_totals=True) takes the window's
+    packet, byte and flag totals from their differences.
 
     A program without reg_newconn_dst (the deployed basic_fix) answers its reads
     with an error and no rows: from then on no destination bucket is requested
@@ -1452,6 +1463,9 @@ def collect_windows_live(
     dormant_probe_resumed_total = 0
     dormant_deferred_total = 0
     dst_missing = False
+    if global_totals and read_fn is None:
+        print("[WARN] --global-totals needs the batched reader; the window totals come from the buckets read")
+        global_totals = False
 
     w = 0
     proc_done = False
@@ -1625,6 +1639,8 @@ def collect_windows_live(
             extra["probe"] = probe_now
             if probe_max_full is not None:
                 extra["probe_max_full"] = probe_max_full
+        if global_totals:
+            extra["totals"] = True
         read_start = clk.time()
         if read_fn is None:
             payload = read_p4_with_retries(reader_path, request_idxs, w, retries=read_retries, timeout=read_timeout,
@@ -1752,6 +1768,7 @@ def collect_windows_live(
             "dormant_probed_count": len(probe_now),
             "dormant_resumed_indexes": resumed_now,
             "dormant_deferred_indexes": deferred_now,
+            "totals": payload.get("totals") if global_totals else None,
             "p4_snapshot": payload.get("snapshot"),
             "p4_read_start_sec": round(read_start - global_t0, 3),
             "p4_read_sec": round(read_end - read_start, 3),
@@ -1865,7 +1882,8 @@ class NetSummarizer:
     present, names the rows that count in its features; the other rows read
     (dormant buckets) only update the bookkeeping."""
 
-    def __init__(self, window_sec: float, byte_layer: str = "ipv4", duration_unit: str = "ns"):
+    def __init__(self, window_sec: float, byte_layer: str = "ipv4", duration_unit: str = "ns",
+                 global_totals: bool = False):
         if byte_layer not in ("ipv4", "frame"):
             raise ValueError(f"byte_layer must be 'ipv4' or 'frame', not {byte_layer!r}")
         if duration_unit not in ("ns", "s"):
@@ -1873,6 +1891,15 @@ class NetSummarizer:
         self.window_sec = window_sec
         self.byte_layer = byte_layer
         self.duration_unit = duration_unit
+        # global_totals (PC1.md part 4d): the window's packet, byte and flag totals from the differences of the
+        # gtot build's one-entry totals (window["totals"]), not from the buckets read, so a flood that keeps
+        # more buckets active than a window's read can cover does not shrink them. Every row then also has
+        # net_gtot_used and the bucket sums net_gtot_bucket_pkts_delta / net_gtot_bucket_bytes_delta (equal to
+        # the totals in a window without overload: a check). The registers are reset at the start of the run,
+        # so the first baseline is zero; after a window without totals the next one only sets the baseline.
+        self.global_totals = global_totals
+        self.prev_totals: Optional[Dict[str, int]] = None
+        self.totals_baseline_ok = True
         self.prev_by_idx: Dict[int, Dict[str, Any]] = {}
         self.prev_new_conn: Dict[int, int] = {}
         self.n_windows = 0
@@ -1894,6 +1921,35 @@ class NetSummarizer:
         k = max(0, int(round((estimate - d_mod) / TS_WRAP_S)))
         return d_mod + k * TS_WRAP_S
 
+    def _apply_totals(self, summary: Dict[str, Any], totals: Any, header: int, whole_switch: bool) -> None:
+        """Replace the bucket sums of the window totals with the global totals' differences (global_totals)."""
+        summary["net_gtot_bucket_pkts_delta"] = summary["net_pkts_total_delta"]
+        summary["net_gtot_bucket_bytes_delta"] = summary["net_bytes_total_delta"]
+        used = 0
+        valid = isinstance(totals, dict) and all(totals.get(k) is not None for k in GTOT_KEYS)
+        if not valid:
+            self.totals_baseline_ok = False          # the next window's difference would span two windows
+        else:
+            now = {k: int(totals[k]) for k in GTOT_KEYS}
+            prev = self.prev_totals if self.prev_totals is not None else dict.fromkeys(GTOT_KEYS, 0)
+            if self.totals_baseline_ok and whole_switch:
+                # 32-bit registers: differences modulo 2^32
+                d = {k: (now[k] - prev[k]) % (1 << 32) for k in GTOT_KEYS}
+                pkts_ba, bytes_ba = max(0, d["pkts"] - d["pkts_ab"]), max(0, d["bytes"] - d["bytes_ab"])
+                summary["net_pkts_total_delta"] = d["pkts"]
+                summary["net_bytes_total_delta"] = d["bytes"] + header * d["pkts"]
+                summary["net_pkts_ab_delta"] = d["pkts_ab"]
+                summary["net_bytes_ab_delta"] = d["bytes_ab"] + header * d["pkts_ab"]
+                summary["net_pkts_ba_delta"] = pkts_ba
+                summary["net_bytes_ba_delta"] = bytes_ba + header * pkts_ba
+                summary["net_syn_delta"] = d["syn"]
+                summary["net_ack_delta"] = d["ack"]
+                summary["net_rst_delta"] = d["rst"]
+                used = 1
+            self.prev_totals = now
+            self.totals_baseline_ok = True
+        summary["net_gtot_used"] = used
+
     def add(self, win: Dict[str, object]) -> Dict[str, object]:
         window_sec = self.window_sec
         prev_by_idx = self.prev_by_idx
@@ -1911,7 +1967,7 @@ class NetSummarizer:
             new_conn_max = max(new_conn_max, new_conn - prev_new_conn.get(idx, 0))
             prev_new_conn[idx] = new_conn
 
-        if not rows:
+        if not rows and not self.global_totals:
             return dict(NET_ZERO, net_new_conn_dst_max=new_conn_max)
 
         cleared_after_read = [safe_int(x) for x in win.get("cleared_indexes", [])]
@@ -2062,6 +2118,9 @@ class NetSummarizer:
             self.first_window.pop(idx, None)
             self.last_change_span.pop(idx, None)
             self.last_read_window.pop(idx, None)
+
+        if self.global_totals:
+            self._apply_totals(summary, win.get("totals"), header, owned_set is None)
 
         pkts_delta = summary["net_pkts_total_delta"]
         bytes_delta = summary["net_bytes_total_delta"]
@@ -2410,6 +2469,10 @@ def build_arg_parser(profile: Optional[str] = None) -> argparse.ArgumentParser:
                          "fits the allowance each window and read the changed ones in full, instead of a few full "
                          "reads round robin, so a flow that resumes in its dormant bucket counts in that window "
                          "(PC1.md part 4b); on in --profile dataset")
+    ap.add_argument("--global-totals", type=int, default=0, choices=[0, 1],
+                    help="test build perf/variants/gtot with the batched reader: read its seven one-entry totals "
+                         "every window and take the window's packet, byte and TCP-flag totals from them, so that "
+                         "an overloaded read does not shrink them (PC1.md part 4d); adds net_gtot_* check columns")
     ap.add_argument("--byte-layer", choices=["ipv4", "frame"], default="ipv4",
                     help="'frame' adds 14 B per packet to the byte counts and the packet lengths: the dataset counted "
                          "Ethernet frames, the switch counts IPv4 totalLen (RUNBOOK 19.9.1)")
@@ -2489,7 +2552,8 @@ def main() -> None:
 
     run_id = f"{args.scenario_name}_{int(time.time())}"
     writer = RunWriter(args.out_csv, run_id)
-    summarizer = NetSummarizer(args.window_sec, byte_layer=args.byte_layer, duration_unit=args.duration_unit)
+    summarizer = NetSummarizer(args.window_sec, byte_layer=args.byte_layer, duration_unit=args.duration_unit,
+                               global_totals=bool(args.global_totals))
     # the dataset launcher's private working directory (RUNBOOK 19.5.6)
     workspace = tempfile.mkdtemp(prefix="sample-launch-") if args.launcher == "dataset" else None
     net_windows: List[Dict[str, object]] = []
@@ -2650,6 +2714,7 @@ def main() -> None:
             clear_budget_frac=args.clear_budget_frac,
             dormant_reads=bool(args.dormant_reads),
             dormant_probe=bool(args.dormant_probe),
+            global_totals=bool(args.global_totals),
             max_windows=args.windows,
             stop_fn=stop_fn if args.windows else None,
         )

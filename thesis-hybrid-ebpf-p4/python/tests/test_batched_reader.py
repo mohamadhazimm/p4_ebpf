@@ -456,6 +456,66 @@ class DormantProbeTests(unittest.TestCase):
         self.assertNotIn("probe_ms", payload["timing"])
 
 
+class GlobalTotalsTests(unittest.TestCase):
+    """read_window(totals=True) on the test build perf/variants/gtot (PC1.md part 4d): the seven one-entry totals,
+    synced with the flow registers, summed over the pipes."""
+
+    def gtot_switch(self):
+        sw = bfrt_mock.MockSwitch(registers=bfrt_mock.REG_NAMES + bfrt_mock.GLOBAL_NAMES)
+        play_known_answer(sw)                                  # KNOWN_IDX, pipe 1
+        for k in range(3):                                     # bucket 11 in pipe 0: two A->B, one B->A
+            sp, dp = (1011, 80) if k < 2 else (80, 1011)
+            sw.packet(11, 0, 60 + k, sp, dp, 6, 0x10 if k else 0x02, 1000 + k)
+        return sw
+
+    def test_the_totals_are_the_sum_over_every_bucket_and_pipe(self):
+        sw = self.gtot_switch()
+        payload = json.loads(json.dumps(make_batched(sw).read_window([11, KNOWN_IDX], totals=True)))
+        rows, t = payload["rows"], payload["totals"]
+        for key in ("pkts", "bytes", "pkts_ab", "bytes_ab", "syn", "ack", "rst"):
+            self.assertEqual(t[key], sum(r[key] for r in rows), key)
+        self.assertEqual((t["pkts"], t["pkts_ab"]), (103, 53), "the known answer's 51 A->B packets and bucket 11's 2")
+        self.assertEqual(payload["errors"], [])
+        self.assertEqual(list(payload)[-2:], ["totals", "rows"])
+        self.assertIn("totals_ms", payload["timing"])
+
+    def test_the_totals_come_from_the_windows_snapshot(self):
+        sw = self.gtot_switch()
+        reader = make_batched(sw)
+        first = reader.read_window([], totals=True)
+        self.assertGreater(first["timing"]["sync_rpcs"], 0, "totals alone still take the snapshot")
+        sw.packet(11, 0, 70, 1011, 80, 6, 0x10, 2000)          # after it: only in hardware
+        self.assertEqual(reader.read_window([], snapshot="shadow", totals=True)["totals"]["pkts"], first["totals"]["pkts"])
+        self.assertEqual(reader.read_window([], totals=True)["totals"]["pkts"], first["totals"]["pkts"] + 1)
+
+    def test_a_program_without_totals_says_so_and_nothing_changes_without_the_flag(self):
+        sw = bfrt_mock.MockSwitch()
+        play_known_answer(sw)
+        reader = make_batched(sw)
+        payload = reader.read_window([KNOWN_IDX], totals=True)
+        self.assertIsNone(payload["totals"])
+        self.assertIn("global totals are not in this program (perf/variants/gtot)", payload["errors"])
+        plain = make_batched(self.gtot_switch(), addr="mock:g").read_window([KNOWN_IDX])
+        self.assertNotIn("totals", plain)
+        self.assertEqual(plain["timing"]["sync_rpcs"], len(batched_reader.REG_NAMES), "the totals are not synced")
+
+    def test_the_serve_protocol_carries_the_totals(self):
+        with tempfile.TemporaryDirectory() as d:
+            sw = self.gtot_switch()
+            spec = {"pipes": 2, "registers": sw.registers,
+                    "cells": {name: {str(i): v for i, v in cells.items()} for name, cells in sw.hw.items()}}
+            cells = os.path.join(d, "cells.json")
+            Path(cells).write_text(json.dumps(spec))
+            proc = hc.BatchedReaderProcess(str(PYDIR / "batched_reader.py"), grpc_addr="mock:gserve", echo=False,
+                                           extra_args=["--mock-cells", cells])
+            try:
+                ready = proc.start()
+                self.assertEqual(ready["global_totals"], bfrt_mock.GLOBAL_NAMES)
+                self.assertEqual(proc.read([], totals=True, timeout=30)["totals"]["pkts"], 103)
+            finally:
+                proc.stop()
+
+
 def run_batched_probe(reader, probe, indexes=(), snapshot="sync"):
     payload = reader.read_window(list(indexes), [], {}, snapshot, "batched gRPC", [], probe=probe)
     return json.loads(json.dumps(payload))

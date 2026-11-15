@@ -70,14 +70,29 @@ class ResetScriptTests(unittest.TestCase):
         bfrt, regs = fake_bfrt(reset_registers.REGISTERS)
         lines = run_reset_inner(bfrt)
         self.assertTrue(all(r.cleared for r in regs.values()))
-        self.assertEqual(len(regs), 15)
-        self.assertTrue(lines[-1].startswith("[RESET-OK] 15 registers cleared"))
+        self.assertEqual(len(regs), 22)
+        self.assertTrue(lines[-1].startswith("[RESET-OK] 22 registers cleared"))
 
     def test_a_build_without_a_register_skips_it(self):
-        bfrt, regs = fake_bfrt([n for n in reset_registers.REGISTERS if n != "reg_newconn_dst"])
+        # the deployed basic_fix: no reg_newconn_dst, no global totals
+        bfrt, regs = fake_bfrt([n for n in reset_registers.REGISTERS
+                                if n != "reg_newconn_dst" and not n.startswith("reg_g_")])
         lines = run_reset_inner(bfrt)
         self.assertIn("[RESET-SKIP] reg_newconn_dst is not in this build", lines)
+        self.assertIn("[RESET-SKIP] reg_g_pkts is not in this build", lines)
         self.assertTrue(lines[-1].startswith("[RESET-OK] 14 registers cleared"))
+
+    def test_the_one_entry_global_totals_are_checked_at_cell_0_only(self):
+        # perf/variants/gtot: reading cell 1 of a one-entry register fails on the switch
+        bfrt, regs = fake_bfrt(reset_registers.REGISTERS)
+        for name, reg in regs.items():
+            if name.startswith("reg_g_"):
+                reg.cells = {0: [5, 9]}
+                reg.get = (lambda r: lambda REGISTER_INDEX, from_hw, print_ents: (
+                    [Entry(r.name, list(r.cells.get(0, [0, 0])))] if REGISTER_INDEX == 0 else 1 / 0))(reg)
+        lines = run_reset_inner(bfrt)
+        self.assertTrue(lines[-1].startswith("[RESET-OK] 22 registers cleared"), lines[-3:])
+        self.assertTrue(all(regs[n].cleared for n in regs if n.startswith("reg_g_")))
 
     def test_a_register_that_is_not_zero_after_clear_fails(self):
         bfrt, _ = fake_bfrt(reset_registers.REGISTERS, broken={"reg_dir_valid"})
