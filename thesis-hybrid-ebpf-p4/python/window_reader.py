@@ -16,7 +16,8 @@ extremes by max); the packets that a pipe whose clock lags counted meanwhile are
 
     window_reader.py --reset                  clear every register of the program, read back a few cells
     window_reader.py --frame-min DST/PREFIX   frame_len: count packets toward DST as at least 46 B of IPv4
-                                              (60 B frames: the host's own capture sees them padded)
+                                              (60 B frames: the host's own capture sees them padded);
+                                              repeatable, replaces the table's entries
     window_reader.py --marker-ports 192,132   the ports whose window markers count (replaces the set)
     window_reader.py --follow [--until-epoch N] [--poll-ms 1]
                                               one JSON line per finished window, from the window open at the
@@ -341,12 +342,22 @@ def do_marker_ports(prog, ports):
     return {"marker_ports": [int(p) for p in ports]}
 
 
-def setup(prog, reset=False, frame_min=(), marker_ports=None):
+def clear_frame_len(prog):
+    t = prog.table("frame_len")
+    try:
+        t.entry_del(prog.target, **prog.kw(t.entry_del))
+    except Exception as error:
+        log("clearing frame_len: %s" % str(error).splitlines()[0][:200])
+
+
+def setup(prog, reset=False, frame_min=None, marker_ports=None):
+    """frame_min (a list, possibly empty) and marker_ports replace what the tables held."""
     out = {}
     if reset:
         out.update(do_reset(prog))
-    for spec in frame_min:
-        out.setdefault("frame_min", []).append(do_frame_min(prog, spec)["frame_len"])
+    if frame_min is not None:
+        clear_frame_len(prog)
+        out["frame_min"] = [do_frame_min(prog, spec)["frame_len"] for spec in frame_min]
     if marker_ports is not None:
         out.update(do_marker_ports(prog, marker_ports))
     return out
@@ -433,7 +444,7 @@ def do_serve(prog, reader):
             req = json.loads(line)
             cmd = req.get("cmd")
             if cmd == "setup":
-                out = setup(prog, bool(req.get("reset")), req.get("frame_min") or (), req.get("marker_ports"))
+                out = setup(prog, bool(req.get("reset")), req.get("frame_min"), req.get("marker_ports"))
             elif cmd == "mark":
                 out = reader.mark(int(req["epoch"]), float(req.get("timeout", 1.0)))
             elif cmd == "follow":
@@ -482,7 +493,7 @@ def main():
     reader = WindowReader(prog, args.cpu_iface)
     ports = None if args.marker_ports is None else [int(p) for p in args.marker_ports.split(",") if p.strip()]
     if args.reset or args.frame_min or ports is not None:
-        print(json.dumps(setup(prog, args.reset, args.frame_min, ports)))
+        print(json.dumps(setup(prog, args.reset, args.frame_min or None, ports)))
         sys.stdout.flush()
     if args.once:
         epochs = prog.pipe_epochs()

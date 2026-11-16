@@ -1062,7 +1062,7 @@ PROFILES: Dict[str, Dict[str, Any]] = {
                 "read_budget_frac": 0.7, "max_dst_reads": 256, "forward_report_port": 192,
                 "clear_expired": 0, "clear_budget_frac": 0.5,
                 "dormant_reads": 1, "dormant_probe": 1, "byte_layer": "frame", "duration_unit": "s", "windows": 40,
-                "launcher": "dataset", "frame_min": ["10.0.0.10/32"]},
+                "launcher": "dataset", "frame_min_default": ["10.0.0.10/32"]},
 }
 
 # Ethernet header bytes: the dataset counted frame bytes, the switch counts IPv4 totalLen.
@@ -2006,8 +2006,9 @@ def collect_windows_exact(
             raise P4ReadError(f"window marker {epoch}: {r['error']}")
         return r
 
+    first_mark = None
     if markers == "cpu":
-        mark(1)
+        first_mark = mark(1)
     else:
         r = reader.request({"cmd": "follow"})
         if "error" in r:
@@ -2035,6 +2036,8 @@ def collect_windows_exact(
             if timing is not None:
                 rec = {k: v for k, v in line.items() if k != "regs"}
                 rec.update(window=w, t_window_end=boundary, marked=marked)
+                if w == 0 and first_mark is not None:
+                    rec["marked_first"] = first_mark
                 timing.write(json.dumps(rec) + "\n")
                 timing.flush()
             if on_window is not None:
@@ -2611,7 +2614,9 @@ def build_arg_parser(profile: Optional[str] = None) -> argparse.ArgumentParser:
                          "--forward-int-port)")
     ap.add_argument("--frame-min", action="append", default=None,
                     help="exact: DST/PREFIX toward which packets count at least the 60-byte frame minimum, as the "
-                         "host's own capture saw them (the dataset profile: 10.0.0.10/32)")
+                         "monitored host's own capture saw them; repeatable, and replaces the profile's default "
+                         "(dataset: 10.0.0.10/32, the dataset's guest). --frame-min none: no such address")
+    ap.add_argument("--frame-min-default", action="append", default=[], help=argparse.SUPPRESS)  # the profile's
     ap.add_argument("--window-reader", default=DEFAULT_WINDOW_READER)
     ap.add_argument("--exact-read-timeout", type=float, default=5.0,
                     help="exact: how long a window's read waits for the window to end on the switch")
@@ -2826,8 +2831,10 @@ def main() -> None:
             print(f"[INFO] window reader ready: {json.dumps(window_reader.start())}")
             marker_ports = [int(args.forward_report_port)] if args.window_markers == "cpu" else [
                 args.marker_port if args.marker_port is not None else int(args.forward_int_port)]
+            frame_min = args.frame_min if args.frame_min is not None else args.frame_min_default
+            frame_min = [f for f in frame_min if f != "none"]
             got = window_reader.request({"cmd": "setup", "reset": not args.no_register_reset,
-                                         "frame_min": args.frame_min or [], "marker_ports": marker_ports},
+                                         "frame_min": frame_min, "marker_ports": marker_ports},
                                         timeout=300)
             if "error" in got:
                 raise P4ReadError(f"window reader setup: {got['error']}")

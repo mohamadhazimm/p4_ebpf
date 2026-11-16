@@ -1479,3 +1479,67 @@ The user asked for the fixes of the review and for `hybrid_collector.py` to matc
 `live_test/committee_replay/pc1_20261116_exact_v3.tar.xz`: the collector runs (final and first; without the send
 captures `tx.pcap.gz`, which stay in `perf/results/exact_collector/`), the live test, the build records, line rate,
 latency, timer results, the scripts.
+
+## Results, part 6c (PC1, 2026-11-16): a live hybrid run on the exact build
+
+The user asked for the live hybrid test after part 6b. Set-up as section 2b:
+- **Switch:** `basic_exact_v3`, forwarding 132 <-> 140.
+- **Servers:** `servers.py` on PC2 (192.168.0.2, behind port 140).
+- **Programs:** the release's seven network workloads on PC1, each 20 s in the collector's cgroup.
+- **Host side:** the real eBPF host monitor (`hostmon_agg`).
+- **Collector:** `hybrid_collector.py --profile dataset --switch-program exact --window-markers cpu --frame-min
+  192.168.0.1/32`. The reader sends the window markers from the switch's CPU port at the collector's boundaries,
+  and `frame_len` counts frames toward PC1 at the frame minimum.
+- **Driver:** `perf/results/exact_live/scripts/run_live.sh`, with eth1 captured in both directions;
+  `check_live.py` compares.
+
+**Every run:**
+- `HOSTMON_HEALTH` all zeros.
+- 40 rows, host and network windows aligned.
+- No window lost, no untracked or unclocked packet, no rejected marker.
+- The programs ran to the 20 s stop or finished early, as in section 2b.
+- A marker showed on the switch's clock a median 2.5-2.6 ms after the reader sent it.
+
+**Against the wire:**
+- **Small-packet programs** (http_poll, tcp_beacon, interactive): every checkable window, 39 of 39 each, holds
+  between the packets and bytes surely and possibly sent between its markers.
+- **Bulk programs** (fanout, http_bulk, threaded, mixed): PC1's capture holds TSO/GRO super-frames, up to
+  31,124 B of IPv4, where the wire and the switch carry 1,500 B segments, so the capture cannot be the reference.
+  Rerun with the offloads off on eth1 (`ethtool -K eth1 tso off gso off gro off`, back on afterwards):
+  - 40 of 40 windows within the bounds;
+  - packets and bytes over the 40 windows equal to the wire exactly (fanout 190 / 65,700 B, http_bulk 700 /
+    662,712 B, threaded 449 / 106,258 B, mixed 452 / 338,340 B).
+  - Without receive offload PC1 acknowledges every segment, so these counts are larger than with offloads on.
+    The rows below use the runs with offloads on, as on 2026-11-08 (`exact_live/offload_on/`).
+
+**Scored** by the published detectors (the dataset construction's `.venv`, `score.py`;
+`exact_live/score_exact_live.txt`):
+
+```
+execution          category         host  network  hybrid  in range    (section 2b, basic_fix:  host network hybrid in range)
+fanout_exact       benign           0.98     0.11    0.62   80/235                              0.98    0.11   0.62   80
+http_poll_exact    network_benign   0.82     0.56    0.69  113/235                              0.82    0.55   0.69  111
+http_bulk_exact    network_benign   0.90     0.09    0.46  177/235                              0.91    0.09   0.46  179
+tcp_beacon_exact   network_benign   0.90     0.70    0.80  155/235                              0.90    0.70   0.80  155
+interactive_exact  network_benign   0.71     0.77    0.77  166/235                              0.71    0.79   0.77  164
+threaded_exact     network_benign   0.89     0.12    0.50  182/235                              0.90    0.13   0.51  180
+mixed_exact        benign           0.92     0.22    0.54   74/235                              0.92    0.21   0.54   74
+```
+
+- Every probability is within 0.02 of section 2b's `basic_fix` rows, and every in-range count within 2.
+- These light programs never overloaded `basic_fix`, so both builds give the same rows.
+- The features furthest outside the dataset's ranges are those of section 2b: PC1's process start-up, and the
+  benign downloads' B->A bytes. The exact build changes nothing on the host side.
+
+**Also fixed:**
+- `--frame-min` now replaces the dataset profile's default (10.0.0.10, the dataset's guest) instead of adding to
+  it, and the reader replaces the `frame_len` entries on setup instead of keeping old ones.
+- The collector's timing log now records the first window's marker too.
+
+**State after:**
+- **PC2:** left as found (server stopped; `/tmp/servers.py`, `/tmp/www`, `/tmp/servers.log` removed).
+- **Switch:** `basic_fix` running again (pid 20586), ports and forwarding from `setup_basic_fix_restored_6c/`.
+- **Check:** the first cohort capture (9 / 9 packets, 40 of 40 windows inside the bounds;
+  `committee_replay/restored_check_6c/`); `enp5s0` down.
+- **Archive:** `live_test/committee_replay/pc1_20261116_exact_live.tar.xz` holds the runs (CSV, timing,
+  collector and host-monitor logs, without the eth1 captures), the rows, the scores and the scripts.
