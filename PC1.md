@@ -1198,3 +1198,78 @@ columns under overload.
 windows inside the bounds); `enp5s0` down. The build stays on the switch in `/root/hazim_perf/build/basic_gtot_ba`.
 `live_test/committee_replay/pc1_20261116_gtot_ba.tar.xz`: the runs, the check, `gtot_ba_compare.csv`,
 `replay_rows_gtot_ba.csv`, `totals_read_exposure.tsv`, the scripts, the build's resource report and the setup logs.
+
+## Results, part 4g (PC1, 2026-11-16): all 109 captures on basic_gtot_ba
+
+**Space first.** PC1 had 295 MB free. Freed:
+- the superseded run directories `runs_gtot/` (part 4d), `runs_gtot_all/` (part 4e's first rerun) and the two trials
+  of part 4e, 76 MB. Each is complete in a committed archive (rows, `rerun.log`, per run `summary.json`,
+  `timing.jsonl`, `windows.csv`, `collector.log`); only their `tx.pcap.gz` files are gone.
+- Firefox's cache (58 MB; Firefox was not running) and apt's package cache (`apt-get clean`, 362 MB).
+
+790 MB free afterwards. Not touched: VS Code's folders (2.8 GB), the journal (324 MB), and a 368 MB file VS Code
+deleted but still holds open (`/tmp/DxX4kjv0`); reloading VS Code frees that one.
+
+**The rerun.** `basic_gtot_ba` started again in `hz_sw` (`setup_gtot_ba_rest/`). The other 103 captures were replayed
+with `--global-totals 1` into `runs_gtot_ba/`, next to part 4f's six, 04:16-05:17 (PC1's clock).
+- All 109 done, and in every run the totals equal the packets and bytes sent over the 44 windows.
+- The self-check passes 4,796 of 4,796 windows.
+- No window has more A->B packets than packets in all.
+- The totals' read ends a median 4.72 ms after the boundary (longest median 7.43 ms).
+
+Against `basic_fix` (`replay_rows_v3.csv`) and `gtot` with the boundary cut (part 4e; `gtot_ba_all_compare.csv`):
+
+| | basic_fix | gtot | gtot_ba |
+|---|---|---|---|
+| **calm (96 captures, 618,805 packets)** | | | |
+| B->A packets in the 40 windows (published 78,400) | 78,417 | 78,442 | **78,400** |
+| 30 B->A columns: rows with all equal | 67 | 64 | 67 |
+| 95 total columns equal: median / mean | 95 / 81.2 | 95 / 81.5 | 95 / **82.7** |
+| rows with all 95 equal | 61 | 63 | 63 |
+| all 145 equal: mean | 119.2 | 119.4 | **120.6** |
+| **overloaded on basic_fix (11 captures, 820,823 packets)** | | | |
+| packets in the 40 windows | 192,916 | 820,823 | 820,823 |
+| 30 B->A columns equal: mean | 3.4 | 7.5 | **10.0** |
+| 95 total columns equal: median / mean | 4 / 10.3 | 41 / 39.1 | **42 / 43.1** |
+| all 145 equal: median / mean | 11 / 17.2 | 49 / 46.1 | 47 / **50.1** |
+| overloaded / overrun windows | 285 / 17 | 279 / 16 | 283 / 17 |
+| **all 109** | | | |
+| captures with all their packets in the 40 windows | 100 | 109 | 109 |
+| 95 total columns equal: mean | 73.1 | 76.3 | **77.8** |
+| all 145 equal: mean | 107.6 | 110.7 | **112.2** |
+
+(bulkup_200/400 are the same on `gtot` and `gtot_ba`: 31.5 of 95 columns, incomplete replays as before.)
+
+**What changed against gtot:**
+- **The six floods of part 4f** gain 185 columns between them.
+- **91 of the other 103 match the same number of the 95 columns.** 4 match more (bulkdl +3; bulk700, syn_sink_40k,
+  goldeneye_r10 +1 each) and 8 fewer (goldeneye_p10 -11, syn_fan_40k -5, dns_10k and slowloris_1000 -4,
+  beacon_100 -2; slowloris_800, bulk400, bulk1000 -1), net -23. Their B->A sums are the same on both builds; the
+  columns they lose are mostly window maxima and sums. These differences come from the replays, not the build:
+  - **goldeneye_p10's replay ran late this time** (95th percentile of the timing error 90 ms, against 1.3 ms on
+    `gtot`), which accounts for 11 of the 23 (9 window maxima, a standard deviation, the active windows).
+  - **The replay's alignment to the window grid** has a median error of 1.05 ms on both builds, and 15-17 of the
+    109 runs land within 0.5 ms. Which captures get such a run differs from run to run, and a millisecond moves
+    a few packets across a window boundary.
+  - **Late replays:** 10 runs had a 95th percentile above 10 ms on `gtot_ba`, against 6 on `gtot`. All but
+    goldeneye_p10 are floods that PC1's Python replayer is known to fall behind on (part 4).
+- **Net over all 109: +162 columns** (mean 76.3 -> 77.8 of 95).
+
+**The rows for the thesis:** `replay_rows_gtot_ba.csv` now holds all 109 rows from `runs_gtot_ba/`, one build. It
+replaces part 4f's file of the same name (six rows from `gtot_ba`, 103 from `gtot`), which stays in
+`pc1_20261116_gtot_ba.tar.xz`.
+
+**Still open:**
+- The direction of a packet whose flow shares a bucket: Chaos counts 83,244 B->A packets against the published
+  110,866, and the SYN fan-outs' 1-2 replies count as A->B.
+- The totals' cut 4-5 ms after the boundary, and later when the collector falls behind on the reports.
+- Late replays of the floods (PC1's Python replayer).
+- The per-flow columns are still sampled under overload.
+- `basic_gtot_ba`'s latency and line rate have not been measured (compiler: the same stages, 133 against 135
+  cycles).
+
+**State after:** `basic_fix` running again (pid 31911 in `hz_sw`), ports 132/140, forwarding and mirror set by
+`run_bfrt.sh setup` (`setup_basic_fix_restored_4g/`), checked with the first cohort capture (9 / 9 packets, 40 of 40
+windows inside the bounds); `enp5s0` down. `live_test/committee_replay/pc1_20261116_gtot_ba_all.tar.xz`: the 103
+runs (part 4f's six are in `pc1_20261116_gtot_ba.tar.xz`), `rows.csv` and `rerun.log` of all 109,
+`gtot_ba_all_compare.csv`, `replay_rows_gtot_ba.csv`, the scripts, the setup logs.

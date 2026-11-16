@@ -571,7 +571,7 @@ only the program differed.
 - **For the paper:** these are the numbers of the build it describes. Sections 3.2 and 4.1
   describe the build with the counter.
 
-### 5.6 Global totals (build `gtot`, 15 November, tested on the switch; the thesis replay rows use it)
+### 5.6 Global totals (build `gtot`, 15-16 November, tested on the switch; the thesis replay rows use `basic_gtot_ba`)
 
 Under a flood the control plane reads ~500 buckets per 0.5 s window while ~30,000 are active, so window
 totals summed over the buckets read show 6–35% of the packets (PC1.md, part 4c). The test build adds seven
@@ -588,7 +588,10 @@ picked up packets that were never sent (6–26 in six floods). `-DP4_GLOBAL_TOTA
 `basic_gtot_ba`, PC1.md part 4f) counts B→A in place of the packet and byte totals. It uses the same seven registers,
 6 stages and 21 stateful ALUs; the compiler estimates 133 ingress cycles against 135; latency and line rate were not
 measured. On it the six floods have no such packets, and they match 29–83 of the 95 columns instead of 16–37.
-Between runs the switch runs `basic_fix`.
+PC1.md part 4g reran all 109 captures on `basic_gtot_ba`. Every packet counts, and no window has more A→B
+packets than packets in all. The calm captures' B→A sum equals the published rows' (78,400). The mean over the
+109 is 77.8 of the 95 columns, against 76.3 on `gtot` and 73.1 on `basic_fix`. The thesis replay rows come from
+this build. Between runs the switch runs `basic_fix`.
 - **Sources:** `perf/variants/gtot/`: the fixed build of Section 5.5 (`basic_fix`, same hashes) with the seven
   registers in `ingress.p4`; `-DP4_ENABLE_GLOBAL_TOTALS=0` compiles `basic_fix`. The instrumented copy for the
   latency is `perf/variants/hwl/make_hwl_sources.sh perf/variants/gtot OUT_DIR`; it differs from Section 5.5's
