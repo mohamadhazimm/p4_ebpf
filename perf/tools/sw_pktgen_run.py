@@ -54,6 +54,8 @@ TIMER_NS = 1000
 MASK32 = (1 << 32) - 1
 # the one-entry global totals of the test build perf/variants/gtot (--global-totals)
 GLOBAL_TOTALS = ["reg_g_pkts", "reg_g_bytes", "reg_g_pkts_ab", "reg_g_bytes_ab", "reg_g_syn", "reg_g_ack", "reg_g_rst"]
+# the window totals of perf/variants/exact (--window-totals): index {bank, found, dir_ab}, lo packets, hi bytes
+WINDOW_TOTALS = "reg_w_tot"
 
 
 def checksum(raw):
@@ -94,6 +96,11 @@ def main():
                     help="also count the seven one-entry totals of the test build perf/variants/gtot (reg_g_*, "
                          "cell 0, every pipe): pipe PIPE must grow by the generated packets, pipe 0 by the "
                          "looped-back ones, the byte totals as the flow's reg_bytes (mod 2^32)")
+    ap.add_argument("--window-totals", action="store_true",
+                    help="also count perf/variants/exact's window totals (reg_w_tot, all 8 cells, every pipe; no "
+                         "markers, so all in window 0): pipe PIPE must grow by the generated packets, pipe 0 by "
+                         "the looped-back ones, the bytes by the IPv4 lengths (mod 2^32); 'tracked' are the "
+                         "packets of flows with a slot (found 1)")
     a = ap.parse_args()
     apps = [(2 * i, 68 + i, 128 * a.pipe + 68 + i) for i in range(a.apps)]   # (app_id, local port, dev_port)
     out = {"prog": a.prog, "size": a.size, "pipe": a.pipe, "apps": apps, "sink_port": a.sink_port,
@@ -244,6 +251,16 @@ def main():
                 tbl = info.table_get("pipe.Ingress." + name)
                 d = get_dict(tbl, t_all, tbl.make_key([gc.KeyTuple("$REGISTER_INDEX", 0)]))
                 s[name] = [int(x) for x in d.get("Ingress.%s.f1" % name, [])]
+        if a.window_totals:
+            tbl = info.table_get("pipe.Ingress." + WINDOW_TOTALS)
+            cells = {}
+            for idx in range(8):
+                d = get_dict(tbl, t_all, tbl.make_key([gc.KeyTuple("$REGISTER_INDEX", idx)]))
+                cells[idx] = (d.get("Ingress.%s.lo" % WINDOW_TOTALS, []), d.get("Ingress.%s.hi" % WINDOW_TOTALS, []))
+            npipes = len(cells[0][0])
+            s["w_pkts"] = [sum(int(cells[i][0][p]) for i in range(8)) & MASK32 for p in range(npipes)]
+            s["w_bytes"] = [sum(int(cells[i][1][p]) for i in range(8)) & MASK32 for p in range(npipes)]
+            s["w_tracked"] = [sum(int(cells[i][0][p]) for i in range(8) if i & 2) & MASK32 for p in range(npipes)]
         return s
 
     before = snapshot()
@@ -283,6 +300,9 @@ def main():
     if a.global_totals:
         out["global_delta"] = dict((name[len("reg_g_"):], [(x - y) & MASK32 for x, y in zip(after[name], before[name])])
                                    for name in GLOBAL_TOTALS)
+    if a.window_totals:
+        out["window_delta"] = dict((k, [(x - y) & MASK32 for x, y in zip(after[k], before[k])])
+                                   for k in ("w_pkts", "w_bytes", "w_tracked"))
     print("HZJSON " + json.dumps(out, sort_keys=True))
     json.dump(out, open(a.out, "w"), indent=2, sort_keys=True)
 

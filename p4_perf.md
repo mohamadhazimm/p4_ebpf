@@ -645,6 +645,121 @@ this build. Between runs the switch runs `basic_fix`.
     ambiguous difference above ~69 Gbps per pipe (Section 5.6 is a test build for the dataset's traffic).
 - The switch runs `basic_fix` again (checked with a replay, 9 of 9 packets).
 
+### 5.7 Window features in the data plane (build `exact`, 16 November, tested on the switch)
+
+The aim: a program whose rows have no leak and no drop. A packet should count in its own window and direction,
+and no flow should go unread under a flood. **Where the remaining errors came from (offline,
+`perf/results/exact_gap_analysis/`):**
+- A copy of `features/switch_model.py` run on the 110 captures reproduces all 110 published rows, which confirms
+  the window grid.
+- With ideal reads and ideal cuts, `basic_fix`'s design would match all 135 non-duration columns in 89 of the 110.
+  - **Shared buckets** cost 4 floods (syn_fan_40k/100k/150k, Chaos).
+  - **Ethernet padding** cost 21 captures. The dataset counts frames as the guest's capture saw them: 27,813
+    received frames padded to 60 B, 40,395 sent 54 B frames unpadded. IPv4 totalLen + 14 misses the padding.
+  - **The parser** differs from the model on VLAN tags, IPv4 options and fragments, but none occur in the dataset.
+- On the switch, three more causes add to these:
+  - each window's cut lands a few ms after its boundary, later when the collector falls behind;
+  - the replay runs late in floods;
+  - the reads cover only part of the active buckets under overload.
+
+**The program** (`perf/variants/exact/`, header comment of `ingress.p4`):
+- **Windows.** A window marker frame (EtherType 0x88B5, carrying the new window's number) advances `reg_epoch`.
+  - Every window register has two banks (epoch & 1). The control plane reads the finished window's bank while the
+    next window counts into the other.
+  - The cut is where the marker sits in the packet sequence, for all registers at once.
+  - In deployment the packet generator's timer advances the epoch instead (`-DTIMER_PORT=196`).
+- **Flows.** The key orders the two (address, port) endpoints, so flows whose ports pair differently with the same
+  two addresses stay apart.
+  - Four ways of 16,384 slots hold a 32-bit signature each. A flow takes the first way whose slot is free or
+    holds its signature, and keeps it for the run, as the model does.
+  - A flow that finds no slot is still counted, as A→B, and its packets go into a separate total, so the window is
+    marked inexact.
+- **Direction.** A→B is the first packet's source, compared by address and port; `basic_fix` compares ports only.
+- **Features.** All 29 are computed in the data plane. Per window, every packet adds its flow's change. A flow's
+  first packet in the window also adds the flow's previous value, under its class (the windows since its last
+  packet, 1–3, or 0 for new or expired flows). From these, `window_features.py` rebuilds the sums over the active
+  flows (3-window TTL), and the minima and maxima come from per-window extremes.
+- **Bytes.** `frame_len` counts the frame minimum toward the guest (10.0.0.10), as its capture saw received frames.
+- **Parser.** It takes VLAN tags, skips IPv4 options while forwarding them, and does not count fragments.
+
+**Control plane** (`thesis-hybrid-ebpf-p4/python/`):
+- `window_reader.py`, on the switch, reads one window in 51 cells and clears its 3 extreme cells.
+- `window_features.py` rebuilds the 29 features from those reads.
+- `exact_model.py` is a software model of the program; `tests/test_exact_windows.py` checks it against the model
+  on random traffic.
+- `live_test/replay_absolute.py --markers` sends the 41 markers in order with the capture's frames, and
+  `live_test/exact_replay.py` drives one run.
+
+- **Compile** (`perf/results/exact_build_20261116/`):
+
+  | Build | Stages ig/eg | SRAM | Map RAM | Stateful ALUs | Latency ig/eg (cycles) |
+  |---|---|---|---|---|---|
+  | basic_fix (Section 5.5) | 5/1 | 197 (20.5%) | 196 (34.0%) | 14 (29.2%) | 131/170 |
+  | exact | 11/1 | 120 (12.5%) | 117 (20.3%) | 23 (47.9%) | 260/170 |
+  | exact, Section 4.1 instrumentation | 11/2 | 120 | 117 | 23 | 260/172 |
+
+  - The per-flow state is 7 registers of 65,536 slots plus the 4 signature ways. The 14 per-flow counters of
+    `basic_fix` are gone, so SRAM drops.
+  - The chain is: compare, order the key, 4 way probes, per-flow state, contributions, window registers.
+  - `-DWAY_BITS=15` (131,072 slots) made bf-p4c 9.6.0 fail with an internal error while it split the 32-bit time
+    registers across stages.
+  - The batch's build and a compile of the committed source give the same assembler program, apart from generated
+    table names and paths.
+- **Latency** (Section 4.1's method, `perf/results/latency_exact_20261116/hwl_runs.sh`, 3 runs per program, all
+  three programs on the same day; every run had 1010 of 1010 reports):
+
+  | Program | min | median | mean | p99 | max (ns) |
+  |---|---|---|---|---|---|
+  | Baseline | 244 | 246 | 245.60–245.65 | 247 | 247–248 |
+  | basic_fix (detector without the counter) | 314 | 315 | 315.38–315.45 | 318–319 | 319–320 |
+  | exact | 420 | 421 | 421.14–421.15 | 424–425 | 425–426 |
+
+  - **The exact build costs 106 ns more than `basic_fix`** (421 against 315 ns), 175 ns over the baseline. That
+    matches the compiler's 129 extra cycles.
+  - The baseline and `basic_fix` reproduce Section 5.5 to the nanosecond.
+- **Line rate** (Section 3.2's matrix, 27 runs; `sw_pktgen_run.py --window-totals` reads `reg_w_tot` before and
+  after each run; `perf/results/linerate_exact_20261116/`):
+
+  | Frame (B) | Paced, exact (3 runs) | Paced, basic_fix (Section 5.5) | Saturating: offered / sent, exact |
+  |---|---|---|---|
+  | 64 | 91.09% / 91.09% / 91.09% (generator maximum) | 91.09% | – |
+  | 128 | 99.88% / 99.88% / 99.88% | 99.88% | 111% / 100.00% |
+  | 256 | 99.89% / 99.89% / 99.89% | 99.89% | 128% / 100.00% |
+  | 512 | 99.87% / 99.87% / 99.87% | 99.87% | 140% / 100.00% |
+  | 1024 | 99.89% / 99.89% / 99.89% | 99.89–99.90% | 148% / 100.00% |
+  | 1280 | 99.88% / 99.88% / 99.88% | 99.88–99.89% | 149% / 100.00% |
+  | 1518 | 99.88% / 99.88% / 99.88% | 99.88% | 150% / 100.00% |
+
+  - **Same rates as `basic_fix`**, and lossless: in every paced run and at 64 B, generated = transmitted = received
+    with no TM drop. In the saturating runs the TM dropped exactly the excess.
+  - **The window totals count exactly at line rate.** Over the 27 runs (13.1 billion packets), the pipe-1 total
+    grew by the generated packets and the pipe-0 total by the looped-back ones. The bytes grew by the IPv4 length
+    each (mod 2³²), and every packet was tracked (one flow).
+- **Timer** (`perf/tools/sw_window_timer.py`, build `-DTIMER_PORT=196`): the generator's 500 ms timer advanced the
+  window 40 times in 20 s, 0.4999 s apart as polled (min 0.4983, max 0.5025). No tick was counted as traffic.
+- **The 109 captures** (PC1.md, part 6), with the markers at the capture's window boundaries:
+  - **102 rows match all 135 non-duration columns of the published row.** All 96 calm captures match, against 61
+    on `basic_fix` and 63 on `basic_gtot_ba`. 6 of the 11 that overload `basic_fix` match too.
+  - No window was read late, and no packet fell outside the 41 markers. A window's read took at most 56 ms.
+  - The 7 others:
+    - **Two bulk uploads:** their frames over the MTU cannot be replayed, the replay's limit.
+    - **Five floods with more distinct flows than slots:**
+
+      | Capture | Packets of flows without a slot |
+      |---|---|
+      | Chaos | 1,930 |
+      | syn_fan_40k | 363 |
+      | udp_fan_60k | 98 |
+      | syn_fan_100k | 35,194 |
+      | syn_fan_150k | 83,936 |
+
+      Their packet, byte and flag totals stay exact, and so do the directions in syn_fan_40k and udp_fan_60k. In
+      the other three, the B→A packets of flows without a slot count as A→B. syn_fan_100k and syn_fan_150k have
+      99,639 and 149,423 distinct flows, more than any single-stage register on Tofino 1 holds per flow.
+  - **Durations come from the switch's clock** (65.536 µs units): median relative error 4.5·10⁻⁵, at most 17% on
+    short flows, from the replay's timing.
+- The switch runs `basic_fix` again (checked with a replay, 9 of 9 packets).
+
 ## 6. Switch CPU side
 
 These two measurements cover the switch CPU and its driver, not the P4 program. The P4

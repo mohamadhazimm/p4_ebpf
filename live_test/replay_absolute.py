@@ -11,6 +11,13 @@ add up, and the start can be placed on the collector's window grid: inside a hyb
 scenario HYBRID_T0 holds the window origin, and the run's anchor (A seconds after the first
 frame) is put on the start of collector window K: start = HYBRID_T0 + K x window - A.
 
+--markers (perf/variants/exact): a window marker frame (EtherType 0x88B5, magic 0x5745, the epoch of
+the window it starts) is sent at each window boundary of the capture, --marker-anchor-us + k x
+--marker-window-us for k = 0..--marker-windows, carrying epoch --marker-first-epoch + k. It goes in
+order with the capture's frames, before every frame whose whole-microsecond time is at or after the
+boundary (the window rule of features/switch_model.py), so the switch's windows are the capture's
+windows whatever the replay's timing. The schedule then starts at the first marker.
+
 Needs root (a raw packet socket). Frames the interface refuses (larger than its MTU) are counted
 as failed and skipped, as tcpreplay does. Prints one line of statistics at the end.
 """
@@ -18,12 +25,54 @@ import argparse
 import os
 import socket
 import statistics
+import struct
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from replay_capture import read_pcap  # noqa: E402
+
+
+WINDOW_ETHERTYPE = 0x88B5
+WINDOW_MAGIC = 0x5745
+
+
+def read_pcap_us(path):
+    """(whole microseconds, frame) of every record, as features/switch_model.py times them."""
+    out = []
+    with open(path, "rb") as f:
+        head = f.read(24)
+        order, digits = {b"\xd4\xc3\xb2\xa1": ("<", 6), b"\xa1\xb2\xc3\xd4": (">", 6),
+                         b"\x4d\x3c\xb2\xa1": ("<", 9), b"\xa1\xb2\x3c\x4d": (">", 9)}[head[:4]]
+        rec = struct.Struct(order + "IIII")
+        while True:
+            h = f.read(16)
+            if len(h) < 16:
+                break
+            sec, frac, incl, _ = rec.unpack(h)
+            out.append((sec * 1000000 + (frac if digits == 6 else frac // 1000), f.read(incl)))
+    return out
+
+
+def marker_frame(src_mac, epoch):
+    frame = b"\xff" * 6 + src_mac + struct.pack("!HHI", WINDOW_ETHERTYPE, WINDOW_MAGIC, epoch)
+    return frame + b"\x00" * (60 - len(frame))
+
+
+def with_markers(path, src_mac, anchor_us, window_us, windows, first_epoch):
+    """[(seconds, frame, is_marker)] in sending order: the capture's frames and the window markers."""
+    frames = read_pcap_us(path)
+    events, k, i = [], 0, 0
+    while i < len(frames) or k <= windows:
+        boundary = anchor_us + k * window_us
+        if k <= windows and (i >= len(frames) or frames[i][0] >= boundary):
+            events.append((boundary / 1e6, marker_frame(src_mac, first_epoch + k), True))
+            k += 1
+        else:
+            events.append((frames[i][0] / 1e6, frames[i][1], False))
+            i += 1
+    return events
 
 
 def main():
@@ -36,8 +85,23 @@ def main():
     ap.add_argument("--anchor-offset", type=float, default=1.0)
     ap.add_argument("--window-sec", type=float, default=1.0)
     ap.add_argument("--spin", type=float, default=0.001, help="busy-wait this long before each frame instead of sleeping")
+    ap.add_argument("--markers", action="store_true", help="send window markers (perf/variants/exact)")
+    ap.add_argument("--marker-anchor-us", type=int, help="the capture time of the first window's start (us)")
+    ap.add_argument("--marker-window-us", type=int, default=500000)
+    ap.add_argument("--marker-windows", type=int, default=40, help="windows: markers 0..N, the last one ends window N-1")
+    ap.add_argument("--marker-first-epoch", type=int, default=1)
     args = ap.parse_args()
-    frames = read_pcap(args.capture)
+    if args.markers:
+        if args.marker_anchor_us is None:
+            sys.exit("--markers needs --marker-anchor-us")
+        mac = bytes.fromhex(Path("/sys/class/net/%s/address" % args.iface).read_text().strip().replace(":", ""))
+        events = with_markers(args.capture, mac, args.marker_anchor_us, args.marker_window_us,
+                              args.marker_windows, args.marker_first_epoch)
+        frames = [(t, f) for t, f, _ in events]
+        is_marker = [m for _, _, m in events]
+    else:
+        frames = read_pcap(args.capture)
+        is_marker = [False] * len(frames)
     if not frames:
         sys.exit("%s holds no frames" % args.capture)
     if args.start_at is not None:
@@ -53,8 +117,8 @@ def main():
     if late_start > 0:
         print("[replay_absolute] WARNING: started %.3f s after the requested start; frames until then go out at once"
               % late_start, flush=True)
-    late, failed = [], 0
-    for t, frame in frames:
+    late, failed, markers_sent = [], 0, 0
+    for (t, frame), marker in zip(frames, is_marker):
         target = start + (t - c0)
         gap = target - time.time()
         if gap > args.spin:
@@ -64,13 +128,19 @@ def main():
         try:
             sock.send(frame)
         except OSError:
+            if marker:
+                sys.exit("[replay_absolute] the window marker could not be sent")
             failed += 1
+            continue
+        if marker:
+            markers_sent += 1
             continue
         late.append(time.time() - target)
     sock.close()
     late.sort()
-    print("[replay_absolute] %d frames sent, %d failed, in %.2f s; lateness median %.3f ms, p99 %.3f ms, max %.3f ms"
-          % (len(late), failed, frames[-1][0] - c0, statistics.median(late) * 1e3 if late else 0.0,
+    print("[replay_absolute] %d frames sent, %d failed, %d window markers, in %.2f s; lateness median %.3f ms, "
+          "p99 %.3f ms, max %.3f ms"
+          % (len(late), failed, markers_sent, frames[-1][0] - c0, statistics.median(late) * 1e3 if late else 0.0,
              late[int(0.99 * (len(late) - 1))] * 1e3 if late else 0.0, late[-1] * 1e3 if late else 0.0), flush=True)
 
 

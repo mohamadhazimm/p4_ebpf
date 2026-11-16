@@ -1273,3 +1273,118 @@ replaces part 4f's file of the same name (six rows from `gtot_ba`, 103 from `gto
 windows inside the bounds); `enp5s0` down. `live_test/committee_replay/pc1_20261116_gtot_ba_all.tar.xz`: the 103
 runs (part 4f's six are in `pc1_20261116_gtot_ba.tar.xz`), `rows.csv` and `rerun.log` of all 109,
 `gtot_ba_all_compare.csv`, `replay_rows_gtot_ba.csv`, the scripts, the setup logs.
+
+## Results, part 6 (PC1, 2026-11-16): the exact build, every window feature in the data plane
+
+The user asked for P4 code with no leak and no drop. p4_perf.md section 5.7 has the program, its compile, latency,
+line rate and the window clock from the packet generator; this part has the analysis behind it and the replays.
+
+**Where the rows of part 4g still differed from the published ones** (offline, `perf/results/exact_gap_analysis/`):
+- A Python 3.8 copy of `features/switch_model.py` on the 110 captures reproduces all 110 published rows.
+- **`basic_fix`'s design with ideal reads and ideal cuts** would match all 135 non-duration columns in 89 of the
+  110. Two things cost the rest:
+  - **Shared buckets** in 4 floods (syn_fan_40k/100k/150k, Chaos).
+  - **Ethernet padding** in 21 captures. The dataset counts frames as the guest's capture saw them: 27,813
+    received frames padded to 60 B, all toward 10.0.0.10; 40,395 sent 54 B frames unpadded. IPv4 totalLen + 14
+    misses the padding, and the wire length would add it to the sent frames too.
+- **The parser:** no VLAN tag, IPv4 option or fragment occurs in the dataset, so its differences from the model
+  cost nothing here.
+- **On the switch, three more causes add to these:**
+  - each window's cut lands a few ms after its boundary, later when the collector falls behind;
+  - the replay runs late in floods;
+  - the reads cover only part of the active buckets under overload.
+
+**The fix: `perf/variants/exact/`.**
+- **Windows** are switched by an in-band marker into one of two banks, so every window is cut at one point for
+  all registers.
+- **Flows** are tracked exactly: 4 ways × 16,384 slots with a 32-bit signature, keyed on the ordered endpoints, and
+  direction comes from the first packet's (address, port).
+- **All 29 features** are computed per window in the data plane, so a flood can no longer force sampling.
+- **`frame_len`** counts the frame minimum toward the guest.
+- **The parser** matches the model's.
+
+New code:
+- `window_reader.py` reads one window in 51 cells, and `window_features.py` rebuilds the features from them.
+- `exact_model.py` is a software model of the program.
+- `replay_absolute.py --markers` puts a marker at each of the 41 window boundaries, in order with the frames.
+- `live_test/exact_replay.py` drives one run, and `perf/results/exact_replay/scripts/run_exact.py` drives all of
+  them.
+
+`tests/test_exact_windows.py` checks the model and `window_features.py` against `switch_model.py` window by window
+on random traffic: both directions, padded frames, flows returning after the TTL, swapped port pairings, equal
+ports, a flow to itself, and a full table.
+
+**The replays.**
+- **Switch:** `basic_fix` stopped, `basic_exact` started in `hz_sw`; ports and forwarding from `run_bfrt.sh setup`
+  (`setup_exact/`).
+- **Runs:** all 109 captures (`bulkup_700` skipped as in part 4), 07:38–08:27 on PC1's clock, 25 s each, into
+  `perf/results/exact_replay/runs/`.
+- **Each run:**
+  1. reset all registers over gRPC (0.12 s);
+  2. install the `frame_len` entry for 10.0.0.10;
+  3. follow the window clock on the switch;
+  4. replay the capture at its recorded times with the markers, epochs 1–41;
+  5. rebuild windows 1–40 and summarize them as the release does.
+
+| | basic_fix | gtot_ba | exact |
+|---|---|---|---|
+| **calm (96)**: all 135 non-duration columns equal to the published row | 61 | 63 | **96** |
+| calm: 95 total-based columns equal (mean) | 81.2 | 82.7 | **95.0** |
+| **overloaded on basic_fix (11)**: all 135 equal | 0 | 0 | **6** |
+| overloaded: 135 columns equal (mean) | 16.6 | 49.5 | **115.5** |
+| bulkup_200/400 (frames over the MTU): 135 columns equal (mean) | 46.5 | 45.5 | 71.0 |
+| **all 109**: all 135 equal | 61 | 63 | **102** |
+| all 109: 95 total-based columns equal (mean) | 73.1 | 77.8 | **92.8** |
+
+- **No leak:**
+  - No window was read after its bank was reused.
+  - No packet fell outside the markers: window 0 held none.
+  - A window's read took at most 56 ms, of a 500 ms deadline.
+- **What is left:**
+  - **Five floods with more distinct flows than the 65,536 slots.** Their totals are exact, and their packets
+    without a slot are counted and reported per window (net_untracked_pkts):
+
+    | Capture | Packets without a slot | 135 columns equal |
+    |---|---|---|
+    | Chaos (d538053a) | 1,930 | 71 |
+    | syn_fan_40k | 363 | 120 |
+    | udp_fan_60k | 98 | 123 |
+    | syn_fan_100k | 35,194 | 70 |
+    | syn_fan_150k | 83,936 | 77 |
+
+    In Chaos and the 100k/150k fans, the B→A packets of those flows count as A→B. 2^15 slots per way did not
+    compile (bf-p4c internal error), and the 100k/150k fans have more distinct flows (99,639, 149,423) than any
+    single-stage register on Tofino 1 holds per flow.
+  - **bulkup_200/400:** their GSO frames over 1514 B cannot be sent, the replay's limit as in part 4.
+  - **Durations** come from the switch's clock: median relative error 4.5·10⁻⁵, at most 17% on short flows.
+    The release's notes already treat the switch's durations as information only.
+- **The marker method:** the switch is told the capture's window boundaries in band, so these rows test what the
+  program computes, independent of the replay's timing.
+  - In deployment the packet generator's timer switches the windows; p4_perf 5.7 shows it at 500 ms, 40 ticks in
+    20 s.
+  - The rows for the thesis could be `perf/results/exact_replay/replay_rows_exact.csv` (the method stated), or
+    part 4g's `replay_rows_gtot_ba.csv` (timer-like windows from the replay's timing). The user decides.
+- **Not supported by this build:** the socket-level join of the live end-to-end test needs the per-flow counters
+  of `basic_fix`, which this build drops. `basic_fix` stays the build for that test.
+
+**Latency, line rate, timer** (p4_perf 5.7):
+- **Latency:** median 421 ns against 315 ns for `basic_fix` (+106 ns, 11 ingress stages against 5).
+- **Line rate:** the same as `basic_fix` and lossless. The window totals counted all 13.1 billion generated
+  packets exactly.
+- **Timer:** works (build `basic_exact_timer`).
+
+**Incident:** the first latency attempt found switchd failing to start for every build, `basic_fix` too: "Error
+Getting the Board info from BMC". The BMC's REST service (port 8080 over `usb0`) refused connections for about 3
+minutes, then came back by itself. The rerun worked (`console_bmc_down.txt`). A second attempt measured nothing
+because I passed the root wrapper as a relative path (`failed_relative_asroot/`).
+
+**Disk:** apt's cache had grown back to 362 MB (automatic updates), so `apt-get clean` again: 744 MB free.
+
+**State after:**
+- **Switch:** `basic_fix` running again (pid 22204 in `hz_sw`), ports 132/140, forwarding and mirror set by
+  `hwl_runs.sh`'s restore (`latency_exact_20261116/setup_basic_fix_restored/`); `enp5s0` down.
+- **Check:** the first cohort capture, 9 / 9 packets, 40 of 40 windows inside the bounds
+  (`committee_replay/restored_check_exact/`).
+- **Archive:** `live_test/committee_replay/pc1_20261116_exact.tar.xz` holds the runs (reads, windows, rows,
+  summaries, logs), `exact_compare.csv`, `replay_rows_exact.csv`, the offline analysis, the build records, the
+  latency, line rate and timer results, and the scripts.
