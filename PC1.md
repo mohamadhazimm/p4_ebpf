@@ -1543,3 +1543,92 @@ mixed_exact        benign           0.92     0.22    0.54   74/235              
   `committee_replay/restored_check_6c/`); `enp5s0` down.
 - **Archive:** `live_test/committee_replay/pc1_20261116_exact_live.tar.xz` holds the runs (CSV, timing,
   collector and host-monitor logs, without the eth1 captures), the rows, the scores and the scripts.
+
+## Results, part 6d (PC1, 2026-11-16): the timer with traffic, and a second pipe
+
+The two paths of the exact build that had not run on the switch: windows from the generator's timer with traffic,
+and traffic in a second pipe. Results in `perf/results/exact_timer_traffic_20261116/` (scripts there).
+
+**How the tests run.**
+- **One gRPC client per program.** Only one client may bind the program, and an unbound client must name it in
+  every request. While `window_reader.py --follow` holds the binding, `sw_window_timer.py` and `sw_pktgen_run.py`
+  now work unbound. They have no other changes in behaviour.
+- **`sw_window_timer.py --pipes 0,1`** enables the timer app of each pipe's generator, one after the other,
+  0.7-1.0 ms apart.
+- **`replay_absolute.py --send-log`** writes this host's time just after each frame was sent.
+- **Generator traffic in pipe 0:** `sw_pktgen_run.py --pipe 0`, one UDP flow at 0.01% of line rate (14.9 kpps)
+  for 9.1 s. The sink port loops each frame back into pipe 0, so pipe 0 counts every packet twice. The count
+  to check against is the generator's own figure for the run (`window_delta`).
+
+**1. Timer windows with traffic** (`basic_exact_v3_timer`; timers on both pipes; captures replayed into port
+132, pipe 1, with no markers; `run_timer.py`, `analyse.py`):
+- **The reader as it was found a fault.**
+  - The two pipes' ticks are about 1 ms apart, and the reader read each window as soon as the first pipe had
+    ticked. In 15 of 47 windows of slowloris_500 only pipe 0 had ticked, so these windows were marked lost
+    (`t1a_before/`).
+  - Window 15 was not marked, yet it held 8,589,930,205 packets. A window is the difference of two reads of
+    its bank, and that bank had last been read with the other set of pipes.
+  - The flow features rebuilt from these windows were wrong too.
+- **Fixed in `window_reader.py` and `window_features.py`:**
+  - Once the clock has passed window e, the reader waits up to 50 ms (`--pipe-grace-ms`) for every pipe that
+    has reached e to pass it. A pipe further behind is not waited for.
+  - A window whose bank was last read with another set of pipes is marked lost. After a change of the set,
+    that is the next window of each bank.
+  - A pipe's unclocked count restarts when it lags again.
+  - `net_window_lost` also marks the 3 windows after a lost one, whose flow features are rebuilt from it.
+  - 5 new unit tests.
+- **With the fix:**
+
+  | Run | Windows | Lost | Pipes combined | Packets switch / sent | Exact windows (27 non-duration features) |
+  |---|---|---|---|---|---|
+  | slowloris_500 (`t1a/`) | 47 | 0 | both, every window | 11,087 / 11,087 | 47 of 47 (17 with flows) |
+  | session_1000 (`t1a_session1000/`) | 35 | 0 | both, every window | 12,000 / 12,000 | 35 of 35 (26 with flows) |
+
+  - **Where the windows cut the stream.** Each window boundary falls between two sent frames: the switch's
+    cumulative window counts say which frames, and the send log says when they were sent. One tick every
+    0.5000168 s fits all 35 cut points of slowloris_500, with a 77 µs margin, the tightest gap. Every tick is
+    where a periodic timer puts it. The fitted period is 15-34 ppm off 0.5 s, the rate difference between
+    PC1's clock and the switch's.
+  - **Features:** the frames so cut, through the dataset's model (the unit tests' `reference_windows`), give
+    the switch's windows exactly. That includes the flows' ageing over the 3-window TTL, as 517 flows fall to
+    0 after the first burst.
+  - **The ticks themselves:** none counted as traffic; ticks 0.5000 s apart (0.4970-0.5032 as polled); pipe 1's
+    ticks as polled at most 3.4 ms after pipe 0's.
+- **Traffic in both pipes** (`t1b/`; session_1000 plus the generator in pipe 0):
+  - 55 windows, none lost, both pipes combined in every window, no unclocked packet.
+  - The windows hold 282,124 packets: the replay's 12,000 plus the 270,124 pipe 0 counted (135,062 generated,
+    each counted twice).
+
+**2. A second pipe with markers** (`basic_exact_v3`, slowloris_500 through `exact_replay.py`, markers from port
+132; `run_pipe0.py`):
+- Pipe 0 had no marker port, so its clock stayed at 0 and only pipe 1 was combined in all 41 reads.
+- The generator in pipe 0 sent 135,044 packets, which pipe 0 counted twice: 270,088. The reader reported
+  exactly 270,088 as unclocked, in windows 4-22 while the generator ran. None was counted in a window.
+- No window lost, no untracked packet. The row equals the published one in all 135 non-duration columns, as in
+  part 6.
+
+**The generator in pipe 0.** The first two attempts sent next to nothing (`t2_port69_nosend/`,
+`t2_port68_after_stall/`):
+- Port 69, enabled while port 68 of that pipe was not a generator port, sent 4 packets.
+- After that, pipe 0's generator sent nothing from any port or app: 1 packet, then none, in later tries.
+- A switchd restart cleared it.
+- The timer runs used port 69 while the timer held port 68, and that works. This is probably also why port 71
+  never ticked in part 6b.
+- `sw_pktgen_run.py`'s help now says so.
+
+**Not changed:** the P4 code (one comment), the builds, the collector. The collector still has no timer mode:
+with the timer, `window_reader.py --follow` reads the windows. The live hybrid runs keep CPU-port markers, which
+fix the windows to the host's.
+
+**Unit tests:** 206 run, the same single known error (`test_sockjoin`: the release's Python 3.9 dict syntax on
+PC1's 3.8); `test_exact_windows.py` has 21 tests (16 before).
+
+**State after:**
+- **Switch:** `basic_fix` running again (pid 768), ports and forwarding from `setup_basic_fix_restored/`.
+- **Check:** the first cohort capture gave 9 of 9 packets and 40 of 40 windows inside the bounds
+  (`exact_timer_traffic_20261116/restored_check/`).
+  - The first try counted 0: `basic_fix` reports through the CPU port, and `enp5s0` comes back down after a
+    restart.
+  - It was brought up for the check and set down again afterwards.
+- **Archive:** `live_test/committee_replay/pc1_20261116_exact_timer.tar.xz` holds the runs (reads, send logs,
+  timer and generator reports, analyses) and the scripts.

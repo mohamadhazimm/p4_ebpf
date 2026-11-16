@@ -5,6 +5,13 @@
                                [--flow-index N] [--sink-port 0] [--pipe 1]
     python2.7 sw_pktgen_run.py OUT_JSON --prog basic --cleanup
 
+--first-local-port P (default 68) and --buffer-offset B (default 0) move the apps to local ports P, P+1, ...
+(app ids 2*(P-68), ...) and the frame to byte B of the packet buffer, so that they can run beside the window
+timer of perf/variants/exact (sw_window_timer.py: app 0, local port 68, buffer offset 0). Observed on the Wedge
+(PC1.md part 6d): a port other than 68 sends only while port 68 of the same pipe is a generator port too. Port 69
+enabled alone sent 4 packets, and that pipe's generator then sent nothing from any port until switchd was
+restarted.
+
 The generator of pipe PIPE sends, with --apps N timer apps in parallel (app ids
 0, 2, ..., on pipe-local ports 68, 69, ..., dev_port 128*PIPE+68+i), one
 UDP flow (10.99.7.1:7000 -> 10.99.7.2:7001) of SIZE-byte frames (FCS included)
@@ -90,6 +97,8 @@ def main():
     ap.add_argument("--flow-index", type=int, default=-1)
     ap.add_argument("--rate-pct", type=float, default=0.0)
     ap.add_argument("--apps", type=int, default=1)
+    ap.add_argument("--first-local-port", type=int, default=68)
+    ap.add_argument("--buffer-offset", type=int, default=0, help="a multiple of 16")
     ap.add_argument("--client-id", type=int, default=9)
     ap.add_argument("--cleanup", action="store_true")
     ap.add_argument("--global-totals", action="store_true",
@@ -102,13 +111,21 @@ def main():
                          "the looped-back ones, the bytes by the IPv4 lengths (mod 2^32); 'tracked' are the "
                          "packets of flows with a slot (found 1)")
     a = ap.parse_args()
-    apps = [(2 * i, 68 + i, 128 * a.pipe + 68 + i) for i in range(a.apps)]   # (app_id, local port, dev_port)
+    lp0 = a.first_local_port
+    apps = [(2 * (lp0 - 68 + i), lp0 + i, 128 * a.pipe + lp0 + i) for i in range(a.apps)]   # (app_id, local, dev_port)
     out = {"prog": a.prog, "size": a.size, "pipe": a.pipe, "apps": apps, "sink_port": a.sink_port,
            "flow": [SRC_IP, DST_IP, SPORT, DPORT, 17], "errors": [], "steps": []}
 
     c = gc.ClientInterface("127.0.0.1:50052", client_id=a.client_id, device_id=0, perform_subscribe=True)
     info = c.bfrt_info_get(a.prog)
-    c.bind_pipeline_config(a.prog)
+    KW = {}
+    try:
+        c.bind_pipeline_config(a.prog)
+    except Exception as e:
+        # another client (window_reader.py --follow) owns the program: work unbound, naming it in every request
+        if "already owns" not in str(e) and "ALREADY_EXISTS" not in str(e):
+            raise
+        KW = {"p4_name": a.prog}
     t_all = gc.Target(device_id=0, pipe_id=0xffff)
     t_pipe = gc.Target(device_id=0, pipe_id=a.pipe)
     port_cfg = info.table_get("$PKTGEN_PORT_CFG")
@@ -129,7 +146,7 @@ def main():
             return False
 
     def get_dict(tbl, target, key, from_hw=True):
-        for data, _ in tbl.entry_get(target, [key], {"from_hw": from_hw}):
+        for data, _ in tbl.entry_get(target, [key], {"from_hw": from_hw}, **KW):
             return data.to_dict()
         return {}
 
@@ -147,15 +164,15 @@ def main():
     def app_set(enable):
         for k in k_app:
             app_cfg.entry_mod(t_pipe, [k], [app_cfg.make_data(
-                [gc.DataTuple("app_enable", bool_val=enable)], "$PKTGEN_TRIGGER_TIMER_PERIODIC")])
+                [gc.DataTuple("app_enable", bool_val=enable)], "$PKTGEN_TRIGGER_TIMER_PERIODIC")], **KW)
 
     if a.cleanup:
         step("app disable", lambda: app_set(False))
         for kg, kf in zip(k_gen, k_fwd):
             step("pktgen port disable", lambda: port_cfg.entry_mod(
-                t_all, [kg], [port_cfg.make_data([gc.DataTuple("pktgen_enable", bool_val=False)])]))
-            step("forwarding delete", lambda: fwd.entry_del(t_all, [kf]))
-        step("sink port delete", lambda: port_tbl.entry_del(t_all, [k_sink]))
+                t_all, [kg], [port_cfg.make_data([gc.DataTuple("pktgen_enable", bool_val=False)])], **KW))
+            step("forwarding delete", lambda: fwd.entry_del(t_all, [kf], **KW))
+        step("sink port delete", lambda: port_tbl.entry_del(t_all, [k_sink], **KW))
         print("HZJSON " + json.dumps(out, sort_keys=True))
         json.dump(out, open(a.out, "w"), indent=2, sort_keys=True)
         return
@@ -166,7 +183,7 @@ def main():
             gc.DataTuple("$SPEED", str_val="BF_SPEED_100G"), gc.DataTuple("$FEC", str_val="BF_FEC_TYP_RS"),
             gc.DataTuple("$AUTO_NEGOTIATION", str_val="PM_AN_FORCE_DISABLE"),
             gc.DataTuple("$LOOPBACK_MODE", str_val="BF_LPBK_MAC_NEAR"),
-            gc.DataTuple("$PORT_ENABLE", bool_val=True)])]))
+            gc.DataTuple("$PORT_ENABLE", bool_val=True)])], **KW))
     t0 = time.time()
     while time.time() - t0 < 20:
         d = get_if_present(port_tbl, t_all, k_sink)
@@ -181,9 +198,9 @@ def main():
     # Forwarding entry: generator port -> sink.
     d_fwd = fwd.make_data([gc.DataTuple("port", a.sink_port)], "Ingress.send_using_port")
     for kf in k_fwd:
-        if not step("forwarding add", lambda: fwd.entry_add(t_all, [kf], [d_fwd])):
+        if not step("forwarding add", lambda: fwd.entry_add(t_all, [kf], [d_fwd], **KW)):
             out["errors"].pop()
-            step("forwarding mod", lambda: fwd.entry_mod(t_all, [kf], [d_fwd]))
+            step("forwarding mod", lambda: fwd.entry_mod(t_all, [kf], [d_fwd], **KW))
 
     # Generator: port, packet buffer, timer app (disabled until the run starts).
     frame = udp_frame(a.size)
@@ -198,24 +215,25 @@ def main():
                 "paced_rate_mpps": round(a.apps * n_pkts / (timer_ns * 1e-9) / 1e6, 4) if a.rate_pct > 0 else None})
     for kg in k_gen:
         step("pktgen port enable", lambda: port_cfg.entry_mod(
-            t_all, [kg], [port_cfg.make_data([gc.DataTuple("pktgen_enable", bool_val=True)])]))
-    k_buf = pkt_buf.make_key([gc.KeyTuple("pkt_buffer_offset", 0), gc.KeyTuple("pkt_buffer_size", len(frame) - 6)])
+            t_all, [kg], [port_cfg.make_data([gc.DataTuple("pktgen_enable", bool_val=True)])], **KW))
+    k_buf = pkt_buf.make_key([gc.KeyTuple("pkt_buffer_offset", a.buffer_offset),
+                              gc.KeyTuple("pkt_buffer_size", len(frame) - 6)])
     d_buf = pkt_buf.make_data([gc.DataTuple("buffer", frame[6:])])
-    if not step("pkt buffer add", lambda: pkt_buf.entry_add(t_pipe, [k_buf], [d_buf])):
+    if not step("pkt buffer add", lambda: pkt_buf.entry_add(t_pipe, [k_buf], [d_buf], **KW)):
         out["errors"].pop()
-        step("pkt buffer mod", lambda: pkt_buf.entry_mod(t_pipe, [k_buf], [d_buf]))
+        step("pkt buffer mod", lambda: pkt_buf.entry_mod(t_pipe, [k_buf], [d_buf], **KW))
     for (aid, local, dp), ka in zip(apps, k_app):
         d_app = app_cfg.make_data([
             gc.DataTuple("timer_nanosec", timer_ns), gc.DataTuple("app_enable", bool_val=False),
-            gc.DataTuple("pkt_len", len(frame) - 6), gc.DataTuple("pkt_buffer_offset", 0),
+            gc.DataTuple("pkt_len", len(frame) - 6), gc.DataTuple("pkt_buffer_offset", a.buffer_offset),
             gc.DataTuple("pipe_local_source_port", local), gc.DataTuple("increment_source_port", bool_val=False),
             gc.DataTuple("batch_count_cfg", 0), gc.DataTuple("packets_per_batch_cfg", n_pkts - 1),
             gc.DataTuple("ibg", 0), gc.DataTuple("ibg_jitter", 0), gc.DataTuple("ipg", 0), gc.DataTuple("ipg_jitter", 0),
             gc.DataTuple("batch_counter", 0), gc.DataTuple("pkt_counter", 0), gc.DataTuple("trigger_counter", 0)],
             "$PKTGEN_TRIGGER_TIMER_PERIODIC")
-        if not step("app %d add" % aid, lambda: app_cfg.entry_add(t_pipe, [ka], [d_app])):
+        if not step("app %d add" % aid, lambda: app_cfg.entry_add(t_pipe, [ka], [d_app], **KW)):
             out["errors"].pop()
-            step("app %d mod" % aid, lambda: app_cfg.entry_mod(t_pipe, [ka], [d_app]))
+            step("app %d mod" % aid, lambda: app_cfg.entry_mod(t_pipe, [ka], [d_app], **KW))
 
     def snapshot():
         s = {"t": time.time()}
@@ -229,7 +247,7 @@ def main():
         per_app = []
         for ka in k_app:
             ap_d = {}
-            for data, _ in app_cfg.entry_get(t_pipe, [ka], {"from_hw": True}, d_get):
+            for data, _ in app_cfg.entry_get(t_pipe, [ka], {"from_hw": True}, d_get, **KW):
                 ap_d = data.to_dict()
             per_app.append(dict((k, ap_d.get(k)) for k in ("pkt_counter", "batch_counter", "trigger_counter")))
         s["per_app"] = per_app

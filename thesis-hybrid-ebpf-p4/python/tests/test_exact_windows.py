@@ -9,6 +9,7 @@ import socket
 import struct
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from window_features import FEATURES, WindowFeatures  # noqa: E402
 from window_reader import WINDOW_REGS  # noqa: E402
 import replay_absolute  # noqa: E402
 import replay_capture  # noqa: E402
+import window_features  # noqa: E402
 import window_reader  # noqa: E402
 sys.path.insert(0, str(HERE.parents[2]))
 import hybrid_collector as hc  # noqa: E402
@@ -345,8 +347,11 @@ class FakeProgram:
         self.epochs = [0, 0]
         self.cells = {}               # (name, idx) -> per-pipe values
         self.after_clear = None
+        self.on_epochs = None         # called before each read of the clocks (a pipe that ticks a moment later)
 
     def pipe_epochs(self):
+        if self.on_epochs:
+            self.on_epochs()
         return list(self.epochs)
 
     def get(self, name, indexes, pair):
@@ -393,13 +398,93 @@ class WindowReaderChecksTest(unittest.TestCase):
         prog.epochs = [0, 4]
         self.assertTrue(r.read_window(3, prog.pipe_epochs())["lost"])   # its extremes may have been cleared
 
-    def test_a_change_of_the_clocked_pipes_loses_the_window(self):
+    def test_a_change_of_the_clocked_pipes_loses_the_next_window_of_each_bank(self):
+        # a window is the difference of two reads of its bank: both must combine the same pipes
         prog = FakeProgram()
         r = window_reader.WindowReader(prog)
+        for e in (1, 2):
+            prog.epochs = [0, e + 1]
+            self.assertFalse(r.read_window(e, prog.pipe_epochs())["lost"])
+        prog.epochs = [4, 4]                                   # pipe 0 is clocked from window 3 on
+        self.assertTrue(r.read_window(3, prog.pipe_epochs())["lost"])    # bank 1 last read with pipe 1 alone
+        prog.epochs = [5, 5]
+        self.assertTrue(r.read_window(4, prog.pipe_epochs())["lost"])    # bank 0 likewise
+        prog.epochs = [6, 6]
+        self.assertFalse(r.read_window(5, prog.pipe_epochs())["lost"])   # bank 1 read with both pipes twice
+        prog.epochs = [6, 7]                                   # pipe 0 falls behind again
+        self.assertTrue(r.read_window(6, prog.pipe_epochs())["lost"])
+        prog.epochs = [6, 8]
+        self.assertTrue(r.read_window(7, prog.pipe_epochs())["lost"])
+        prog.epochs = [6, 9]
+        self.assertFalse(r.read_window(8, prog.pipe_epochs())["lost"])
+
+    def test_a_pipe_that_ticks_a_moment_later_is_waited_for(self):
+        # the timer build: each pipe's generator ticks its own clock, about 1 ms apart
+        prog = FakeProgram()
+        r = window_reader.WindowReader(prog, grace_s=0.5)
+        calls = []
+
+        def tick_later():
+            calls.append(1)
+            if len(calls) == 3:
+                prog.epochs = [prog.epochs[1], prog.epochs[1]]
+        for e in range(4):
+            calls.clear()
+            prog.epochs = [e, e + 1]                           # pipe 1 has ticked, pipe 0 not yet
+            prog.on_epochs = tick_later
+            line = r.read_window(e, r.settle(e, prog.pipe_epochs()))
+            prog.on_epochs = None
+            self.assertEqual(line["clocked_pipes"], [0, 1])
+            self.assertFalse(line["lost"])
+
+    def test_a_pipe_far_behind_is_not_waited_for(self):
+        prog = FakeProgram()
+        r = window_reader.WindowReader(prog, grace_s=5.0)
+        prog.epochs = [0, 4]                                   # pipe 0 never clocked (markers into pipe 1)
+        t0 = time.time()
+        epochs = r.settle(3, prog.pipe_epochs())
+        self.assertLess(time.time() - t0, 0.5)
+        self.assertEqual(r.read_window(3, epochs)["clocked_pipes"], [1])
+
+    def test_a_pipe_that_stays_at_the_window_is_given_up_on_after_the_grace(self):
+        prog = FakeProgram()
+        r = window_reader.WindowReader(prog, grace_s=0.05)
+        prog.epochs = [3, 4]                                   # pipe 0's timer stopped at window 3
+        t0 = time.time()
+        epochs = r.settle(3, prog.pipe_epochs())
+        self.assertGreaterEqual(time.time() - t0, 0.05)
+        self.assertEqual(r.read_window(3, epochs)["clocked_pipes"], [1])
+
+    def test_a_pipe_counts_as_unclocked_only_while_it_lags(self):
+        prog = FakeProgram()
+        r = window_reader.WindowReader(prog)
+        prog.cells[("reg_w_tot", 3)] = [[5, 500], [0, 0]]
+        prog.epochs = [0, 1]
+        self.assertEqual(r.read_window(0, prog.pipe_epochs())["unclocked_pkts"], 0)   # the baseline
+        prog.cells[("reg_w_tot", 3)] = [[8, 800], [0, 0]]
         prog.epochs = [0, 2]
-        r.read_window(1, prog.pipe_epochs())
-        prog.epochs = [3, 3]
-        self.assertTrue(r.read_window(2, prog.pipe_epochs())["lost"])
+        self.assertEqual(r.read_window(1, prog.pipe_epochs())["unclocked_pkts"], 3)
+        prog.epochs = [3, 3]                                   # pipe 0 clocked: its packets count in windows
+        prog.cells[("reg_w_tot", 3)] = [[20, 2000], [0, 0]]
+        self.assertEqual(r.read_window(2, prog.pipe_epochs())["unclocked_pkts"], 0)
+        prog.cells[("reg_w_tot", 3)] = [[30, 3000], [0, 0]]
+        prog.epochs = [3, 4]                                   # behind again: a new baseline, not the old one
+        self.assertEqual(r.read_window(3, prog.pipe_epochs())["unclocked_pkts"], 0)
+        prog.cells[("reg_w_tot", 3)] = [[31, 3100], [0, 0]]
+        prog.epochs = [3, 5]
+        self.assertEqual(r.read_window(4, prog.pipe_epochs())["unclocked_pkts"], 1)
+
+    def test_a_lost_window_marks_the_windows_rebuilt_from_it(self):
+        lines = []
+        prog = FakeProgram()
+        r = window_reader.WindowReader(prog)
+        for e in range(9):
+            prog.epochs = [0, e + 1]
+            line = r.read_window(e, prog.pipe_epochs())
+            line["lost"] = e == 2
+            lines.append(line)
+        rows = window_features.window_rows(lines)
+        self.assertEqual([rows[e]["net_window_lost"] for e in range(9)], [0, 0, 1, 1, 1, 1, 0, 0, 0])
 
 
 class FollowerTest(unittest.TestCase):

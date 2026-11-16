@@ -12,7 +12,12 @@ of two reads of a bank.
 Pipes. Every pipe has its own registers and its own clock (a marker or a tick moves only the clock of the
 pipe it enters). A window's values are combined over the pipes whose clock has passed it (summed, the
 extremes by max); the packets that a pipe whose clock lags counted meanwhile are reported as
-"unclocked_pkts" (they belong to no window), and a window whose set of clocked pipes changed is "lost".
+"unclocked_pkts" (they belong to no window). Pipes ticked by their own generators (the timer build) do not
+tick at the same instant (about 1 ms apart on the Wedge), so once the clock has passed window e the reader
+waits up to --pipe-grace-ms for every pipe that has reached e to pass it too; a pipe further behind is not
+waited for. A window's additive values are the difference of two reads of its bank, so the difference is
+only right if both reads combined the same pipes: a window whose bank was last read with another set of
+clocked pipes is "lost" (after a change of the set, the next window of each bank).
 
     window_reader.py --reset                  clear every register of the program, read back a few cells
     window_reader.py --frame-min DST/PREFIX   frame_len: count packets toward DST as at least 46 B of IPv4
@@ -32,11 +37,13 @@ extremes by max); the packets that a pipe whose clock lags counted meanwhile are
                                               "follow": the line it read, once it has)
         {"cmd": "epoch"} / {"cmd": "quit"}
     window_reader.py --once                   the current epoch and the bank of the window before it
+                                              (reads and clears that window: not during a run)
 
 A window line: {"epoch", "bank", "regs": {register: {index: value or [lo, hi]}}, "epoch_seen" (the clock when
 the window was found finished), "epoch_after" (after the read and the clear), "lost" (the bank may hold
 another window's packets: the read came after window e + 2 started, or a late clear may have wiped this
-window's extremes, or the clocked pipes changed), "pipe_epochs", "clocked_pipes", "unclocked_pkts",
+window's extremes, or the bank was last read with other clocked pipes), "pipe_epochs", "clocked_pipes",
+"unclocked_pkts",
 "rejected_markers" (cumulative), "t" (this host's clock at the read), "read_ms", "clear_ms"}.
 
 Runs under Python 2.7 (the SDE 9.6 client on the switch) and 3. Self-contained: it is copied to the switch
@@ -190,17 +197,26 @@ class Program(object):
 class WindowReader(object):
     """Reads finished windows in order; keeps what the lost / unclocked checks need between reads."""
 
-    def __init__(self, prog, cpu_iface="enp5s0"):
+    def __init__(self, prog, cpu_iface="enp5s0", grace_s=0.05):
         self.prog = prog
         self.cpu_iface = cpu_iface
+        self.grace_s = grace_s
         self.tainted = set()          # windows whose extremes a late clear may have wiped
-        self.clocked = None           # the pipes counted in the windows so far
+        self.bank_pipes = {}          # bank -> the pipes combined at its previous read
         self.unclocked_prev = {}      # pipe -> packets of all its tot cells at the previous read
         self.sock = None
 
     def clock(self, epochs=None):
         """The clock: the most advanced pipe's epoch."""
         return max(epochs if epochs is not None else self.prog.pipe_epochs())
+
+    def settle(self, e, epochs):
+        """The clock has passed window e: wait (up to grace_s) for the pipes that have reached e to pass it too."""
+        deadline = time.time() + self.grace_s
+        while any(ep == e for ep in epochs) and time.time() < deadline:
+            time.sleep(0.0002)
+            epochs = self.prog.pipe_epochs()
+        return epochs
 
     def read_window(self, e, epochs):
         """Window e (finished: the clock is past it) from the pipes whose clock has passed it."""
@@ -209,10 +225,14 @@ class WindowReader(object):
         lost = self.clock(epochs) >= e + 2 or e in self.tainted
         self.tainted.discard(e)
         clocked = [p for p, ep in enumerate(epochs) if ep >= e + 1]
-        if self.clocked is not None and clocked != self.clocked:
+        before = self.bank_pipes.get(b)
+        if before is not None and clocked != before:
+            # the bank's previous read combined other pipes: the difference mixes them
             lost = True
-            log("window %d: clocked pipes %s, before %s" % (e, clocked, self.clocked))
-        self.clocked = clocked
+            log("window %d: clocked pipes %s, at the bank's previous read %s" % (e, clocked, before))
+        self.bank_pipes[b] = clocked
+        for p in clocked:
+            self.unclocked_prev.pop(p, None)
         t0 = time.time()
         regs = {}
         unclocked = 0
@@ -250,7 +270,7 @@ class WindowReader(object):
         while True:
             epochs = self.prog.pipe_epochs()
             if self.clock(epochs) > e:
-                return self.read_window(e, epochs)
+                return self.read_window(e, self.settle(e, epochs))
             if time.time() > deadline:
                 return {"epoch": e, "error": "the clock stayed at %d: window %d did not end within %.1f s"
                         % (self.clock(epochs), e, timeout), "pipe_epochs": list(epochs)}
@@ -379,6 +399,7 @@ def do_follow(prog, reader, until_epoch, poll_s):
         epochs = prog.pipe_epochs()
         cur = reader.clock(epochs)
         while nxt < cur and not STOP[0]:
+            epochs = reader.settle(nxt, epochs)
             print(json.dumps(reader.read_window(nxt, epochs), sort_keys=True))
             sys.stdout.flush()
             nxt += 1
@@ -405,6 +426,7 @@ class Follower(object):
             while True:
                 epochs = self.prog.pipe_epochs()
                 while self.nxt < self.reader.clock(epochs):
+                    epochs = self.reader.settle(self.nxt, epochs)
                     line = self.reader.read_window(self.nxt, epochs)
                     with self.cond:
                         self.lines[self.nxt] = line
@@ -486,11 +508,13 @@ def main():
     ap.add_argument("--serve", action="store_true")
     ap.add_argument("--until-epoch", type=int)
     ap.add_argument("--poll-ms", type=float, default=1.0)
+    ap.add_argument("--pipe-grace-ms", type=float, default=50.0,
+                    help="how long to wait for a pipe that has reached a finished window to pass it")
     ap.add_argument("--once", action="store_true")
     args = ap.parse_args()
     gc = import_client(args.sde_install)
     prog = Program(gc, args.grpc_addr, args.client_id, args.device_id, args.p4_name)
-    reader = WindowReader(prog, args.cpu_iface)
+    reader = WindowReader(prog, args.cpu_iface, args.pipe_grace_ms / 1e3)
     ports = None if args.marker_ports is None else [int(p) for p in args.marker_ports.split(",") if p.strip()]
     if args.reset or args.frame_min or ports is not None:
         print(json.dumps(setup(prog, args.reset, args.frame_min or None, ports)))

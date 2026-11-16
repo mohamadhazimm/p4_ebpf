@@ -6,8 +6,10 @@ clears them after the read). WindowFeatures.add() takes these lines in epoch ord
 window's features (the model's names), plus
     net_untracked_pkts    packets of flows that found no slot in the flow table (the window's flow
                           features are then not exact);
-    net_window_lost       the read came after the bank's next window had started, a late clear may have
-                          wiped the window's extremes, or the clocked pipes changed;
+    net_window_lost       this window's numbers may be wrong, or those of one of the TTL windows before it,
+                          which its flow features are rebuilt from: the reader marked that window lost (its
+                          read came after the bank's next window had started, a late clear may have wiped
+                          its extremes, or its bank was last read with other clocked pipes);
     net_unclocked_pkts    packets counted by a pipe whose clock lags (they belong to no window);
     net_rejected_markers  window markers from ports outside marker_ports since the window before.
 
@@ -59,6 +61,7 @@ class WindowFeatures:
         self.hist: Dict[int, Dict[str, Any]] = {}
         self.last_epoch: Optional[int] = None
         self.prev_rejected: Optional[int] = None
+        self.lost: set = set()                 # windows the reader marked lost (the last TTL of them)
 
     def window_registers(self, line: Dict[str, Any]) -> Dict[str, Any]:
         """The window's own values: differences of the additive registers, the extremes as read."""
@@ -154,7 +157,10 @@ class WindowFeatures:
             "net_ba_ratio_byte_delta": ba_b / size if size else 0.0,
         })
         out["net_untracked_pkts"] = tot.get(0, [0, 0])[0] + tot.get(1, [0, 0])[0]
-        out["net_window_lost"] = int(bool(line.get("lost")))
+        if line.get("lost"):
+            self.lost.add(e)
+        self.lost = {j for j in self.lost if j >= e - TTL}
+        out["net_window_lost"] = int(bool(self.lost))
         out["net_unclocked_pkts"] = int(line.get("unclocked_pkts") or 0)
         rejected = line.get("rejected_markers")
         out["net_rejected_markers"] = 0 if rejected is None or self.prev_rejected is None else \

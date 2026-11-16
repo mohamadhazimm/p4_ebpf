@@ -34,7 +34,7 @@ Then it reads one window at a time, either following the clock (`--follow`) or o
 |---|---|---|
 | Live collection: `hybrid_collector.py --switch-program exact --window-markers cpu` | The reader sends a marker from the CPU port at each of the collector's window boundaries, about 3 ms to take effect. | the CPU port, 192 |
 | Dataset replay: `replay_capture.py --exact`, or `live_test/exact_replay.py` | The replayer sends the markers in order with the capture's frames. | the replay host's port, 132 |
-| Deployment without a collector clock | Build with `-DTIMER_LOCAL_PORT=68` and start a timer app on the generator (`perf/tools/sw_window_timer.py`). | none |
+| Deployment without a collector clock | Build with `-DTIMER_LOCAL_PORT=68` and start a timer app on every pipe's generator, back to back (`perf/tools/sw_window_timer.py --pipes 0,1`; they then tick within about 1 ms of each other). The collector has no timer mode: `window_reader.py --follow` reads the windows. | none |
 
 A marker frame from any other port is dropped and counted (`rejected_markers`), so a monitored host
 cannot move the window clock.
@@ -52,11 +52,17 @@ cannot move the window clock.
 - **Every pipe has its own clock.**
   - A marker or a tick moves only the clock of the pipe it enters; the testbed's ports 132, 140 and 192 are all
     in pipe 1.
-  - The reader combines only the pipes whose clock has passed the window. It reports the packets of a lagging
-    pipe as `net_unclocked_pkts`, and marks a window lost if the set of clocked pipes changes.
-  - Traffic on two pipes needs a timer on each pipe, and their phases are not aligned.
+  - The reader combines only the pipes whose clock has passed the window, and reports the packets of a pipe
+    whose clock lags as `net_unclocked_pkts`. With markers from ports in pipe 1, the packets of every other
+    pipe are reported that way (tested: PC1.md part 6d).
+  - Traffic on two pipes needs a timer on each pipe. The timers' ticks are not simultaneous, so the reader
+    waits up to 50 ms (`--pipe-grace-ms`) for a pipe that has reached a window to pass it. Two timers started
+    back to back are about 1 ms apart: their windows are combined, and tested with traffic in both pipes.
+  - A window is the difference of two reads of its bank, so both reads must combine the same pipes. After a
+    change of the clocked pipes, the next window of each bank is marked lost.
 - **A window's read must finish before the window after the next one starts** (1 window of slack). A late
-  read, or a late clear of the extremes, marks the window lost (`net_window_lost`).
+  read, or a late clear of the extremes, marks the window lost. `net_window_lost` also marks the 3 windows
+  after a lost one, since their flow features are rebuilt from it.
 - **Number ranges:**
   - Window numbers are kept per flow in 16 bits (9 h of 0.5 s windows).
   - Times are 32-bit at 65.536 µs (78 h).

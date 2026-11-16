@@ -94,6 +94,8 @@ def main():
     ap.add_argument("--marker-window-us", type=int, help="default: --window-sec")
     ap.add_argument("--marker-windows", type=int, default=40, help="windows: markers 0..N, the last one ends window N-1")
     ap.add_argument("--marker-first-epoch", type=int, default=1)
+    ap.add_argument("--send-log", help="write this host's clock just after each capture frame was sent, one line per "
+                    "capture frame in order (\"-\" for a frame the interface refused); markers are not listed")
     args = ap.parse_args()
     if args.markers:
         window_us = args.marker_window_us or int(round(args.window_sec * 1e6))
@@ -136,6 +138,7 @@ def main():
         print("[replay_absolute] WARNING: started %.3f s after the requested start; frames until then go out at once"
               % late_start, flush=True)
     late, failed, markers_sent = [], 0, 0
+    sent_at = [] if args.send_log else None
     for (t, frame), marker in zip(frames, is_marker):
         target = start + (t - c0)
         gap = target - time.time()
@@ -149,12 +152,20 @@ def main():
             if marker:
                 sys.exit("[replay_absolute] the window marker could not be sent")
             failed += 1
+            if sent_at is not None:
+                sent_at.append(None)
             continue
         if marker:
             markers_sent += 1
             continue
-        late.append(time.time() - target)
+        now = time.time()
+        late.append(now - target)
+        if sent_at is not None:
+            sent_at.append(now)
     sock.close()
+    if sent_at is not None:
+        with open(args.send_log, "w") as fh:
+            fh.write("".join("-\n" if x is None else "%.6f\n" % x for x in sent_at))
     late.sort()
     print("[replay_absolute] %d frames sent, %d failed, %d window markers, in %.2f s; lateness median %.3f ms, "
           "p99 %.3f ms, max %.3f ms"

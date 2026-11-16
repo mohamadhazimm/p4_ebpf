@@ -44,9 +44,9 @@
 #define WAY_SLOTS (1 << WAY_BITS)
 
 /* The packet generator's local port whose timer packets tick the window clock, on any pipe (each pipe has its
- * own clock and its own generator): a deployment build sets -DTIMER_LOCAL_PORT=68 (tested on pipe 1, dev_port
- * 196; sw_window_timer.py). The default, 127, is no port: the line-rate tests' generator (sw_pktgen_run.py,
- * local ports 68-70) then sends traffic, and only window markers move the clock. */
+ * own clock and its own generator): a deployment build sets -DTIMER_LOCAL_PORT=68 (tested on both pipes with
+ * traffic, sw_window_timer.py --pipes 0,1; PC1.md part 6d). The default, 127, is no port: the line-rate tests'
+ * generator (sw_pktgen_run.py, local ports 68-70) then sends traffic, and only window markers move the clock. */
 #ifndef TIMER_LOCAL_PORT
 #define TIMER_LOCAL_PORT 127
 #endif

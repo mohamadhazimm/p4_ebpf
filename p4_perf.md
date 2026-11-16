@@ -781,6 +781,24 @@ and no flow should go unread under a flood. **Where the remaining errors came fr
   - **All 109 captures:** all 4,796 windows equal the frames the replayer sent between their markers, with no
     window lost. All 109 rows equal the standalone driver's in the 135 non-duration columns, and 102 equal the
     published row.
+- **The timer with traffic, and a second pipe** (PC1.md part 6d, `perf/results/exact_timer_traffic_20261116/`):
+  - **Timer windows:** `basic_exact_v3_timer` with a timer on each pipe's generator, the captures replayed
+    without markers. slowloris_500 and session_1000 give 47 and 35 windows: none lost, every packet counted, and
+    every window exact in the 27 non-duration features against the dataset's model on the frames as the
+    switch's windows cut them. The cut points fit one tick every 0.5 s, to within the two clocks' rate
+    difference.
+  - **Fault found and fixed:** the two pipes' timers tick about 1 ms apart, and the reader read each window as
+    soon as the first pipe had ticked. That marked 15 of 47 windows lost, and left one window unmarked with
+    8.6 billion packets. A window's bank had last been read with another set of pipes.
+    - The reader now waits up to 50 ms for a pipe that has reached the window, and marks lost the next window
+      of each bank after a change of pipes.
+    - `net_window_lost` also marks the 3 windows rebuilt from a lost one.
+  - **Two pipes combined:** with generator traffic in pipe 0 as well, the windows hold 282,124 packets, the
+    replay's 12,000 plus pipe 0's 270,124, with none lost and none unclocked.
+  - **A pipe without a clock:** with markers from port 132 (pipe 1), all 270,088 of pipe 0's packets were
+    reported as unclocked and none counted in a window. The capture's row still equals the published one.
+  - **Generator:** on the Wedge a generator port other than 68 sends only while port 68 of the same pipe is a
+    generator port too. Port 69 enabled alone stalled pipe 0's generator until switchd restarted.
 - The switch runs `basic_fix` again (checked with a replay, 9 of 9 packets).
 
 ## 6. Switch CPU side
@@ -1016,7 +1034,9 @@ Section 6 measures the switch CPU, not the P4 program, and can be left out.
   - **The flow table holds every flow of a run (65,536 slots, no aging).** A flow without a slot is counted in
     the totals and reported per window, but not in the flow features. 5 floods of the dataset exceed it.
   - **Every pipe has its own window clock.** The reader leaves out, and reports, the packets of a pipe whose
-    clock lags.
+    clock lags. With markers, only the pipe of the marker port has a clock. With a timer on each pipe, the
+    pipes are combined if their ticks are less than 50 ms apart; the timers started back to back are 1 ms
+    apart. The collector has no timer mode.
   - **A window must be read within one window of slack**, or it is marked lost.
   - **11 ingress stages:** 421 ns of latency against 315 ns.
   - **No per-flow counters**, so the live test's socket-level join still needs `basic_fix`.
