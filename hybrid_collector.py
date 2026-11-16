@@ -2798,6 +2798,9 @@ def main() -> None:
                  "no per-flow counters for the socket-level join")
     if exact and args.global_totals:
         ap.error("--global-totals is for the gtot test build; --switch-program exact computes the windows itself")
+    if exact and args.scope_ip:
+        ap.error("--scope-ip needs the CPU reports of --switch-program buckets (the 5-tuple that owns each bucket): "
+                 "perf/variants/exact keeps no per-flow rows to split by host")
     timer_mode = exact and args.window_markers == "timer"
     if args.sockowner and not args.hostmon_cgroup:
         ap.error("--sockowner needs --hostmon-cgroup: the socket-level join selects the flows of that cgroup")

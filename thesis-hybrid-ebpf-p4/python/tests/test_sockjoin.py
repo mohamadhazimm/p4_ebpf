@@ -231,3 +231,16 @@ class IpScopeTests(unittest.TestCase):
                                                       "--scope-ip", "10.0.0.11"])
         self.assertEqual(args.scope_ip, ["10.0.0.10", "10.0.0.11"])
         self.assertEqual(self.hc.scoped_csv_path("runs/w.csv", "10.0.0.11"), Path("runs/w.scoped-10.0.0.11.csv"))
+
+    def test_cli_refuses_the_exact_build(self):
+        # perf/variants/exact sends no CPU reports, so no bucket has an owner to split the rows by
+        import contextlib
+        import io
+        from unittest import mock
+        argv = ["hybrid_collector.py", "--mode", "command", "--scenario-name", "t", "--label", "benign",
+                "--command", "true", "--switch-program", "exact", "--scope-ip", "10.0.0.10"]
+        err = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit):
+                self.hc.main()
+        self.assertIn("--scope-ip needs the CPU reports", err.getvalue())

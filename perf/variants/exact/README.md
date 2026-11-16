@@ -69,4 +69,5 @@ cannot move the window clock.
   - A window's sum of flow durations must stay below 2^32 units (281,475 s).
   - Bytes per window per pipe must stay below 2^32.
 - **Durations come from the switch's clock**, in 65.536 µs units.
-- **No per-flow counters:** the socket-level join of the live test needs `basic_fix`.
+- **No per-flow counters or CPU reports:** the socket-level join of the live test and the host-level join
+  (`--scope-ip`) need `basic_fix`; the collector refuses both with `--switch-program exact`.
