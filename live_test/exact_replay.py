@@ -5,9 +5,10 @@
         [--switch-ssh root@172.168.1.2] [--iface eth1] [--frame-min 10.0.0.10/32] [--windows 40]
 
 The switch must run the exact build with its ports set up (forwarding 132 <-> 140). Steps:
- 1. window_reader.py --reset --frame-min ... on the switch: every register cleared, the frame_len
-    entry installed (packets toward the monitored host count at least the 60-byte frame minimum, as
-    its own capture saw them);
+ 1. window_reader.py --reset --frame-min ... --marker-ports ... on the switch: every register cleared,
+    the frame_len entry installed (packets toward the monitored host count at least the 60-byte frame
+    minimum, as its own capture saw them), and the replay host's port (--marker-port) made the only one
+    whose window markers count;
  2. window_reader.py --follow --until-epoch N+1 on the switch, its lines into DIR/reads.jsonl;
  3. live_test/replay_absolute.py --markers as root (ASROOT): the capture's frames at their recorded
     times with a window marker at each of the N+1 window boundaries from the anchor, epochs 1..N+1;
@@ -74,6 +75,7 @@ def main():
     ap.add_argument("--iface", default="eth1")
     ap.add_argument("--frame-min", action="append", default=None,
                     help="DST/PREFIX toward which packets count at least the frame minimum (default 10.0.0.10/32)")
+    ap.add_argument("--marker-port", type=int, default=132, help="the dev_port the replay host's frames enter")
     ap.add_argument("--windows", type=int, default=40)
     ap.add_argument("--window-us", type=int, default=500000)
     ap.add_argument("--lead-s", type=float, default=3.0, help="the replay starts this long after the reader")
@@ -87,7 +89,7 @@ def main():
     summary = dict(capture=str(args.capture), anchor_us=args.anchor_us, windows=args.windows,
                    execution_id=args.execution_id, frame_min=frame_min, start=time.time())
     try:
-        reset_args = ["--reset"] + sum((["--frame-min", f] for f in frame_min), [])
+        reset_args = ["--reset", "--marker-ports", str(args.marker_port)] + sum((["--frame-min", f] for f in frame_min), [])
         r = subprocess.run(ssh + [remote_cmd(remote, reset_args)], capture_output=True, text=True, timeout=300)
         if r.returncode != 0:
             raise SystemExit("reset failed: %s" % (r.stderr or r.stdout)[-2000:])

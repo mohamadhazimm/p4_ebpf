@@ -1,19 +1,27 @@
 /* Flow packets as features/switch_model.py parse_flow_packet() takes them: up to two VLAN tags,
  * IPv4 version 4 with IHL >= 5, fragment offset 0, TCP or UDP. Anything else is forwarded without
- * being counted. IPv4 options are extracted (ipv4_opts) so that they are forwarded. A window marker
- * frame (ETHERTYPE_WINDOW) is parsed as such. */
+ * being counted. IPv4 options are extracted (ipv4_opts) so that they are forwarded.
+ *
+ * A window marker frame (ETHERTYPE_WINDOW) is taken as one only from the ports in marker_ports, a value set
+ * the control plane fills (window_reader.py --marker-ports): the switch's CPU port when the collector's reader
+ * sends the markers, the replay host's port for an in-band replay, none with the packet generator's timer.
+ * From any other port the frame sets meta.bad_marker and is dropped and counted (rejected_markers), so a
+ * monitored host cannot move the window clock. */
 parser IngressParser(
     packet_in pkt,
     out my_headers_t hdr,
     out my_ingress_metadata_t meta,
     out ingress_intrinsic_metadata_t ig_intr_md
 ) {
+    value_set<bit<9>>(8) marker_ports;
+
     state start {
         pkt.extract(ig_intr_md);
         pkt.advance(PORT_METADATA_SIZE);
         meta.l4_sport = 16w0;
         meta.l4_dport = 16w0;
         meta.is_flow = 1w0;
+        meta.bad_marker = 1w0;
         transition parse_ethernet;
     }
 
@@ -23,9 +31,21 @@ parser IngressParser(
             ETHERTYPE_IPV4:   parse_ipv4;
             ETHERTYPE_VLAN:   parse_vlan0;
             ETHERTYPE_QINQ:   parse_vlan0;
-            ETHERTYPE_WINDOW: parse_marker;
+            ETHERTYPE_WINDOW: check_marker_port;
             default: accept;
         }
+    }
+
+    state check_marker_port {
+        transition select(ig_intr_md.ingress_port) {
+            marker_ports: parse_marker;
+            default: bad_marker;
+        }
+    }
+
+    state bad_marker {
+        meta.bad_marker = 1w1;
+        transition accept;
     }
 
     state parse_vlan0 {

@@ -96,6 +96,55 @@ def ipv4_l4_len(frame):
     return struct.unpack("!H", frame[16:18])[0]
 
 
+WINDOW_ETHERTYPE = b"\x88\xb5"
+
+
+def exact_check(tx, rows, header_bytes=0, frame_min=(), max_frame=None):
+    """--exact: frames in sending order with the window markers among them, split at the markers, against
+    the switch's window totals: collector window k is the marker epoch k + 1, and its packets and bytes must
+    equal those sent between marker k + 1 and marker k + 2, exactly. `tx`: (time, frame) pairs, e.g. the
+    replayer's schedule (replay_absolute.with_markers on the capture) or the send capture tx.pcap (which
+    tcpdump can drop frames from under a burst); frames longer than max_frame (the interface refuses them)
+    are left out. Bytes as perf/variants/exact counts them in the collector's layer: the IPv4 length, at
+    least 46 toward a frame_min address, plus header_bytes."""
+    import socket
+    mins = {socket.inet_aton(a.split("/")[0]) for a in frame_min}
+    sent, epoch = {}, None
+    for _t, f in tx:
+        if max_frame is not None and len(f) > max_frame:
+            continue
+        if f[12:14] == WINDOW_ETHERTYPE and len(f) >= 20:
+            epoch = struct.unpack("!I", f[16:20])[0]
+            continue
+        n = ipv4_l4_len(f)
+        if n is None or epoch is None:
+            continue
+        if f[30:34] in mins:
+            n = max(n, 46)
+        p, b = sent.get(epoch, (0, 0))
+        sent[epoch] = (p + 1, b + n + header_bytes)
+    windows, exact = [], 0
+    for k in sorted(rows):
+        r = rows[k]
+        sw = (int(float(r.get("net_pkts_total_delta") or 0)), int(float(r.get("net_bytes_total_delta") or 0)))
+        want = sent.get(k + 1, (0, 0))
+        ok = sw == want
+        exact += int(ok)
+        windows.append({"window": k, "epoch": k + 1, "switch_pkts": sw[0], "switch_bytes": sw[1], "sent_pkts": want[0],
+                        "sent_bytes": want[1], "check": "exact" if ok else "differs",
+                        "untracked_pkts": int(float(r.get("net_untracked_pkts") or 0)),
+                        "lost": int(float(r.get("net_window_lost") or 0))})
+    return {"windows_checked": len(windows), "windows_exact": exact,
+            "switch_pkts_total": sum(w["switch_pkts"] for w in windows),
+            "sent_pkts_total": sum(w["sent_pkts"] for w in windows),
+            "switch_bytes_total": sum(w["switch_bytes"] for w in windows),
+            "sent_bytes_total": sum(w["sent_bytes"] for w in windows),
+            "sent_before_first_marker_or_after_last": sum(p for e, (p, _b) in sent.items()
+                                                           if e - 1 not in rows),
+            "untracked_pkts": sum(w["untracked_pkts"] for w in windows),
+            "windows_lost": sum(w["lost"] for w in windows), "per_window": windows}
+
+
 def wait_listening(proc, timeout):
     """True once tcpdump has printed "listening on" on stderr."""
     deadline = time.time() + timeout
@@ -297,6 +346,14 @@ def main():
     ap.add_argument("--ext-port", default="140")
     ap.add_argument("--cpu-iface", default="enp5s0")
     ap.add_argument("--label", default="replay")
+    ap.add_argument("--exact", action="store_true",
+                    help="the switch runs perf/variants/exact: the collector reads its window registers "
+                         "(--switch-program exact --window-markers inband), the replayer sends a window marker at "
+                         "each collector window boundary in order with the frames, and the self-check compares "
+                         "every window exactly with the frames sent between its markers")
+    ap.add_argument("--frame-min", action="append", default=None,
+                    help="--exact: DST/PREFIX toward which the switch counts the frame minimum (default with "
+                         "--profile dataset: 10.0.0.10/32, the dataset's guest)")
     argv, extra = sys.argv[1:], []
     if "--" in argv:                        # after --: extra hybrid_collector.py options
         extra, argv = argv[argv.index("--") + 1:], argv[:argv.index("--")]
@@ -309,6 +366,20 @@ def main():
         sys.exit("%s already holds a replay; use a new --out" % out)
     out.mkdir(parents=True, exist_ok=True)
     window_sec, profile_args = profile_settings(args.profile, args.align_window)
+    frame_min = args.frame_min if args.frame_min is not None else (["10.0.0.10/32"] if args.profile == "dataset" else [])
+    n_windows = None
+    if args.exact:
+        if args.replayer != "absolute":
+            sys.exit("--exact needs --replayer absolute (it sends the window markers)")
+        if args.profile == "dataset":
+            n_windows = args.align_window + DATASET_WINDOWS
+        else:
+            frames = read_pcap(capture, snap=1)
+            span = frames[-1][0] - (frames[0][0] + args.anchor_offset) if frames else 0.0
+            n_windows = args.align_window + int(span // window_sec) + 2
+        profile_args = profile_args + ["--switch-program", "exact", "--window-markers", "inband",
+                                       "--marker-port", args.int_port, "--windows", str(n_windows)] + \
+            sum((["--frame-min", f] for f in frame_min), [])
     delay = None
     if args.replayer == "tcpreplay":
         delay = args.align_window * window_sec - args.anchor_offset - args.start_latency
@@ -318,10 +389,10 @@ def main():
     else:
         if args.align_window * window_sec - args.anchor_offset < 0.5:
             sys.exit("the anchor cannot reach window %d: raise --align-window" % args.align_window)
-        scenario = "exec %s %s --iface %s --align-window %d --anchor-offset %.6f --window-sec %s %s" % (
+        scenario = "exec %s %s --iface %s --align-window %d --anchor-offset %.6f --window-sec %s %s%s" % (
             shlex.quote(sys.executable), shlex.quote(str(REPO / "live_test" / "replay_absolute.py")),
             shlex.quote(args.tx_iface), args.align_window, args.anchor_offset, repr(window_sec),
-            shlex.quote(str(capture)))
+            shlex.quote(str(capture)), " --markers --marker-windows %d" % n_windows if args.exact else "")
     stub = out / "hostmon_stub"
     stub.write_text("#!/bin/sh\n# stand-in HostMon: the host side of a replay comes from the recorded run\nexec sleep 86400\n")
     stub.chmod(0o755)
@@ -356,6 +427,28 @@ def main():
     summary = analyse(out, capture, args.anchor_offset, args.align_window, delay, args.report_latency, window_sec,
                       header_bytes=self_check_header_bytes(args.profile))
     summary["collector_exit_code"] = rc
+    if args.exact:
+        import csv
+        csv.field_size_limit(sys.maxsize)
+        rows = {int(float(r["net_window_id"])): r for r in csv.DictReader(open(out / "windows.csv"))}
+        # the replayer's own sending order: the capture's frames and its markers (replay_absolute.py's defaults
+        # inside the collector), less the frames the interface refuses (over its MTU)
+        sys.path.insert(0, str(REPO / "live_test"))
+        import replay_absolute
+        window_us = int(round(window_sec * 1e6))
+        first_us = replay_absolute.read_pcap_us(str(capture))[0][0]
+        events = replay_absolute.with_markers(str(capture), b"\x00" * 6,
+                                              first_us + int(round(args.anchor_offset * 1e6)) - args.align_window * window_us,
+                                              window_us, n_windows, 1)
+        mtu = int(open("/sys/class/net/%s/mtu" % args.tx_iface).read())
+        hb = self_check_header_bytes(args.profile)
+        summary["exact_check"] = exact_check([(t, f) for t, f, _m in events], rows, header_bytes=hb,
+                                             frame_min=frame_min, max_frame=mtu + 14)
+        summary["exact_check"]["frame_min"] = frame_min
+        summary["exact_check"]["against"] = "the replayer's schedule (capture frames up to the MTU, and the markers)"
+        tx_side = exact_check(read_pcap(out / "tx.pcap"), rows, header_bytes=hb, frame_min=frame_min)
+        summary["exact_check"]["tx_capture"] = {k: tx_side[k] for k in ("windows_exact", "sent_pkts_total",
+                                                                        "sent_bytes_total")}
     (out / "summary.json").write_text(json.dumps(summary, indent=1) + "\n")
     uid, gid = os.environ.get("SUDO_UID"), os.environ.get("SUDO_GID")
     if uid and gid:
@@ -366,9 +459,18 @@ def main():
         summary.get("alignment_error_ms"), summary.get("start_latency_measured_s"), summary.get("replay_timing_error_ms")))
     print("[replay] snapshot interval %s ms, starting %s ms after the window end; clock offset round trip min %s ms" % (
         sc["snapshot_interval_ms"], sc["snapshot_start_after_window_end_ms"], summary["round_trip_min_ms"]))
-    print("[replay] self-check: %d of %d windows inside the bounds; packets switch %d / sent %d, bytes switch %d / sent %d" % (
-        sc["windows_inside_bounds"], sc["windows_checked"], sc["switch_pkts_total"], sc["sent_pkts_total"],
-        sc["switch_bytes_total"], sc["sent_bytes_total"]))
+    if args.exact:
+        ec = summary["exact_check"]
+        print("[replay] exact check: %d of %d windows equal to the frames sent between their markers; packets "
+              "switch %d / sent %d, bytes switch %d / sent %d; packets without a slot %d, windows lost %d; "
+              "send capture: %d packets" % (
+                  ec["windows_exact"], ec["windows_checked"], ec["switch_pkts_total"], ec["sent_pkts_total"],
+                  ec["switch_bytes_total"], ec["sent_bytes_total"], ec["untracked_pkts"], ec["windows_lost"],
+                  ec["tx_capture"]["sent_pkts_total"]))
+    else:
+        print("[replay] self-check: %d of %d windows inside the bounds; packets switch %d / sent %d, bytes switch %d / "
+              "sent %d" % (sc["windows_inside_bounds"], sc["windows_checked"], sc["switch_pkts_total"],
+                           sc["sent_pkts_total"], sc["switch_bytes_total"], sc["sent_bytes_total"]))
     sys.exit(0 if rc == 0 else rc)
 
 

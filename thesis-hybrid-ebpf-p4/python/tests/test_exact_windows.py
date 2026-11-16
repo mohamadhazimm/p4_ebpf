@@ -1,7 +1,9 @@
 """Tests of perf/variants/exact's window features without a switch: exact_model.py (the program's registers and
 per-packet logic) read as window_reader.py reads it and rebuilt by window_features.py must give, window by window,
-the features of the dataset's model (features/switch_model.py, copied below for Python 3.8). Also the window
-markers' order (live_test/replay_absolute.py) and the reader's register layout."""
+the features of the dataset's model (features/switch_model.py, copied below for Python 3.8); so must
+hybrid_collector.py's exact loop, with the markers from the CPU port or in band. Also the window markers' order
+(live_test/replay_absolute.py), the reader's register layout and its lost / unclocked checks, and
+replay_capture.py's exact self-check."""
 import random
 import socket
 import struct
@@ -17,6 +19,10 @@ from exact_model import ExactModel  # noqa: E402
 from window_features import FEATURES, WindowFeatures  # noqa: E402
 from window_reader import WINDOW_REGS  # noqa: E402
 import replay_absolute  # noqa: E402
+import replay_capture  # noqa: E402
+import window_reader  # noqa: E402
+sys.path.insert(0, str(HERE.parents[2]))
+import hybrid_collector as hc  # noqa: E402
 
 WINDOW_NS = 500_000_000
 TTL = 3
@@ -229,6 +235,201 @@ class MarkerOrderTest(unittest.TestCase):
         self.assertEqual(kinds, ["M1", "F0", "F1", "M2", "F2", "M3", "F3", "M4"])
         self.assertEqual(struct.unpack("!H", ev[0][1][12:14])[0], 0x88B5)
         self.assertEqual(len(ev[0][1]), 60)
+
+
+class FakeClock:
+    """time() / sleep() for the collector; sleeping feeds the model the packets sent until then."""
+
+    def __init__(self, t0, feed):
+        self.now, self.feed = t0, feed
+
+    def time(self):
+        return self.now
+
+    def sleep(self, d):
+        self.now += d
+        self.feed(self.now)
+
+
+class FakeWindowReader:
+    """window_reader.py --serve on exact_model.py: mark sets the clock, read returns the window's line."""
+
+    def __init__(self, model, inband_marks=None):
+        self.model, self.requests = model, []
+
+    def request(self, req, timeout=None):
+        self.requests.append(req)
+        if req["cmd"] == "mark":
+            self.model.marker(req["epoch"])
+            return {"marked": req["epoch"]}
+        if req["cmd"] == "follow":
+            return {"following_from": self.model.epoch}
+        if req["cmd"] == "read":
+            if self.model.epoch <= req["epoch"]:
+                return {"epoch": req["epoch"], "error": "window %d did not end" % req["epoch"]}
+            return self.model.read(req["epoch"])
+        return {"error": "unexpected %r" % req}
+
+
+class DoneProc:
+    def poll(self):
+        return 0
+
+
+class CollectorExactTest(unittest.TestCase):
+    def run_collector(self, markers):
+        packets = make_traffic(3)
+        ref = reference_windows([p[:9] for p in packets], 40)
+        t0 = 1_792_932_220.0                           # make_traffic's windows start at t0 = 1792932220 s
+        model = ExactModel(frame_min={HOST})
+        pending = list(packets)
+        if markers == "inband":
+            model.marker(1)
+
+        def feed(now):
+            # the packets sent until `now` reach the switch; in band, each window's marker comes first
+            while pending and pending[0][10] / 1e9 < now:
+                p = pending.pop(0)
+                if markers == "inband" and p[0] + 1 > model.epoch:
+                    model.marker(p[0] + 1)
+                model.packet(p[2], p[3], p[4], p[5], p[6], p[7], p[9], p[10])
+            if markers == "inband":
+                model.marker(max(model.epoch, int((now - t0 + 1e-9) // 0.5) + 1))
+
+        reader = FakeWindowReader(model)
+        clock = FakeClock(t0, feed)
+        rows = []
+        hc.collect_windows_exact(reader, DoneProc(), 0.5, t0, markers=markers,
+                                 on_window=lambda w: rows.append(w["exact_features"]), max_windows=40, clock=clock)
+        self.assertEqual(len(rows), 40)
+        for w, (r, g) in enumerate(zip(ref, rows)):
+            for f in FEATURES:
+                tol = 2 * 65.536e-6 if f in DUR else 1e-9 * max(1.0, abs(r[f]))
+                self.assertTrue(close(r[f], g[f], tol), (markers, w, f, r[f], g[f]))
+            self.assertEqual(g["net_untracked_pkts"], 0)
+        return reader
+
+    def test_cpu_markers_give_the_models_windows(self):
+        reader = self.run_collector("cpu")
+        marks = [r["epoch"] for r in reader.requests if r["cmd"] == "mark"]
+        self.assertEqual(marks, list(range(1, 42)))            # epoch 1 at the start, w + 2 after window w
+        reads = [r["epoch"] for r in reader.requests if r["cmd"] == "read"]
+        self.assertEqual(reads, list(range(1, 41)))
+
+    def test_inband_markers_give_the_models_windows(self):
+        reader = self.run_collector("inband")
+        self.assertFalse([r for r in reader.requests if r["cmd"] == "mark"])
+        self.assertEqual(reader.requests[0], {"cmd": "follow"})      # the reader reads each window as it ends
+
+    def test_a_window_that_does_not_end_stops_the_run(self):
+        model = ExactModel()
+        reader = FakeWindowReader(model)
+        with self.assertRaises(hc.P4ReadError):
+            hc.collect_windows_exact(reader, DoneProc(), 0.5, 0.0, markers="inband", max_windows=3,
+                                     clock=FakeClock(0.0, lambda now: None))
+
+    def test_exact_summary_keeps_the_collector_columns(self):
+        feats = dict.fromkeys(FEATURES, 1)
+        feats.update(net_flow_duration_mean=0.25, net_flow_duration_max=0.5, net_untracked_pkts=3)
+        out = hc.exact_summary(feats, duration_unit="ns")
+        self.assertEqual(set(hc.NET_ZERO) | set(hc.EXACT_EXTRA_KEYS), set(out))
+        self.assertEqual(out["net_flow_duration_max"], 0.5e9)
+        self.assertEqual(out["net_untracked_pkts"], 3)
+        self.assertEqual(out["net_new_conn_dst_max"], 0)
+
+
+class FakeProgram:
+    """window_reader.Program for two pipes: per-pipe registers; reg_epoch per pipe."""
+
+    def __init__(self):
+        self.epochs = [0, 0]
+        self.cells = {}               # (name, idx) -> per-pipe values
+        self.after_clear = None
+
+    def pipe_epochs(self):
+        return list(self.epochs)
+
+    def get(self, name, indexes, pair):
+        zero = [0, 0] if pair else 0
+        return {i: [list(v) if pair else v for v in self.cells.get((name, i), [zero, zero])] for i in indexes}
+
+    def put_zero(self, name, indexes, pair):
+        for i in indexes:
+            self.cells.pop((name, i), None)
+        if self.after_clear:
+            self.after_clear()
+
+    def rejected_markers(self):
+        return 0
+
+
+class WindowReaderChecksTest(unittest.TestCase):
+    def test_packets_of_a_pipe_whose_clock_lags_are_reported_not_counted(self):
+        prog = FakeProgram()
+        r = window_reader.WindowReader(prog)
+        prog.epochs = [0, 2]                                   # pipe 1 is clocked, pipe 0 is not
+        prog.cells[("reg_w_tot", 7)] = [[5, 500], [9, 900]]    # bank 1, found 1, A->B: pipe 0 has 5, pipe 1 has 9
+        first = r.read_window(1, prog.pipe_epochs())
+        self.assertEqual(first["regs"]["reg_w_tot"]["7"], [9, 900])
+        self.assertEqual(first["clocked_pipes"], [1])
+        prog.cells[("reg_w_tot", 7)] = [[12, 1200], [9, 900]]  # pipe 0 counted 7 more
+        prog.epochs = [0, 3]
+        second = r.read_window(2, prog.pipe_epochs())
+        self.assertEqual(second["unclocked_pkts"], 7)
+        self.assertFalse(second["lost"])
+
+    def test_a_clear_after_the_next_window_started_taints_that_window(self):
+        prog = FakeProgram()
+        r = window_reader.WindowReader(prog)
+        prog.epochs = [0, 2]
+
+        def late():
+            prog.epochs = [0, 4]                               # window 3 (bank 1) started before the clear
+        prog.after_clear = late
+        first = r.read_window(1, prog.pipe_epochs())
+        self.assertFalse(first["lost"])
+        prog.after_clear = None
+        self.assertTrue(r.read_window(2, prog.pipe_epochs())["lost"])   # read once window 4 has started
+        prog.epochs = [0, 4]
+        self.assertTrue(r.read_window(3, prog.pipe_epochs())["lost"])   # its extremes may have been cleared
+
+    def test_a_change_of_the_clocked_pipes_loses_the_window(self):
+        prog = FakeProgram()
+        r = window_reader.WindowReader(prog)
+        prog.epochs = [0, 2]
+        r.read_window(1, prog.pipe_epochs())
+        prog.epochs = [3, 3]
+        self.assertTrue(r.read_window(2, prog.pipe_epochs())["lost"])
+
+
+class FollowerTest(unittest.TestCase):
+    def test_the_follower_reads_each_window_as_its_clock_passes(self):
+        prog = FakeProgram()
+        reader = window_reader.WindowReader(prog)
+        f = window_reader.Follower(prog, reader, poll_s=0.0005)
+        prog.cells[("reg_w_tot", 3)] = [[0, 0], [4, 400]]      # window 0 (bank 0) in pipe 1
+        prog.epochs = [0, 1]
+        line = f.get(0, 2.0)
+        self.assertEqual(line["epoch"], 0)
+        self.assertEqual(line["regs"]["reg_w_tot"]["3"], [4, 400])
+        self.assertIn("error", f.get(1, 0.05))                 # window 1 has not ended
+
+
+class ReplayExactCheckTest(unittest.TestCase):
+    def frame(self, dst, total, proto=6):
+        ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, total, 0, 0, 64, proto, 0, socket.inet_aton("10.0.0.1"),
+                         socket.inet_aton(dst))
+        return b"\x02" * 12 + b"\x08\x00" + ip + b"\x00" * 20
+
+    def test_windows_are_split_at_the_markers_and_compared_exactly(self):
+        mk = lambda e: replay_absolute.marker_frame(b"\x02" * 6, e)
+        tx = [(0, mk(1)), (0, self.frame(HOST, 40)), (0, self.frame("10.0.0.1", 100)), (0, mk(2)),
+              (0, self.frame(HOST, 52)), (0, mk(3))]
+        rows = {0: {"net_pkts_total_delta": "2", "net_bytes_total_delta": str(46 + 14 + 100 + 14)},
+                1: {"net_pkts_total_delta": "1", "net_bytes_total_delta": str(52 + 14 + 1)}}
+        got = replay_capture.exact_check(tx, rows, header_bytes=14, frame_min=["10.0.0.10/32"])
+        self.assertEqual([w["check"] for w in got["per_window"]], ["exact", "differs"])
+        self.assertEqual(got["per_window"][0]["sent_bytes"], 46 + 14 + 100 + 14)
 
 
 if __name__ == "__main__":

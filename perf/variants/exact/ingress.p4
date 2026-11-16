@@ -1,8 +1,9 @@
 /* perf/variants/exact: the 29 window features of features/switch_model.py computed in the data plane,
  * so that no window depends on when or how much the control plane reads.
  *
- * Windows. A window marker frame (headers.p4, ETHERTYPE_WINDOW, carrying the new window's number) or,
- * in deployment, a timer packet of the packet generator (TIMER_PORT) starts the next window: reg_epoch
+ * Windows. A window marker frame (headers.p4, ETHERTYPE_WINDOW, carrying the new window's number; taken
+ * only from the ports in the parser's marker_ports) or, in a deployment build, a timer packet of the packet
+ * generator (local port TIMER_LOCAL_PORT of the pipe) starts the next window: reg_epoch
  * holds its number. Every window register has two banks, bank = epoch & 1: while window e counts into
  * bank e & 1, the other bank holds window e - 1 unchanged, and the control plane (window_reader.py)
  * reads it at any time before window e + 1 starts. The cut is where the marker is in the packet
@@ -42,10 +43,12 @@
 
 #define WAY_SLOTS (1 << WAY_BITS)
 
-/* The packet generator's port whose timer packets tick the window clock in deployment (pipe 1 of the
- * Wedge100BF-32X: 196); in-band markers need no timer. 511 is no port. */
-#ifndef TIMER_PORT
-#define TIMER_PORT 511
+/* The packet generator's local port whose timer packets tick the window clock, on any pipe (each pipe has its
+ * own clock and its own generator): a deployment build sets -DTIMER_LOCAL_PORT=68 (tested on pipe 1, dev_port
+ * 196; sw_window_timer.py). The default, 127, is no port: the line-rate tests' generator (sw_pktgen_run.py,
+ * local ports 68-70) then sends traffic, and only window markers move the clock. */
+#ifndef TIMER_LOCAL_PORT
+#define TIMER_LOCAL_PORT 127
 #endif
 #define FLOW_SLOTS (4 * WAY_SLOTS)
 
@@ -68,6 +71,9 @@ control Ingress(
     RegisterAction<bit<32>, bit<1>, bit<32>>(reg_epoch) epoch_get = {
         void apply(inout bit<32> v, out bit<32> rv) { rv = v; }
     };
+
+    /* window marker frames from ports outside marker_ports, dropped */
+    Counter<bit<32>, bit<1>>(1, CounterType_t.PACKETS) rejected_markers;
 
     /* ---------------- packet length ---------------- */
     action len_ip(bit<16> extra) { meta.L16 = hdr.ipv4.totalLen + extra; }
@@ -372,7 +378,10 @@ control Ingress(
                 epoch_set.execute(0);
             }
             ig_dprsr_md.drop_ctl = 3w1;
-        } else if (ig_intr_md.ingress_port == TIMER_PORT) {
+        } else if (meta.bad_marker == 1w1) {
+            rejected_markers.count(0);
+            ig_dprsr_md.drop_ctl = 3w1;
+        } else if (ig_intr_md.ingress_port[6:0] == TIMER_LOCAL_PORT) {
             epoch_tick.execute(0);
             ig_dprsr_md.drop_ctl = 3w1;
         } else {

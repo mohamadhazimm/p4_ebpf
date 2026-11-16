@@ -667,7 +667,8 @@ and no flow should go unread under a flood. **Where the remaining errors came fr
   - Every window register has two banks (epoch & 1). The control plane reads the finished window's bank while the
     next window counts into the other.
   - The cut is where the marker sits in the packet sequence, for all registers at once.
-  - In deployment the packet generator's timer advances the epoch instead (`-DTIMER_PORT=196`).
+  - In deployment the packet generator's timer advances the epoch instead (first `-DTIMER_PORT=196`; since
+    `basic_exact_v3`, `-DTIMER_LOCAL_PORT=68` on any pipe).
 - **Flows.** The key orders the two (address, port) endpoints, so flows whose ports pair differently with the same
   two addresses stay apart.
   - Four ways of 16,384 slots hold a 32-bit signature each. A flow takes the first way whose slot is free or
@@ -735,7 +736,7 @@ and no flow should go unread under a flood. **Where the remaining errors came fr
   - **The window totals count exactly at line rate.** Over the 27 runs (13.1 billion packets), the pipe-1 total
     grew by the generated packets and the pipe-0 total by the looped-back ones. The bytes grew by the IPv4 length
     each (mod 2³²), and every packet was tracked (one flow).
-- **Timer** (`perf/tools/sw_window_timer.py`, build `-DTIMER_PORT=196`): the generator's 500 ms timer advanced the
+- **Timer** (`perf/tools/sw_window_timer.py`, build `-DTIMER_PORT=196`, later `-DTIMER_LOCAL_PORT=68`): the generator's 500 ms timer advanced the
   window 40 times in 20 s, 0.4999 s apart as polled (min 0.4983, max 0.5025). No tick was counted as traffic.
 - **The 109 captures** (PC1.md, part 6), with the markers at the capture's window boundaries:
   - **102 rows match all 135 non-duration columns of the published row.** All 96 calm captures match, against 61
@@ -758,6 +759,28 @@ and no flow should go unread under a flood. **Where the remaining errors came fr
       99,639 and 149,423 distinct flows, more than any single-stage register on Tofino 1 holds per flow.
   - **Durations come from the switch's clock** (65.536 µs units): median relative error 4.5·10⁻⁵, at most 17% on
     short flows, from the replay's timing.
+- **Hardening (build `basic_exact_v3`, PC1.md part 6b):**
+  - **Markers only from configured ports:** the parser value set `marker_ports` is filled by the reader (the
+    CPU port for live collection, the replay host's port for a replay). Any other marker is dropped and counted.
+    Five forged markers from a host port did not move the clock and were all counted.
+  - **Timer per pipe in a deployment build** (`-DTIMER_LOCAL_PORT=68`, any pipe's generator): 40 ticks in 20 s,
+    0.5000 s apart as polled. The default build has no timer port.
+  - **Reader:** it combines only pipes whose clock passed the window and reports a lagging pipe's packets. A late
+    clear or a change of clocked pipes marks the window lost.
+  - **Resources:** the same 11 stages, 23 stateful ALUs and 260 cycles, plus 2 SRAM blocks for the counter.
+  - **Line rate:** unchanged and lossless; the window totals stayed exact for 13.1 billion packets
+    (`perf/results/linerate_exact_v3_20261116/`).
+  - **Latency:** median 421 ns, as before (1010 of 1010 reports in each of 3 runs;
+    `perf/results/latency_exact_v3_20261116/`).
+- **`hybrid_collector.py --switch-program exact`** (PC1.md part 6b):
+  - **Markers:** from the switch's CPU port at the collector's window boundaries (live), or in band from the
+    replayer (`replay_capture.py --exact`).
+  - **Features:** `window_features.py`, the code the standalone driver uses.
+  - **Live test:** all 24,008 packets of a 1 s-window replay counted, every checkable window within its bounds,
+    the markers on the clock 2.8 ms after they were sent.
+  - **All 109 captures:** all 4,796 windows equal the frames the replayer sent between their markers, with no
+    window lost. All 109 rows equal the standalone driver's in the 135 non-duration columns, and 102 equal the
+    published row.
 - The switch runs `basic_fix` again (checked with a replay, 9 of 9 packets).
 
 ## 6. Switch CPU side
@@ -986,6 +1009,17 @@ Section 6 measures the switch CPU, not the P4 program, and can be left out.
   - TCP/UDP throughput with iperf3 and RTT with ping, which would measure PC1;
   - the collision rate on the switch over several flow counts. One point was measured
     (Section 5.2); the other numbers are offline, with the verified compiled hash.
+
+- **The exact build (Section 5.7)** removes several of these: it parses VLAN tags, IPv4 options and fragments
+  as the dataset's model does; it decides direction by address and port; it takes durations from a 48-bit clock
+  (65.536 µs units). Its own limits (`perf/variants/exact/README.md`):
+  - **The flow table holds every flow of a run (65,536 slots, no aging).** A flow without a slot is counted in
+    the totals and reported per window, but not in the flow features. 5 floods of the dataset exceed it.
+  - **Every pipe has its own window clock.** The reader leaves out, and reports, the packets of a pipe whose
+    clock lags.
+  - **A window must be read within one window of slack**, or it is marked lost.
+  - **11 ingress stages:** 421 ns of latency against 315 ns.
+  - **No per-flow counters**, so the live test's socket-level join still needs `basic_fix`.
 
 ## 10. Reproducing the measurements
 

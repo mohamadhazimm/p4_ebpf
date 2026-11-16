@@ -1,6 +1,6 @@
 diff -ru a/egress.p4 b/egress.p4
---- a/egress.p4	2026-11-16 09:05:34.717944660 -0500
-+++ b/egress.p4	2026-11-16 09:05:34.721944761 -0500
+--- a/egress.p4	2026-11-16 10:10:00.767973612 -0500
++++ b/egress.p4	2026-11-16 10:10:00.771973703 -0500
 @@ -31,5 +31,17 @@
  
      apply {
@@ -21,8 +21,8 @@ diff -ru a/egress.p4 b/egress.p4
  }
 \ No newline at end of file
 diff -ru a/egress_parser.p4 b/egress_parser.p4
---- a/egress_parser.p4	2026-11-16 09:05:34.717944660 -0500
-+++ b/egress_parser.p4	2026-11-16 09:05:34.721944761 -0500
+--- a/egress_parser.p4	2026-11-16 10:10:00.767973612 -0500
++++ b/egress_parser.p4	2026-11-16 10:10:00.771973703 -0500
 @@ -8,6 +8,20 @@
  {
      state start {
@@ -46,8 +46,8 @@ diff -ru a/egress_parser.p4 b/egress_parser.p4
  }
 \ No newline at end of file
 diff -ru a/headers.p4 b/headers.p4
---- a/headers.p4	2026-11-16 09:05:34.717944660 -0500
-+++ b/headers.p4	2026-11-16 09:05:34.721944761 -0500
+--- a/headers.p4	2026-11-16 10:10:00.767973612 -0500
++++ b/headers.p4	2026-11-16 10:10:00.771973703 -0500
 @@ -77,7 +77,30 @@
      bit<16> checksum;
  }
@@ -79,7 +79,7 @@ diff -ru a/headers.p4 b/headers.p4
      ethernet_t      ethernet;
      vlan_t[2]       vlan;
      window_marker_t marker;
-@@ -148,6 +171,10 @@
+@@ -149,6 +172,10 @@
  }
  
  struct my_egress_headers_t {
@@ -91,8 +91,8 @@ diff -ru a/headers.p4 b/headers.p4
  
  struct my_egress_metadata_t {
 diff -ru a/ingress_deparser.p4 b/ingress_deparser.p4
---- a/ingress_deparser.p4	2026-11-16 09:05:34.721944761 -0500
-+++ b/ingress_deparser.p4	2026-11-16 09:05:34.721944761 -0500
+--- a/ingress_deparser.p4	2026-11-16 10:10:00.767973612 -0500
++++ b/ingress_deparser.p4	2026-11-16 10:10:00.771973703 -0500
 @@ -5,6 +5,7 @@
      in    ingress_intrinsic_metadata_for_deparser_t ig_dprsr_md)
  {
@@ -102,9 +102,9 @@ diff -ru a/ingress_deparser.p4 b/ingress_deparser.p4
          pkt.emit(hdr.vlan);
          pkt.emit(hdr.marker);
 diff -ru a/ingress.p4 b/ingress.p4
---- a/ingress.p4	2026-11-16 09:05:34.721944761 -0500
-+++ b/ingress.p4	2026-11-16 09:05:34.721944761 -0500
-@@ -363,6 +363,11 @@
+--- a/ingress.p4	2026-11-16 10:10:00.767973612 -0500
++++ b/ingress.p4	2026-11-16 10:10:00.771973703 -0500
+@@ -369,6 +369,11 @@
      }
  
      apply {

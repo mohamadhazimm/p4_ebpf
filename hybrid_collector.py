@@ -40,6 +40,7 @@ DEFAULT_REPLAY = "/home/ubuntu/Desktop/p4_ebpf/thesis-hybrid-ebpf-p4/python/repl
 DEFAULT_P4_FORWARDER = "/home/ubuntu/Desktop/p4_ebpf/thesis-hybrid-ebpf-p4/python/program_forwarding.py"
 DEFAULT_P4_RESETTER = str(Path(__file__).resolve().parent / "thesis-hybrid-ebpf-p4" / "python" / "reset_registers.py")
 DEFAULT_BATCHED_READER = str(Path(__file__).resolve().parent / "thesis-hybrid-ebpf-p4" / "python" / "batched_reader.py")
+DEFAULT_WINDOW_READER = str(Path(__file__).resolve().parent / "thesis-hybrid-ebpf-p4" / "python" / "window_reader.py")
 DEFAULT_GRPC_ADDR = "127.0.0.1:50052"
 
 DEFAULT_OUT_CSV = "hybrid_windows.csv"
@@ -737,6 +738,7 @@ class BatchedReaderProcess:
         self.start_timeout = start_timeout
         self.extra_args = list(extra_args or [])
         self.echo = echo
+        self.remote_name = "batched_reader"
         self.ready: Optional[Dict[str, Any]] = None
         self.starts = 0
         self._proc: Optional[subprocess.Popen] = None
@@ -760,7 +762,7 @@ class BatchedReaderProcess:
         if self.switch_ssh is None:
             cmd = [sys.executable, self.script] + self._args()
         else:
-            remote_path = f"/tmp/batched_reader_{os.getpid()}.py"
+            remote_path = f"/tmp/{self.remote_name}_{os.getpid()}.py"
             copy = subprocess.run(["ssh", "-o", "BatchMode=yes", self.switch_ssh, f"cat > {remote_path}"],
                                   input=Path(self.script).read_bytes(), stdout=subprocess.PIPE,
                                   stderr=subprocess.STDOUT, timeout=60)
@@ -899,6 +901,36 @@ class BatchedReaderProcess:
                 pass
 
 
+class WindowReaderProcess(BatchedReaderProcess):
+    """`window_reader.py --serve` for perf/variants/exact (--switch-program exact): one request per command
+    (setup, mark, read), one JSON reply each. On the switch, as the batched reader runs."""
+
+    def __init__(self, script: str = DEFAULT_WINDOW_READER, grpc_addr: str = DEFAULT_GRPC_ADDR,
+                 client_id: int = 9, p4_name: str = "basic", switch_ssh: Optional[str] = None,
+                 remote_sde_install: str = DEFAULT_REMOTE_SDE_INSTALL, cpu_iface: str = "enp5s0",
+                 start_timeout: float = 90.0, echo: bool = True):
+        super().__init__(script, grpc_addr=grpc_addr, client_id=client_id, p4_name=p4_name, switch_ssh=switch_ssh,
+                         remote_sde_install=remote_sde_install, start_timeout=start_timeout, echo=echo)
+        self.cpu_iface = cpu_iface
+        self.remote_name = "window_reader"
+
+    def _args(self) -> List[str]:
+        return ["--serve", "--grpc-addr", self.grpc_addr, "--client-id", str(self.client_id),
+                "--p4-name", self.p4_name, "--cpu-iface", self.cpu_iface]
+
+    def request(self, req: Dict[str, Any], timeout: Optional[float] = None) -> Dict[str, Any]:
+        """One command; the reply with this host's clock around it (collector_t_sent / collector_t_reply)."""
+        if self._proc is None or self._proc.poll() is not None:
+            self.start()
+        assert self._proc is not None and self._proc.stdin is not None
+        t_sent = time.time()
+        self._proc.stdin.write(json.dumps(req) + "\n")
+        self._proc.stdin.flush()
+        reply = json.loads(self._get_line(timeout))
+        reply["collector_t_sent"], reply["collector_t_reply"] = t_sent, time.time()
+        return reply
+
+
 # Absolute times a batched read reports (RUNBOOK 19.6); the timing log keeps them per window.
 CLOCK_KEYS = ("collector_t_sent", "collector_t_reply", "reader_t_recv", "reader_t_sync_start",
               "reader_t_sync_end", "reader_t_send")
@@ -1030,7 +1062,7 @@ PROFILES: Dict[str, Dict[str, Any]] = {
                 "read_budget_frac": 0.7, "max_dst_reads": 256, "forward_report_port": 192,
                 "clear_expired": 0, "clear_budget_frac": 0.5,
                 "dormant_reads": 1, "dormant_probe": 1, "byte_layer": "frame", "duration_unit": "s", "windows": 40,
-                "launcher": "dataset"},
+                "launcher": "dataset", "frame_min": ["10.0.0.10/32"]},
 }
 
 # Ethernet header bytes: the dataset counted frame bytes, the switch counts IPv4 totalLen.
@@ -1910,6 +1942,119 @@ def collect_windows_live(
 # P4 SUMMARY BUILDER
 # ============================================================
 
+# --switch-program exact: the columns a window gets besides the model's 29 features (window_features.py)
+EXACT_EXTRA_KEYS = ["net_untracked_pkts", "net_window_lost", "net_unclocked_pkts", "net_rejected_markers"]
+
+
+def exact_summary(feats: Dict[str, Any], duration_unit: str = "s") -> Dict[str, Any]:
+    """A window's network columns from window_features.py: the collector's NET_ZERO columns with the
+    switch's values, and the exact build's own checks."""
+    out = dict(NET_ZERO)
+    for k in NET_ZERO:
+        if k in feats:
+            out[k] = feats[k]
+    if duration_unit == "ns":
+        out["net_flow_duration_mean"] = feats["net_flow_duration_mean"] * 1e9
+        out["net_flow_duration_max"] = feats["net_flow_duration_max"] * 1e9
+    for k in EXACT_EXTRA_KEYS:
+        out[k] = int(feats.get(k, 0))
+    return out
+
+
+def collect_windows_exact(
+    reader: Any,
+    proc: subprocess.Popen,
+    window_sec: float,
+    global_t0: float,
+    markers: str = "cpu",
+    on_window: Optional[Callable[[Dict[str, object]], None]] = None,
+    max_windows: int = 0,
+    stop_fn: Optional[Callable[[], None]] = None,
+    drain_seconds: float = 0.0,
+    read_timeout: float = 5.0,
+    header: int = ETHERNET_HEADER_BYTES,
+    duration_unit: str = "s",
+    timing_path: Optional[str] = None,
+    clock: Any = None,
+) -> List[Dict[str, object]]:
+    """The windows of perf/variants/exact (--switch-program exact). Collector window w is the switch's
+    epoch w + 1. markers "cpu": the reader sends the window markers from the switch's CPU port, epoch 1 at
+    the start and epoch w + 2 at the end of window w, so the switch's windows are the collector's (cut
+    when the marker enters the pipeline, ~1 ms after the boundary, the same for every register). markers
+    "inband": the scenario sends them in order with its traffic (live_test/replay_absolute.py --markers in
+    a replay); the collector only reads. After each boundary the reader waits until window w has ended on
+    the switch (at most read_timeout s), reads it and clears it; window_features.py gives its features. With
+    in-band markers the reader follows the switch's clock itself ("follow") and reads each window as soon as
+    it ends, so a collector slowed down by its host (a flood replay on PC1's two CPUs) cannot read a window
+    after the window after the next has started in its bank. No CPU report, no bucket and no read budget:
+    every window is complete whatever the traffic.
+
+    max_windows: exactly that many windows, then stop_fn() (as collect_windows_live). Otherwise windows
+    continue until the scenario has ended and drain_seconds have passed. reader.request(dict) -> dict
+    (WindowReaderProcess; tests pass a fake). timing_path: one JSON line per window (the reader's reply
+    without its registers)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "thesis-hybrid-ebpf-p4" / "python"))
+    from window_features import WindowFeatures
+    clk = clock if clock is not None else time
+    wf = WindowFeatures(window_sec=window_sec, header=header)
+    timing = open(timing_path, "a") if timing_path else None
+    windows: List[Dict[str, object]] = []
+
+    def mark(epoch: int) -> Dict[str, Any]:
+        r = reader.request({"cmd": "mark", "epoch": epoch})
+        if "error" in r:
+            raise P4ReadError(f"window marker {epoch}: {r['error']}")
+        return r
+
+    if markers == "cpu":
+        mark(1)
+    else:
+        r = reader.request({"cmd": "follow"})
+        if "error" in r:
+            raise P4ReadError(f"window reader follow: {r['error']}")
+    w = 0
+    ended_at: Optional[float] = None
+    try:
+        while True:
+            boundary = global_t0 + (w + 1) * window_sec
+            delay = boundary - clk.time()
+            if delay > 0:
+                clk.sleep(delay)
+            marked = mark(w + 2) if markers == "cpu" else None
+            line = reader.request({"cmd": "read", "epoch": w + 1, "timeout": read_timeout})
+            if "error" in line:
+                raise P4ReadError(f"window {w}: {line['error']}")
+            feats = wf.add(line)
+            win: Dict[str, object] = {
+                "net_window_id": w, "net_window_start_sec": w * window_sec,
+                "net_window_end_sec": (w + 1) * window_sec, "net_window_duration_sec": window_sec,
+                "indexes": [], "report_count": 0, "index_mismatches": 0, "cleared_indexes": [],
+                "report_aggregates": dict(REPORT_ZERO), "exact_features": exact_summary(feats, duration_unit),
+            }
+            windows.append(win)
+            if timing is not None:
+                rec = {k: v for k, v in line.items() if k != "regs"}
+                rec.update(window=w, t_window_end=boundary, marked=marked)
+                timing.write(json.dumps(rec) + "\n")
+                timing.flush()
+            if on_window is not None:
+                on_window(win)
+            w += 1
+            if max_windows:
+                if w >= max_windows:
+                    if stop_fn is not None:
+                        stop_fn()
+                    break
+            elif proc.poll() is not None:
+                ended_at = clk.time() if ended_at is None else ended_at
+                if clk.time() - ended_at >= drain_seconds:
+                    break
+    finally:
+        if timing is not None:
+            timing.close()
+    return windows
+
+
 class NetSummarizer:
     """Window features from the register snapshots taken at each window end
     (collect_windows_live): deltas against the previous snapshot of the same
@@ -2453,6 +2598,23 @@ def build_arg_parser(profile: Optional[str] = None) -> argparse.ArgumentParser:
                          "gRPC client, one Sync and one batched Read per register table per window "
                          "(batched_reader.py)")
     ap.add_argument("--batched-reader", default=DEFAULT_BATCHED_READER)
+    ap.add_argument("--switch-program", choices=["buckets", "exact"], default="buckets",
+                    help="the P4 program on the switch: 'buckets' (basic_fix and its test builds: per-bucket "
+                         "registers read at each window end) or 'exact' (perf/variants/exact: the window features "
+                         "computed in the data plane, read by window_reader.py; p4_perf.md section 5.7)")
+    ap.add_argument("--window-markers", choices=["cpu", "inband"], default="cpu",
+                    help="exact: who starts the switch's windows. 'cpu': the reader, from the switch's CPU port "
+                         "(--cpu-iface), at the collector's window boundaries; 'inband': the scenario, in order with "
+                         "its traffic (a replay with replay_absolute.py --markers), from --marker-port")
+    ap.add_argument("--marker-port", type=int, default=None,
+                    help="exact, --window-markers inband: the dev_port the scenario's markers enter (default "
+                         "--forward-int-port)")
+    ap.add_argument("--frame-min", action="append", default=None,
+                    help="exact: DST/PREFIX toward which packets count at least the 60-byte frame minimum, as the "
+                         "host's own capture saw them (the dataset profile: 10.0.0.10/32)")
+    ap.add_argument("--window-reader", default=DEFAULT_WINDOW_READER)
+    ap.add_argument("--exact-read-timeout", type=float, default=5.0,
+                    help="exact: how long a window's read waits for the window to end on the switch")
     ap.add_argument("--grpc-addr", default=DEFAULT_GRPC_ADDR,
                     help="BF Runtime gRPC server for --reader batched; with --switch-ssh the reader runs on the "
                          "switch, so this is the address as seen from there")
@@ -2576,6 +2738,12 @@ def main() -> None:
     if args.hostmon_cgroup and args.mode != "command":
         ap.error("--hostmon-cgroup applies to --mode command (the replayed packets have no local process to monitor)")
 
+    exact = args.switch_program == "exact"
+    if exact and args.sockowner:
+        ap.error("--sockowner needs the per-bucket registers of --switch-program buckets: perf/variants/exact keeps "
+                 "no per-flow counters for the socket-level join")
+    if exact and args.global_totals:
+        ap.error("--global-totals is for the gtot test build; --switch-program exact computes the windows itself")
     if args.sockowner and not args.hostmon_cgroup:
         ap.error("--sockowner needs --hostmon-cgroup: the socket-level join selects the flows of that cgroup")
     if args.mode == "pcap" and not args.pcap:
@@ -2586,14 +2754,15 @@ def main() -> None:
         print(f"[WARN] --duration-unit s resolves the 32-bit timestamp wrap from the windows; with {args.window_sec} s "
               f"windows (over {TS_WRAP_S / 2:.2f} s) a duration can be off by a multiple of {TS_WRAP_S:.3f} s")
 
-    for needed in [args.hostmon, args.p4_reader if args.reader == "legacy" else args.batched_reader]:
+    for needed in [args.hostmon, args.window_reader if exact else
+                   (args.p4_reader if args.reader == "legacy" else args.batched_reader)]:
         if not Path(needed).exists():
             raise FileNotFoundError(f"Required file not found: {needed}")
 
     if not args.skip_p4_forwarding and not Path(args.p4_forwarder).exists():
         raise FileNotFoundError(f"Forwarding setup file not found: {args.p4_forwarder}")
 
-    if not args.no_register_reset and not Path(args.p4_resetter).exists():
+    if not exact and not args.no_register_reset and not Path(args.p4_resetter).exists():
         raise FileNotFoundError(f"Register reset script not found: {args.p4_resetter}")
 
     if args.mode == "pcap" and not Path(args.replay_script).exists():
@@ -2605,6 +2774,7 @@ def main() -> None:
     workload_proc = None
     report_collector = None
     batched_reader = None
+    window_reader = None
     cgroup_path: Optional[Path] = None
     cgroup_created = False
 
@@ -2632,7 +2802,7 @@ def main() -> None:
 
     def on_window(win: Dict[str, object]) -> None:
         net_windows.append(win)
-        net_summaries.append(summarizer.add(win))
+        net_summaries.append(win["exact_features"] if "exact_features" in win else summarizer.add(win))
         write_ready_rows(read_host_windows(args.hostmon_log), final=False)
 
     try:
@@ -2647,7 +2817,22 @@ def main() -> None:
                 switch_ssh=args.switch_ssh,
             )
 
-        if args.no_register_reset:
+        if exact:
+            # perf/variants/exact: its reader clears the registers, installs frame_len and the marker ports
+            window_reader = WindowReaderProcess(
+                args.window_reader, grpc_addr=args.grpc_addr, p4_name=args.p4_name,
+                switch_ssh=None if args.reader_local else args.switch_ssh,
+                remote_sde_install=args.remote_sde_install, cpu_iface=args.cpu_iface)
+            print(f"[INFO] window reader ready: {json.dumps(window_reader.start())}")
+            marker_ports = [int(args.forward_report_port)] if args.window_markers == "cpu" else [
+                args.marker_port if args.marker_port is not None else int(args.forward_int_port)]
+            got = window_reader.request({"cmd": "setup", "reset": not args.no_register_reset,
+                                         "frame_min": args.frame_min or [], "marker_ports": marker_ports},
+                                        timeout=300)
+            if "error" in got:
+                raise P4ReadError(f"window reader setup: {got['error']}")
+            print(f"[INFO] exact build: {json.dumps({k: v for k, v in got.items() if k != 'sizes'})}")
+        elif args.no_register_reset:
             print("[WARN] P4 registers not cleared (--no-register-reset): a flow that lands in a bucket left "
                   "from an earlier run sends no CPU report and is not counted")
         else:
@@ -2655,7 +2840,7 @@ def main() -> None:
             run_p4_register_reset(args.p4_resetter, switch_ssh=args.switch_ssh)
 
         read_fn = None
-        if args.reader == "batched":
+        if args.reader == "batched" and not exact:
             batched_reader = BatchedReaderProcess(
                 args.batched_reader, grpc_addr=args.grpc_addr, client_id=args.grpc_client_id, p4_name=args.p4_name,
                 switch_ssh=None if args.reader_local else args.switch_ssh,
@@ -2672,10 +2857,15 @@ def main() -> None:
         timing_log = make_timing_logger(args.reader, args.reader_timing_file) if timing_on else None
 
         where = f"{args.switch_ssh}:{args.cpu_iface}" if args.switch_ssh else args.cpu_iface
-        print(f"[INFO] Collecting CPU reports on {where}")
-        report_collector = ReportCollector(args.cpu_iface, ssh_host=args.switch_ssh).start()
+        if exact:
+            pass   # no CPU reports: the windows come from the window registers
+        else:
+            print(f"[INFO] Collecting CPU reports on {where}")
+            report_collector = ReportCollector(args.cpu_iface, ssh_host=args.switch_ssh).start()
         t_capture = time.time()
-        if report_collector.wait_ready(REPORT_CAPTURE_READY_S):
+        if exact:
+            pass
+        elif report_collector.wait_ready(REPORT_CAPTURE_READY_S):
             print(f"[INFO] CPU-report capture listening after {time.time() - t_capture:.1f} s")
         else:
             said = "; ".join(report_collector.capture_messages[-3:]) or "no message"
@@ -2748,47 +2938,68 @@ def main() -> None:
         def stop_fn() -> None:
             stop_scenario(workload_proc, own_session=args.launcher == "dataset")
 
-        collect_windows_live(
-            collector=report_collector,
-            proc=workload_proc,
-            window_sec=args.window_sec,
-            drain_seconds=args.drain_seconds if args.mode == "pcap" else 0.0,
-            global_t0=global_t0,
-            reader_path=args.p4_reader,
-            active_ttl_windows=args.active_ttl_windows,
-            switch_ssh=args.switch_ssh,
-            snapshot=args.p4_snapshot,
-            clear_idle_windows=args.clear_idle_windows,
-            read_timeout=args.p4_read_timeout,
-            read_retries=args.p4_read_retries,
-            on_window=on_window,
-            read_fn=read_fn,
-            timing_log=timing_log,
-            read_budget_frac=args.read_budget_frac,
-            max_read_buckets=args.max_read_buckets,
-            max_dst_reads=args.max_dst_reads,
-            cost_model=cost_model,
-            clear_expired=bool(args.clear_expired),
-            clear_budget_frac=args.clear_budget_frac,
-            dormant_reads=bool(args.dormant_reads),
-            dormant_probe=bool(args.dormant_probe),
-            global_totals=bool(args.global_totals),
-            totals_cut=args.totals_cut,
-            max_windows=args.windows,
-            stop_fn=stop_fn if args.windows else None,
-        )
-        report_collector.stop()
+        if exact:
+            print(f"[INFO] exact build: window markers {args.window_markers}, {args.byte_layer} bytes, durations in "
+                  f"{args.duration_unit}" + (f", exactly {args.windows} windows" if args.windows else ""))
+            collect_windows_exact(
+                window_reader, workload_proc, args.window_sec, global_t0, markers=args.window_markers,
+                on_window=on_window, max_windows=args.windows, stop_fn=stop_fn if args.windows else None,
+                drain_seconds=args.drain_seconds if args.mode == "pcap" else 0.0,
+                read_timeout=args.exact_read_timeout,
+                header=ETHERNET_HEADER_BYTES if args.byte_layer == "frame" else 0,
+                duration_unit=args.duration_unit, timing_path=args.reader_timing_file)
+            window_reader.stop()
+            window_reader = None
+        else:
+            collect_windows_live(
+                collector=report_collector,
+                proc=workload_proc,
+                window_sec=args.window_sec,
+                drain_seconds=args.drain_seconds if args.mode == "pcap" else 0.0,
+                global_t0=global_t0,
+                reader_path=args.p4_reader,
+                active_ttl_windows=args.active_ttl_windows,
+                switch_ssh=args.switch_ssh,
+                snapshot=args.p4_snapshot,
+                clear_idle_windows=args.clear_idle_windows,
+                read_timeout=args.p4_read_timeout,
+                read_retries=args.p4_read_retries,
+                on_window=on_window,
+                read_fn=read_fn,
+                timing_log=timing_log,
+                read_budget_frac=args.read_budget_frac,
+                max_read_buckets=args.max_read_buckets,
+                max_dst_reads=args.max_dst_reads,
+                cost_model=cost_model,
+                clear_expired=bool(args.clear_expired),
+                clear_budget_frac=args.clear_budget_frac,
+                dormant_reads=bool(args.dormant_reads),
+                dormant_probe=bool(args.dormant_probe),
+                global_totals=bool(args.global_totals),
+                totals_cut=args.totals_cut,
+                max_windows=args.windows,
+                stop_fn=stop_fn if args.windows else None,
+            )
+        if report_collector is not None:
+            report_collector.stop()
         if batched_reader is not None:
             batched_reader.stop()
-        print(f"[INFO] CPU reports: {sum(w['report_count'] for w in net_windows)} in "
-              f"{len(net_windows)} windows; index mismatches: "
-              f"{sum(w['index_mismatches'] for w in net_windows)}; buckets cleared: "
-              f"{sum(len(w['cleared_indexes']) for w in net_windows)} "
-              f"({sum(len(w.get('expired_cleared_indexes') or []) for w in net_windows)} of them expired, "
-              f"unconditionally); clear backlog after the last window: "
-              f"{net_windows[-1]['report_aggregates']['net_clear_backlog'] if net_windows else 0}; "
-              f"cleared at the end of the run: "
-              f"{len(net_windows[-1].get('final_cleared_indexes') or []) if net_windows else 0}")
+        if exact:
+            print(f"[INFO] exact build: {len(net_windows)} windows; packets without a slot "
+                  f"{sum(x['net_untracked_pkts'] for x in net_summaries)}, windows lost "
+                  f"{sum(x['net_window_lost'] for x in net_summaries)}, unclocked packets "
+                  f"{sum(x['net_unclocked_pkts'] for x in net_summaries)}, rejected markers "
+                  f"{sum(x['net_rejected_markers'] for x in net_summaries)}")
+        else:
+            print(f"[INFO] CPU reports: {sum(w['report_count'] for w in net_windows)} in "
+                  f"{len(net_windows)} windows; index mismatches: "
+                  f"{sum(w['index_mismatches'] for w in net_windows)}; buckets cleared: "
+                  f"{sum(len(w['cleared_indexes']) for w in net_windows)} "
+                  f"({sum(len(w.get('expired_cleared_indexes') or []) for w in net_windows)} of them expired, "
+                  f"unconditionally); clear backlog after the last window: "
+                  f"{net_windows[-1]['report_aggregates']['net_clear_backlog'] if net_windows else 0}; "
+                  f"cleared at the end of the run: "
+                  f"{len(net_windows[-1].get('final_cleared_indexes') or []) if net_windows else 0}")
 
         workload_proc.wait()
         workload_rc = workload_proc.returncode
@@ -2874,6 +3085,9 @@ def main() -> None:
 
         if batched_reader is not None:
             batched_reader.stop()
+
+        if window_reader is not None:
+            window_reader.stop()
 
         if cgroup_path is not None:
             cleanup_cgroup(cgroup_path, cgroup_created)

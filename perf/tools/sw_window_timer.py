@@ -3,7 +3,8 @@
 
     python2.7 sw_window_timer.py OUT_JSON --period-ns 500000000 --seconds 20 [--pipe 1] [--local-port 68]
 
-For a build compiled with -DTIMER_PORT=<the generator port> (pipe 1, local port 68: dev_port 196): timer app 0 of
+A build of perf/variants/exact with -DTIMER_LOCAL_PORT=68 ticks its window clock on timer packets from that local port of any
+pipe (pipe 1: dev_port 196). Timer app 0 of
 the pipe's generator sends one 64-byte frame (not IPv4, EtherType 0x88B6) every PERIOD ns from that port; the
 program advances reg_epoch on each and drops it. This tool enables the app, polls reg_epoch (every --poll-ms) for
 SECONDS, disables the app and the generator port again, and reports the epochs seen with this host's time of the

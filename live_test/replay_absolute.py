@@ -16,7 +16,10 @@ the window it starts) is sent at each window boundary of the capture, --marker-a
 --marker-window-us for k = 0..--marker-windows, carrying epoch --marker-first-epoch + k. It goes in
 order with the capture's frames, before every frame whose whole-microsecond time is at or after the
 boundary (the window rule of features/switch_model.py), so the switch's windows are the capture's
-windows whatever the replay's timing. The schedule then starts at the first marker.
+windows whatever the replay's timing; a late start (loading a big capture) shifts the whole schedule instead
+of sending the markers due by then at once. Inside hybrid_collector (--window-markers inband) the defaults put
+marker k at the start of collector window k: the anchor (--anchor-offset after the first frame) minus
+--align-window windows of --window-sec. Frames keep their times relative to the first capture frame.
 
 Needs root (a raw packet socket). Frames the interface refuses (larger than its MTU) are counted
 as failed and skipped, as tcpreplay does. Prints one line of statistics at the end.
@@ -86,17 +89,22 @@ def main():
     ap.add_argument("--window-sec", type=float, default=1.0)
     ap.add_argument("--spin", type=float, default=0.001, help="busy-wait this long before each frame instead of sleeping")
     ap.add_argument("--markers", action="store_true", help="send window markers (perf/variants/exact)")
-    ap.add_argument("--marker-anchor-us", type=int, help="the capture time of the first window's start (us)")
-    ap.add_argument("--marker-window-us", type=int, default=500000)
+    ap.add_argument("--marker-anchor-us", type=int, help="the capture time of the first window's start (us; "
+                    "default: the anchor minus --align-window windows)")
+    ap.add_argument("--marker-window-us", type=int, help="default: --window-sec")
     ap.add_argument("--marker-windows", type=int, default=40, help="windows: markers 0..N, the last one ends window N-1")
     ap.add_argument("--marker-first-epoch", type=int, default=1)
     args = ap.parse_args()
     if args.markers:
-        if args.marker_anchor_us is None:
-            sys.exit("--markers needs --marker-anchor-us")
+        window_us = args.marker_window_us or int(round(args.window_sec * 1e6))
+        anchor_us = args.marker_anchor_us
+        if anchor_us is None:
+            first = read_pcap_us(args.capture)[:1]
+            if not first:
+                sys.exit("%s holds no frames" % args.capture)
+            anchor_us = first[0][0] + int(round(args.anchor_offset * 1e6)) - args.align_window * window_us
         mac = bytes.fromhex(Path("/sys/class/net/%s/address" % args.iface).read_text().strip().replace(":", ""))
-        events = with_markers(args.capture, mac, args.marker_anchor_us, args.marker_window_us,
-                              args.marker_windows, args.marker_first_epoch)
+        events = with_markers(args.capture, mac, anchor_us, window_us, args.marker_windows, args.marker_first_epoch)
         frames = [(t, f) for t, f, _ in events]
         is_marker = [m for _, _, m in events]
     else:
@@ -112,9 +120,19 @@ def main():
         sys.exit("give --start-at, or run inside hybrid_collector (%s)" % args.t0_env)
     sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
     sock.bind((args.iface, 0))
-    c0 = frames[0][0]
+    # times relative to the first capture frame (markers before it go out at once, in order)
+    c0 = next((t for (t, _f), m in zip(frames, is_marker) if not m), frames[0][0])
     late_start = time.time() - start
-    if late_start > 0:
+    if args.markers:
+        # late against the first event (the first marker comes before the first frame)
+        late_start = time.time() - (start + (frames[0][0] - c0))
+    if late_start > 0 and args.markers:
+        # the windows are the markers' (perf/variants/exact): shift the whole schedule rather than send the markers
+        # due by now in one burst (a burst ends windows faster than the reader can read them)
+        start += late_start + 0.05
+        print("[replay_absolute] started %.3f s after the requested start (loading the capture): the schedule, "
+              "markers included, is shifted by %.3f s" % (late_start, late_start + 0.05), flush=True)
+    elif late_start > 0:
         print("[replay_absolute] WARNING: started %.3f s after the requested start; frames until then go out at once"
               % late_start, flush=True)
     late, failed, markers_sent = [], 0, 0

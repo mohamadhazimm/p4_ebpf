@@ -3,9 +3,13 @@
 window_reader.py --follow prints, per finished window e, the window registers of bank e & 1: the
 additive ones as they are (they are never cleared), the extremes as the window left them (the reader
 clears them after the read). WindowFeatures.add() takes these lines in epoch order and returns the
-window's features (the model's names), plus net_untracked_pkts (packets of flows that found no slot
-in the flow table: the window's flow features are then not exact) and net_window_lost (the read came
-after the bank's next window had started).
+window's features (the model's names), plus
+    net_untracked_pkts    packets of flows that found no slot in the flow table (the window's flow
+                          features are then not exact);
+    net_window_lost       the read came after the bank's next window had started, a late clear may have
+                          wiped the window's extremes, or the clocked pipes changed;
+    net_unclocked_pkts    packets counted by a pipe whose clock lags (they belong to no window);
+    net_rejected_markers  window markers from ports outside marker_ports since the window before.
 
 The rebuild (ingress.p4's header comment): a flow is active in window e if its last packet is in
 e-3..e. For a per-flow value v (min length, max length, duration; 1 for the count; has-B->A for
@@ -54,6 +58,7 @@ class WindowFeatures:
         self.prev: Dict[Any, Any] = {}         # (register, index) -> value at the bank's previous read
         self.hist: Dict[int, Dict[str, Any]] = {}
         self.last_epoch: Optional[int] = None
+        self.prev_rejected: Optional[int] = None
 
     def window_registers(self, line: Dict[str, Any]) -> Dict[str, Any]:
         """The window's own values: differences of the additive registers, the extremes as read."""
@@ -150,6 +155,12 @@ class WindowFeatures:
         })
         out["net_untracked_pkts"] = tot.get(0, [0, 0])[0] + tot.get(1, [0, 0])[0]
         out["net_window_lost"] = int(bool(line.get("lost")))
+        out["net_unclocked_pkts"] = int(line.get("unclocked_pkts") or 0)
+        rejected = line.get("rejected_markers")
+        out["net_rejected_markers"] = 0 if rejected is None or self.prev_rejected is None else \
+            (int(rejected) - self.prev_rejected) & M32
+        if rejected is not None:
+            self.prev_rejected = int(rejected)
         return out
 
 

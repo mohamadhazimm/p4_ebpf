@@ -97,6 +97,7 @@ struct my_ingress_metadata_t {
     bit<16> l4_sport;
     bit<16> l4_dport;
     bit<1>  is_flow;        /* IPv4 (first fragment or unfragmented) TCP or UDP, as the model counts */
+    bit<1>  bad_marker;     /* a window marker frame from a port not in marker_ports */
 
     bit<32> epoch;          /* the window this packet counts in */
     bit<1>  bank;           /* epoch & 1: which of the two banks of the window registers */

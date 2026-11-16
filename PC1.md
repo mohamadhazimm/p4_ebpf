@@ -1388,3 +1388,94 @@ because I passed the root wrapper as a relative path (`failed_relative_asroot/`)
 - **Archive:** `live_test/committee_replay/pc1_20261116_exact.tar.xz` holds the runs (reads, windows, rows,
   summaries, logs), `exact_compare.csv`, `replay_rows_exact.csv`, the offline analysis, the build records, the
   latency, line rate and timer results, and the scripts.
+
+## Results, part 6b (PC1, 2026-11-16): the exact build hardened, and hybrid_collector.py on it
+
+The user asked for the fixes of the review and for `hybrid_collector.py` to match the P4 code.
+
+**The program** (`perf/variants/exact/`, build `basic_exact_v3`; README.md there):
+- **Markers only from configured ports.**
+  - The parser takes a window marker only from the ports in the value set `marker_ports`, which the reader
+    fills: the CPU port 192 when the collector's reader sends the markers, the replay host's port 132 for an
+    in-band replay, none with the timer.
+  - A marker from any other port is dropped and counted (`rejected_markers`).
+  - **Test:** with `marker_ports` = {192}, five forged markers sent from PC1 through port 132 left the clock
+    at 0 and counted 5. A marker from the CPU port showed on the clock 1.6 ms after it was sent.
+- **Timer per pipe.**
+  - A deployment build (`-DTIMER_LOCAL_PORT=68`) ticks each pipe's clock from that pipe's own generator.
+    `basic_exact_v3_timer`: 40 ticks in 20 s, 0.5000 s apart as polled (0.4978-0.5024), no tick counted.
+  - The default build has no timer port, so the line-rate generator's ports stay traffic ports.
+  - Local port 71, tried first, never ticked: the generator showed no sign of sending from it.
+- **Per-pipe clocks in the reader.**
+  - A window combines only the pipes whose clock has passed it.
+  - The packets of a pipe whose clock lags are reported (`net_unclocked_pkts`), not mixed in.
+  - A window whose set of clocked pipes changed is marked lost.
+- **The reader race:** a clear of the extremes that ends after the bank's next window started marks that window
+  lost.
+- **Not changed:** the flow table keeps every flow of a run. Aging in the data plane would let a live flow in a
+  later way claim a second slot after an earlier way's slot is freed, so it would need recirculation. The
+  README and p4_perf.md section 9 say so.
+- **Resources:** same 11 ingress stages, 23 stateful ALUs and 260 cycles; 122 SRAM blocks (+2, the counter).
+  Line rate: the same as before and lossless, with the window totals exact for 13.1 billion packets
+  (`linerate_exact_v3_20261116/`).
+
+**hybrid_collector.py `--switch-program exact`:**
+- `window_reader.py --serve` runs on the switch. It sets the program up (reset, `frame_len`, marker ports) and
+  sends or follows the markers.
+- `collect_windows_exact()` takes each window's 29 features from `window_features.py`, the code of
+  `exact_replay.py`. It adds `net_untracked_pkts`, `net_window_lost`, `net_unclocked_pkts` and
+  `net_rejected_markers`.
+- There is no CPU report, bucket or read budget in this mode.
+- `--sockowner` and `--global-totals` are refused: they need the bucket program.
+- **`--window-markers cpu` (live):** the reader sends the markers from the switch's CPU port at the collector's
+  window boundaries.
+  - **Test:** a plain replay of bulk2000 in 1 s windows. All 24,008 packets counted; 26 of 26 checkable windows
+    within the bounds of the packets sent between their markers (on this host's clock, via the reader's
+    timestamps). A marker showed on the clock a median 2.8 ms after the reader sent it (max 3.3 ms). No lost
+    window, no rejected marker.
+- **`--window-markers inband` (replays):** `replay_capture.py --exact` makes `replay_absolute.py` send a marker
+  at each collector window boundary, in order with the frames. The reader follows the switch's clock itself and
+  reads each window as soon as it ends.
+  - **Self-check:** every window must equal the frames the replayer sent between its markers, taken from the
+    replayer's own schedule: the capture, less frames over the MTU. tcpdump's send capture is kept as a
+    secondary figure, because it dropped 14-26 frames in goldeneye_p10's bursts.
+
+**Two faults found by the collector runs, both fixed:**
+- **Lost windows in two floods.** The first run of all 109 (`exact_collector/runs/`) lost 5 windows each in Chaos
+  and udp_sink_250k, which cost 2-3 windows' extremes.
+  - Cause: the replayer takes up to 1.9 s to load a big capture. It counted itself late only against the first
+    frame, so the markers of the 4 empty alignment windows, due earlier, went out in one burst.
+  - The reads of those empty windows then cleared a bank's extremes after the dataset's first window had
+    started in it. The reader's new check flagged exactly that.
+  - Fix: `replay_absolute.py` now measures lateness from the first marker and shifts the whole schedule, so
+    there is no burst. The windows are the markers', so the shift changes nothing the switch counts.
+- **PC1 lag.** The reader now follows the clock on the switch ("follow") instead of waiting for PC1's
+  requests.
+
+**All 109 captures on the final code** (`exact_collector/runs_follow/`; `compare_collector.py`):
+
+| | calm (96) | overloaded on basic_fix (11) | bulkup_200/400 | all 109 |
+|---|---|---|---|---|
+| windows equal to the frames sent between their markers | 4,224 / 4,224 | 484 / 484 | 88 / 88 | 4,796 / 4,796 |
+| packets counted / sent | 618,805 / 618,805 | 820,823 / 820,823 | 30,150 / 30,150 | 1,469,778 / 1,469,778 |
+| windows lost | 0 | 0 | 0 | 0 |
+| rows equal to part 6's driver row (135 non-duration columns) | 96 | 11 | 2 | **109** |
+| rows equal to the published row (135 columns) | 96 | 6 | 0 | **102** |
+
+- **The collector gives the same rows as the standalone driver.** All 109 rows equal part 6's in every
+  non-duration column, so the collector matches the P4 code.
+- The 7 rows not equal to the published ones are part 6's: the bulk uploads (frames over the MTU) and the
+  five floods with more distinct flows than slots (121,521 packets without a slot, counted and reported).
+- The thesis rows from this path: `perf/results/exact_collector/replay_rows_exact_collector.csv`.
+- **Timing:** 12 of the floods were run first, with both fixes in. The replayer started 0.18-1.9 s late in each
+  (loading) and shifted its schedule. The other 97 followed, 11:43-12:47 on PC1's clock, about 36 s each.
+- **Before the fixes:** the first run (`exact_collector/runs/`) had 101 rows equal to the published ones, 107
+  equal to the driver's, and 16 lost windows.
+
+**Latency** of `basic_hwl_exact_v3`: median 421 ns (420-426 ns, p99 424-425 ns), as part 6's build: 1010 of 1010 reports in each of 3 runs (`perf/results/latency_exact_v3_20261116/`).
+
+**State after:** `basic_fix` running again (pid 16998 in `hz_sw`), restored by `hwl_runs.sh`, checked with the first cohort capture
+(9 / 9 packets, 40 of 40 windows inside the bounds; `committee_replay/restored_check_exact_v3/`); `enp5s0` down.
+`live_test/committee_replay/pc1_20261116_exact_v3.tar.xz`: the collector runs (final and first; without the send
+captures `tx.pcap.gz`, which stay in `perf/results/exact_collector/`), the live test, the build records, line rate,
+latency, timer results, the scripts.
