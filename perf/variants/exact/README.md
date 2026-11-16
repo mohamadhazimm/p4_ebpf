@@ -34,7 +34,7 @@ Then it reads one window at a time, either following the clock (`--follow`) or o
 |---|---|---|
 | Live collection: `hybrid_collector.py --switch-program exact --window-markers cpu` | The reader sends a marker from the CPU port at each of the collector's window boundaries, about 3 ms to take effect. | the CPU port, 192 |
 | Dataset replay: `replay_capture.py --exact`, or `live_test/exact_replay.py` | The replayer sends the markers in order with the capture's frames. | the replay host's port, 132 |
-| Deployment without a collector clock | Build with `-DTIMER_LOCAL_PORT=68` and start a timer app on every pipe's generator, back to back (`perf/tools/sw_window_timer.py --pipes 0,1`; they then tick within about 1 ms of each other). The collector has no timer mode: `window_reader.py --follow` reads the windows. | none |
+| Timer (a build with `-DTIMER_LOCAL_PORT=68`): `hybrid_collector.py --switch-program exact --window-markers timer`, or `window_reader.py --follow --timer-ns NS` alone | The reader starts timer app 0 of every pipe's generator (local port 68), one pipe after the other, so the pipes tick about 1 ms apart. The collector has it configured first and enabled one window before its window 0, so the first tick starts window 0, 2.4-3.8 ms after the collector's boundary. The ticks then drift with the switch's clock against the host's (under 40 ppm on the Wedge, about 1 ms over a 27 s run). The reader stops the timer when it exits. | none |
 
 A marker frame from any other port is dropped and counted (`rejected_markers`), so a monitored host
 cannot move the window clock.

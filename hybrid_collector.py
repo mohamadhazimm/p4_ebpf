@@ -1961,6 +1961,26 @@ def exact_summary(feats: Dict[str, Any], duration_unit: str = "s") -> Dict[str, 
     return out
 
 
+def start_window_timer(reader: Any, first_tick_at: float, window_sec: float, clock: Any = None) -> Dict[str, Any]:
+    """--window-markers timer: start the generators' timers one window before first_tick_at (this host's clock),
+    so that their first tick, which starts the switch's epoch 1, falls on the start of the collector's window 0
+    (as the first CPU marker does). The generators are configured first ("prepare", about 20 ms); at the start
+    time only the enables go out, through the reader's pipe and one gRPC write per pipe, so the ticks come a few ms
+    after the boundaries. They then drift with the switch's clock against this host's (15-40 ppm on the Wedge,
+    PC1.md parts 6d-6e)."""
+    clk = clock if clock is not None else time
+    r = reader.request({"cmd": "timer", "prepare": True, "period_ns": int(round(window_sec * 1e9))})
+    if "error" in r:
+        raise P4ReadError(f"window timer: {r['error']}")
+    delay = first_tick_at - window_sec - clk.time()
+    if delay > 0:
+        clk.sleep(delay)
+    r = reader.request({"cmd": "timer", "enable": True})
+    if "error" in r:
+        raise P4ReadError(f"window timer: {r['error']}")
+    return r
+
+
 def collect_windows_exact(
     reader: Any,
     proc: subprocess.Popen,
@@ -1982,7 +2002,9 @@ def collect_windows_exact(
     the start and epoch w + 2 at the end of window w, so the switch's windows are the collector's (cut
     when the marker enters the pipeline, ~1 ms after the boundary, the same for every register). markers
     "inband": the scenario sends them in order with its traffic (live_test/replay_absolute.py --markers in
-    a replay); the collector only reads. After each boundary the reader waits until window w has ended on
+    a replay); the collector only reads. "timer": every pipe's packet generator ticks the clock, started by
+    start_window_timer() so that its first tick starts epoch 1 at the start of window 0; the collector only
+    reads, as with in-band markers. After each boundary the reader waits until window w has ended on
     the switch (at most read_timeout s), reads it and clears it; window_features.py gives its features. With
     in-band markers the reader follows the switch's clock itself ("follow") and reads each window as soon as
     it ends, so a collector slowed down by its host (a flood replay on PC1's two CPUs) cannot read a window
@@ -2024,7 +2046,9 @@ def collect_windows_exact(
             marked = mark(w + 2) if markers == "cpu" else None
             line = reader.request({"cmd": "read", "epoch": w + 1, "timeout": read_timeout})
             if "error" in line:
-                raise P4ReadError(f"window {w}: {line['error']}")
+                hint = (" (no tick: is the program built with -DTIMER_LOCAL_PORT=68?)"
+                        if markers == "timer" and w == 0 else "")
+                raise P4ReadError(f"window {w}: {line['error']}{hint}")
             feats = wf.add(line)
             win: Dict[str, object] = {
                 "net_window_id": w, "net_window_start_sec": w * window_sec,
@@ -2605,10 +2629,12 @@ def build_arg_parser(profile: Optional[str] = None) -> argparse.ArgumentParser:
                     help="the P4 program on the switch: 'buckets' (basic_fix and its test builds: per-bucket "
                          "registers read at each window end) or 'exact' (perf/variants/exact: the window features "
                          "computed in the data plane, read by window_reader.py; p4_perf.md section 5.7)")
-    ap.add_argument("--window-markers", choices=["cpu", "inband"], default="cpu",
+    ap.add_argument("--window-markers", choices=["cpu", "inband", "timer"], default="cpu",
                     help="exact: who starts the switch's windows. 'cpu': the reader, from the switch's CPU port "
                          "(--cpu-iface), at the collector's window boundaries; 'inband': the scenario, in order with "
-                         "its traffic (a replay with replay_absolute.py --markers), from --marker-port")
+                         "its traffic (a replay with replay_absolute.py --markers), from --marker-port; 'timer': "
+                         "every pipe's packet generator, a tick every --window-sec from the collector's window 0 on "
+                         "(a build with -DTIMER_LOCAL_PORT=68; no marker counts)")
     ap.add_argument("--marker-port", type=int, default=None,
                     help="exact, --window-markers inband: the dev_port the scenario's markers enter (default "
                          "--forward-int-port)")
@@ -2749,6 +2775,7 @@ def main() -> None:
                  "no per-flow counters for the socket-level join")
     if exact and args.global_totals:
         ap.error("--global-totals is for the gtot test build; --switch-program exact computes the windows itself")
+    timer_mode = exact and args.window_markers == "timer"
     if args.sockowner and not args.hostmon_cgroup:
         ap.error("--sockowner needs --hostmon-cgroup: the socket-level join selects the flows of that cgroup")
     if args.mode == "pcap" and not args.pcap:
@@ -2829,8 +2856,12 @@ def main() -> None:
                 switch_ssh=None if args.reader_local else args.switch_ssh,
                 remote_sde_install=args.remote_sde_install, cpu_iface=args.cpu_iface)
             print(f"[INFO] window reader ready: {json.dumps(window_reader.start())}")
-            marker_ports = [int(args.forward_report_port)] if args.window_markers == "cpu" else [
-                args.marker_port if args.marker_port is not None else int(args.forward_int_port)]
+            if args.window_markers == "cpu":
+                marker_ports = [int(args.forward_report_port)]
+            elif args.window_markers == "inband":
+                marker_ports = [args.marker_port if args.marker_port is not None else int(args.forward_int_port)]
+            else:
+                marker_ports = []          # the timer: no marker frame may move the clock
             frame_min = args.frame_min if args.frame_min is not None else args.frame_min_default
             frame_min = [f for f in frame_min if f != "none"]
             got = window_reader.request({"cmd": "setup", "reset": not args.no_register_reset,
@@ -2912,8 +2943,12 @@ def main() -> None:
             print(f"[INFO] Starting the in-kernel monitor {args.hostmon} on {cgroup_path} with window_sec={args.window_sec}")
             host_proc = start_hostmon_agg(args.hostmon, args.hostmon_log, args.window_sec, cgroup_path)
             print("[INFO] " + wait_for_line(args.hostmon_log, "HOSTMON_READY", 30.0, host_proc))
-            start_mono = time.monotonic() + 1.0
+            start_mono = time.monotonic() + (max(1.0, args.window_sec + 0.5) if timer_mode else 1.0)
             send_hostmon_start(host_proc, start_mono)
+            if timer_mode:
+                started = start_window_timer(window_reader, time.time() + start_mono - time.monotonic(),
+                                             args.window_sec)
+                print(f"[INFO] exact build: window timer {json.dumps(started)}")
             time.sleep(max(0.0, start_mono - time.monotonic()))
             global_t0 = time.time()
             clock_offset_ns = time.monotonic_ns() - time.time_ns()   # sockowner's clock vs the windows' wall clock
@@ -2923,6 +2958,11 @@ def main() -> None:
             print(f"[INFO] Starting HostMon with window_sec={args.window_sec}")
             host_proc = start_hostmon(args.hostmon, args.hostmon_log, args.window_sec)
             time.sleep(0.2)
+            if timer_mode:
+                first_tick = time.time() + args.window_sec + 0.3
+                started = start_window_timer(window_reader, first_tick, args.window_sec)
+                print(f"[INFO] exact build: window timer {json.dumps(started)}")
+                time.sleep(max(0.0, first_tick - time.time()))
             global_t0 = time.time()
             os.environ["HYBRID_T0"] = repr(global_t0)   # the window origin, for the scenario (RUNBOOK 19.6)
             workload_proc = launch()

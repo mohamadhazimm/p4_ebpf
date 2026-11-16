@@ -1616,9 +1616,8 @@ and traffic in a second pipe. Results in `perf/results/exact_timer_traffic_20261
   never ticked in part 6b.
 - `sw_pktgen_run.py`'s help now says so.
 
-**Not changed:** the P4 code (one comment), the builds, the collector. The collector still has no timer mode:
-with the timer, `window_reader.py --follow` reads the windows. The live hybrid runs keep CPU-port markers, which
-fix the windows to the host's.
+**Not changed:** the P4 code (one comment), the builds, the collector. The collector had no timer mode yet;
+part 6e adds it.
 
 **Unit tests:** 206 run, the same single known error (`test_sockjoin`: the release's Python 3.9 dict syntax on
 PC1's 3.8); `test_exact_windows.py` has 21 tests (16 before).
@@ -1632,3 +1631,60 @@ PC1's 3.8); `test_exact_windows.py` has 21 tests (16 before).
   - It was brought up for the check and set down again afterwards.
 - **Archive:** `live_test/committee_replay/pc1_20261116_exact_timer.tar.xz` holds the runs (reads, send logs,
   timer and generator reports, analyses) and the scripts.
+
+## Results, part 6e (PC1, 2026-11-16): the collector's timer mode
+
+The user asked for the open item of part 6d: `hybrid_collector.py` had no timer mode. Results in
+`perf/results/exact_timer_collector_20261116/` (scripts there).
+
+**What was added.**
+- **`window_reader.py` starts the timer itself.** The reader owns the program's gRPC binding, so it drives the
+  generators itself (`WindowTimer`): timer app 0 of every pipe on local port 68, one pipe after the other.
+  - `--serve` command `{"cmd": "timer", ...}`: `prepare` configures the apps (about 20 ms), `enable` starts them
+    (about 1 ms per pipe), `stop` stops them. Quit, end of input, SIGTERM and errors stop them too.
+  - A setup with reset first stops any timer left running, so no stale tick moves the clock.
+  - `--follow --timer-ns NS` does the same without the collector.
+- **`hybrid_collector.py --window-markers timer`:**
+  - No marker port counts.
+  - `start_window_timer()` prepares the timer, then enables it one window before the collector's window 0. The
+    first tick (epoch 1) then starts window 0, as the first CPU marker does, and window w is epoch w + 1.
+  - The window origin is put far enough ahead for that, in both start paths (the eBPF monitor's cgroup start
+    and the plain one).
+  - Then the collector reads as with in-band markers: the reader follows the clock.
+  - If window 0 never ends, the error asks whether the build has the timer port.
+- **Unit test:** the collector loop on the program's model with the timer's ticks gives the model's windows
+  (22 tests in `test_exact_windows.py`).
+
+**On the switch** (`basic_exact_v3_timer`; `run_timer_collector.sh`, `check_timer_collector.py`; each replay
+with `--send-log`):
+
+| Run | Windows | Lost | Pipes combined | Packets switch / sent | Ticks after the collector's boundaries |
+|---|---|---|---|---|---|
+| A: bulk2000, `--profile switch`, 1 s, stub host monitor | 27 | 0 | both, every window | 24,008 / 24,008 | 3.1-3.8 ms |
+| B: session_1000, `--profile dataset`, 0.5 s, eBPF monitor in its cgroup | 40 | 0 | both, every window | 12,000 / 12,000 | 2.4-3.2 ms |
+
+- **Where the ticks fall:** taken from where the windows cut the sent stream, as in part 6d. One lag and one
+  rate fit every cut point. The rates that fit are under 40 ppm, under 1 ms over a run, and a constant lag fits
+  too.
+- **B, the host side:** `HOSTMON_HEALTH` all zeros, with 41 host windows to 40 network windows as in part 6c's
+  runs. No unclocked or untracked packet and no rejected marker in either run.
+- **The first version** configured and enabled the generators in one command, and the ticks came 19.1-20.0 ms
+  after the boundaries (`A_bulk2000_onestep/`, otherwise the same). The reader spent 17.7 ms configuring them
+  before the first enable. Hence the prepare / enable split.
+- **The timer stops:** after the collector's run the clock stood still (epoch 41, unchanged 1.5 s later).
+  `window_reader.py --follow --timer-ns 500000000 --until-epoch 6` read 6 windows over both pipes, stopped the
+  timer, and the clock stood still at 6.
+
+**Limits:**
+- The timer runs free on the switch's clock, so the windows drift from the host's by the two clocks' rate
+  difference: under 40 ppm here, which would reach about 140 ms in an hour.
+- The live hybrid runs keep CPU-port markers, which put every window on the collector's boundary.
+- The timer suits a switch with no collector clock, or traffic in pipes the CPU port's markers cannot reach.
+
+**Unit tests:** 207 run, the same single known error (`test_sockjoin`).
+
+**State after:**
+- **Switch:** `basic_fix` running again (pid 3158), ports and forwarding from `setup_basic_fix_restored/`.
+- **Check:** the first cohort capture gave 9 of 9 packets and 40 of 40 windows inside the bounds
+  (`exact_timer_collector_20261116/restored_check/`, with `enp5s0` up for it); `enp5s0` down.
+- **Archive:** `live_test/committee_replay/pc1_20261116_exact_timer_collector.tar.xz` (runs, checks, scripts).

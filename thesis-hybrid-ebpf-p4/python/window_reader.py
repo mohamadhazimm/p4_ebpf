@@ -24,13 +24,20 @@ clocked pipes is "lost" (after a change of the set, the next window of each bank
                                               (60 B frames: the host's own capture sees them padded);
                                               repeatable, replaces the table's entries
     window_reader.py --marker-ports 192,132   the ports whose window markers count (replaces the set)
-    window_reader.py --follow [--until-epoch N] [--poll-ms 1]
+    window_reader.py --follow [--until-epoch N] [--poll-ms 1] [--timer-ns NS]
                                               one JSON line per finished window, from the window open at the
-                                              start; stops when the clock reaches N (or on SIGTERM)
+                                              start; stops when the clock reaches N (or on SIGTERM); with
+                                              --timer-ns the generators' timers tick every NS (started
+                                              first, stopped at the end)
     window_reader.py --serve                  JSON lines on stdin, one JSON reply line each (the collector):
         {"cmd": "setup", "reset": true, "frame_min": [...], "marker_ports": [...]}
         {"cmd": "mark", "epoch": E}            send a marker for epoch E from --cpu-iface (the switch's CPU
                                               port) and wait until the clock shows it
+        {"cmd": "timer", "period_ns": NS}      start the window timer on every pipe's generator (a build with
+                                              -DTIMER_LOCAL_PORT=68): a tick every NS, the first NS after this;
+                                              "prepare": true only configures it (about 20 ms), then
+                                              {"cmd": "timer", "enable": true} starts it (about 1 ms per pipe);
+                                              {"cmd": "timer", "stop": true} stops it, as quit and exit do
         {"cmd": "follow"}                      from now on read every window as soon as it ends (a thread on the
                                               switch), so that a slow requester cannot make a read late
         {"cmd": "read", "epoch": e, "timeout": s}   wait until window e has ended, read it, clear it (after
@@ -140,6 +147,7 @@ class Program(object):
             log("another client is bound to %s: continuing unbound" % p4_name)
             self.bound = False
         self.p4_name = p4_name
+        self.device_id = device_id
         self.target = gc.Target(device_id=device_id, pipe_id=0xFFFF)
         self.tables = {}
 
@@ -192,6 +200,114 @@ class Program(object):
             v = data.to_dict().get("$COUNTER_SPEC_PKTS", 0)
             return int(sum(v) if isinstance(v, (list, tuple)) else v)
         return 0
+
+
+TIMER_ETHERTYPE = 0x88B6
+TIMER_APP = 0
+TRIGGER = "$PKTGEN_TRIGGER_TIMER_PERIODIC"
+
+
+class WindowTimer(object):
+    """The window clock from the packet generators, for a build with -DTIMER_LOCAL_PORT=68: timer app 0 of every
+    pipe's generator sends a 60-byte frame (EtherType 0x88B6, not counted) from that pipe's local port every
+    period, and the program advances the pipe's reg_epoch on each. The apps are enabled one after the other, so
+    the pipes tick about 1 ms apart (the reader waits for them: WindowReader.settle). Local port 68: on the Wedge
+    another generator port sends only while 68 is a generator port too (PC1.md part 6d). Tofino 1: the local
+    port of pipe p is dev_port 128 p + port."""
+
+    def __init__(self, prog, local_port=68):
+        self.prog, self.local_port = prog, local_port
+        self.pipes, self.period_ns, self.enabled = [], None, False
+
+    def _tables(self):
+        t = self.prog.table
+        return t("$PKTGEN_PORT_CFG", prefix=""), t("$PKTGEN_APPLICATION_CFG", prefix=""), \
+            t("$PKTGEN_PKT_BUFFER", prefix="")
+
+    def _pipe(self, p):
+        return self.prog.gc.Target(device_id=self.prog.device_id, pipe_id=p)
+
+    def start(self, period_ns, pipes=None):
+        self.prepare(period_ns, pipes)
+        return self.enable()
+
+    def prepare(self, period_ns, pipes=None):
+        """Configure the apps and ports (about 20 ms over gRPC), the apps still disabled; enable() starts them."""
+        prog, gc = self.prog, self.prog.gc
+        if pipes is None:
+            pipes = list(range(len(prog.pipe_epochs())))
+        self.stop(pipes)
+        port_cfg, app_cfg, pkt_buf = self._tables()
+        frame = b"\xff" * 6 + b"\x02\x00\x00\x00\x07\x01" + struct.pack("!H", TIMER_ETHERTYPE) + b"\x00" * 46
+        k_app = app_cfg.make_key([gc.KeyTuple("app_id", TIMER_APP)])
+        k_buf = pkt_buf.make_key([gc.KeyTuple("pkt_buffer_offset", 0), gc.KeyTuple("pkt_buffer_size", len(frame) - 6)])
+        d_buf = pkt_buf.make_data([gc.DataTuple("buffer", frame[6:])])
+        d_app = app_cfg.make_data([
+            gc.DataTuple("timer_nanosec", int(period_ns)), gc.DataTuple("app_enable", bool_val=False),
+            gc.DataTuple("pkt_len", len(frame) - 6), gc.DataTuple("pkt_buffer_offset", 0),
+            gc.DataTuple("pipe_local_source_port", self.local_port),
+            gc.DataTuple("increment_source_port", bool_val=False),
+            gc.DataTuple("batch_count_cfg", 0), gc.DataTuple("packets_per_batch_cfg", 0),
+            gc.DataTuple("ibg", 0), gc.DataTuple("ibg_jitter", 0), gc.DataTuple("ipg", 0), gc.DataTuple("ipg_jitter", 0),
+            gc.DataTuple("batch_counter", 0), gc.DataTuple("pkt_counter", 0), gc.DataTuple("trigger_counter", 0)],
+            TRIGGER)
+        for p in pipes:
+            k_port = port_cfg.make_key([gc.KeyTuple("dev_port", 128 * p + self.local_port)])
+            port_cfg.entry_mod(prog.target, [k_port], [port_cfg.make_data([gc.DataTuple("pktgen_enable", bool_val=True)])],
+                               **prog.kw(port_cfg.entry_mod))
+            for tbl, k, d in ((pkt_buf, k_buf, d_buf), (app_cfg, k_app, d_app)):
+                try:
+                    tbl.entry_add(self._pipe(p), [k], [d], **prog.kw(tbl.entry_add))
+                except Exception:
+                    tbl.entry_mod(self._pipe(p), [k], [d], **prog.kw(tbl.entry_mod))
+        self.pipes, self.period_ns, self.enabled = list(pipes), int(period_ns), False
+        return {"timer_ns": int(period_ns), "timer_pipes": list(pipes), "timer_local_port": self.local_port,
+                "prepared": True}
+
+    def enable(self):
+        """Start the prepared apps, one pipe after the other (about 1 ms per gRPC write): the first ticks come
+        one period later."""
+        prog, gc = self.prog, self.prog.gc
+        if not self.pipes:
+            raise RuntimeError("the window timer is not prepared")
+        _, app_cfg, _ = self._tables()
+        k_app = app_cfg.make_key([gc.KeyTuple("app_id", TIMER_APP)])
+        d_on = app_cfg.make_data([gc.DataTuple("app_enable", bool_val=True)], TRIGGER)
+        t0 = time.time()
+        after = []
+        for p in self.pipes:
+            app_cfg.entry_mod(self._pipe(p), [k_app], [d_on], **prog.kw(app_cfg.entry_mod))
+            after.append(round(time.time() - t0, 6))
+        self.enabled = True
+        log("window timer: a tick every %d ns on pipes %s (local port %d), enabled %s s after the first write"
+            % (self.period_ns, self.pipes, self.local_port, after))
+        return {"timer_ns": self.period_ns, "timer_pipes": list(self.pipes), "timer_local_port": self.local_port,
+                "t_enabled": t0, "enabled_after_s": after}
+
+    def stop(self, pipes=None):
+        """Disable the timer apps and the generator ports (of `pipes`, default: those started). Errors are logged."""
+        prog, gc = self.prog, self.prog.gc
+        pipes = self.pipes if pipes is None else pipes
+        if not pipes:
+            return {"timer_stopped": []}
+        port_cfg, app_cfg, _ = self._tables()
+        k_app = app_cfg.make_key([gc.KeyTuple("app_id", TIMER_APP)])
+        for p in pipes:
+            try:
+                app_cfg.entry_mod(self._pipe(p), [k_app], [app_cfg.make_data(
+                    [gc.DataTuple("app_enable", bool_val=False)], TRIGGER)], **prog.kw(app_cfg.entry_mod))
+            except Exception as error:
+                if "not found" not in str(error).lower() and "not_found" not in str(error).lower():
+                    log("window timer: disabling the app of pipe %d: %s" % (p, str(error).splitlines()[0][:200]))
+            try:
+                k_port = port_cfg.make_key([gc.KeyTuple("dev_port", 128 * p + self.local_port)])
+                port_cfg.entry_mod(prog.target, [k_port], [port_cfg.make_data(
+                    [gc.DataTuple("pktgen_enable", bool_val=False)])], **prog.kw(port_cfg.entry_mod))
+            except Exception as error:
+                log("window timer: disabling generator port of pipe %d: %s" % (p, str(error).splitlines()[0][:200]))
+        stopped, self.pipes = list(pipes), [p for p in self.pipes if p not in pipes]
+        self.enabled = self.enabled and bool(self.pipes)
+        return {"timer_stopped": stopped}
 
 
 class WindowReader(object):
@@ -370,10 +486,13 @@ def clear_frame_len(prog):
         log("clearing frame_len: %s" % str(error).splitlines()[0][:200])
 
 
-def setup(prog, reset=False, frame_min=None, marker_ports=None):
-    """frame_min (a list, possibly empty) and marker_ports replace what the tables held."""
+def setup(prog, reset=False, frame_min=None, marker_ports=None, timer=None):
+    """frame_min (a list, possibly empty) and marker_ports replace what the tables held. A reset first stops the
+    window timer (`timer`, a WindowTimer; every pipe), so that no tick left from an earlier run moves the clock."""
     out = {}
     if reset:
+        if timer is not None:
+            timer.stop(list(range(len(prog.pipe_epochs()))))
         out.update(do_reset(prog))
     if frame_min is not None:
         clear_frame_len(prog)
@@ -453,7 +572,7 @@ class Follower(object):
             return {"epoch": e, "error": "the follower stopped: %s" % self.error}
 
 
-def do_serve(prog, reader):
+def do_serve(prog, reader, timer):
     print(json.dumps({"ready": True, "epoch": reader.clock(), "pipe_epochs": prog.pipe_epochs()}))
     sys.stdout.flush()
     follower = None
@@ -466,7 +585,16 @@ def do_serve(prog, reader):
             req = json.loads(line)
             cmd = req.get("cmd")
             if cmd == "setup":
-                out = setup(prog, bool(req.get("reset")), req.get("frame_min"), req.get("marker_ports"))
+                out = setup(prog, bool(req.get("reset")), req.get("frame_min"), req.get("marker_ports"), timer)
+            elif cmd == "timer":
+                if req.get("stop"):
+                    out = timer.stop()
+                elif req.get("prepare"):
+                    out = timer.prepare(int(req["period_ns"]), req.get("pipes"))
+                elif req.get("enable"):
+                    out = timer.enable()
+                else:
+                    out = timer.start(int(req["period_ns"]), req.get("pipes"))
             elif cmd == "mark":
                 out = reader.mark(int(req["epoch"]), float(req.get("timeout", 1.0)))
             elif cmd == "follow":
@@ -510,24 +638,37 @@ def main():
     ap.add_argument("--poll-ms", type=float, default=1.0)
     ap.add_argument("--pipe-grace-ms", type=float, default=50.0,
                     help="how long to wait for a pipe that has reached a finished window to pass it")
+    ap.add_argument("--timer-ns", type=int, help="--follow: start the window timer (every pipe) with this period")
+    ap.add_argument("--timer-local-port", type=int, default=68, help="the generator port of the timer build")
     ap.add_argument("--once", action="store_true")
     args = ap.parse_args()
     gc = import_client(args.sde_install)
     prog = Program(gc, args.grpc_addr, args.client_id, args.device_id, args.p4_name)
     reader = WindowReader(prog, args.cpu_iface, args.pipe_grace_ms / 1e3)
+    timer = WindowTimer(prog, args.timer_local_port)
     ports = None if args.marker_ports is None else [int(p) for p in args.marker_ports.split(",") if p.strip()]
-    if args.reset or args.frame_min or ports is not None:
-        print(json.dumps(setup(prog, args.reset, args.frame_min or None, ports)))
-        sys.stdout.flush()
-    if args.once:
-        epochs = prog.pipe_epochs()
-        e = reader.clock(epochs)
-        print(json.dumps({"epoch": e, "pipe_epochs": epochs, "regs": reader.read_window(e - 1, epochs)["regs"]},
-                         sort_keys=True))
-    if args.follow:
-        do_follow(prog, reader, args.until_epoch, args.poll_ms / 1e3)
-    if args.serve:
-        do_serve(prog, reader)
+    try:
+        if args.reset or args.frame_min or ports is not None:
+            print(json.dumps(setup(prog, args.reset, args.frame_min or None, ports, timer)))
+            sys.stdout.flush()
+        if args.once:
+            epochs = prog.pipe_epochs()
+            e = reader.clock(epochs)
+            print(json.dumps({"epoch": e, "pipe_epochs": epochs, "regs": reader.read_window(e - 1, epochs)["regs"]},
+                             sort_keys=True))
+        if args.follow:
+            if args.timer_ns:
+                start = timer.start(args.timer_ns)
+                sys.stderr.write("[window] %s\n" % json.dumps(start))
+            do_follow(prog, reader, args.until_epoch, args.poll_ms / 1e3)
+        if args.serve:
+            # terminated (the collector's stop when quit is not answered): leave through the finally below
+            signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+            do_serve(prog, reader, timer)
+    finally:
+        if timer.pipes:
+            timer.stop()
+            log("window timer stopped")
     try:
         prog.iface.tear_down_stream()
     except Exception:

@@ -256,11 +256,17 @@ class FakeClock:
 class FakeWindowReader:
     """window_reader.py --serve on exact_model.py: mark sets the clock, read returns the window's line."""
 
-    def __init__(self, model, inband_marks=None):
-        self.model, self.requests = model, []
+    def __init__(self, model, inband_marks=None, clock=None):
+        self.model, self.requests, self.clock, self.timer_at = model, [], clock, None
 
     def request(self, req, timeout=None):
         self.requests.append(req)
+        if req["cmd"] == "timer" and req.get("prepare"):
+            self.prepared = req["period_ns"]
+            return {"timer_ns": req["period_ns"], "timer_pipes": [0, 1], "prepared": True}
+        if req["cmd"] == "timer" and req.get("enable"):
+            self.timer_at = self.clock.time()                  # ticks every period from now, the first a period on
+            return {"timer_ns": self.prepared, "timer_pipes": [0, 1]}
         if req["cmd"] == "mark":
             self.model.marker(req["epoch"])
             return {"marked": req["epoch"]}
@@ -287,6 +293,14 @@ class CollectorExactTest(unittest.TestCase):
         pending = list(packets)
         if markers == "inband":
             model.marker(1)
+        reader = None
+
+        def ticks_until(t):
+            # the timer's ticks up to time t: tick k (epoch k) at timer_at + k periods
+            if reader is None or reader.timer_at is None:
+                return
+            while reader.timer_at + (model.epoch + 1) * 0.5 <= t + 1e-9:
+                model.marker(model.epoch + 1)
 
         def feed(now):
             # the packets sent until `now` reach the switch; in band, each window's marker comes first
@@ -294,12 +308,19 @@ class CollectorExactTest(unittest.TestCase):
                 p = pending.pop(0)
                 if markers == "inband" and p[0] + 1 > model.epoch:
                     model.marker(p[0] + 1)
+                if markers == "timer":
+                    ticks_until(p[10] / 1e9)
                 model.packet(p[2], p[3], p[4], p[5], p[6], p[7], p[9], p[10])
             if markers == "inband":
                 model.marker(max(model.epoch, int((now - t0 + 1e-9) // 0.5) + 1))
+            if markers == "timer":
+                ticks_until(now)
 
-        reader = FakeWindowReader(model)
-        clock = FakeClock(t0, feed)
+        clock = FakeClock(t0 - 1.0 if markers == "timer" else t0, feed)
+        reader = FakeWindowReader(model, clock=clock)
+        if markers == "timer":
+            hc.start_window_timer(reader, t0, 0.5, clock=clock)
+            self.assertEqual(reader.timer_at, t0 - 0.5)        # one window before window 0: tick 1 at its start
         rows = []
         hc.collect_windows_exact(reader, DoneProc(), 0.5, t0, markers=markers,
                                  on_window=lambda w: rows.append(w["exact_features"]), max_windows=40, clock=clock)
@@ -322,6 +343,12 @@ class CollectorExactTest(unittest.TestCase):
         reader = self.run_collector("inband")
         self.assertFalse([r for r in reader.requests if r["cmd"] == "mark"])
         self.assertEqual(reader.requests[0], {"cmd": "follow"})      # the reader reads each window as it ends
+
+    def test_timer_windows_give_the_models_windows(self):
+        reader = self.run_collector("timer")
+        self.assertEqual(reader.requests[:3], [{"cmd": "timer", "prepare": True, "period_ns": 500_000_000},
+                                               {"cmd": "timer", "enable": True}, {"cmd": "follow"}])
+        self.assertFalse([r for r in reader.requests if r["cmd"] == "mark"])
 
     def test_a_window_that_does_not_end_stops_the_run(self):
         model = ExactModel()

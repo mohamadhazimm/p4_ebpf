@@ -799,6 +799,12 @@ and no flow should go unread under a flood. **Where the remaining errors came fr
     reported as unclocked and none counted in a window. The capture's row still equals the published one.
   - **Generator:** on the Wedge a generator port other than 68 sends only while port 68 of the same pipe is a
     generator port too. Port 69 enabled alone stalled pipe 0's generator until switchd restarted.
+  - **`hybrid_collector.py --window-markers timer`** (PC1.md part 6e): the reader starts every pipe's timer.
+    The timers are configured first and enabled one window before the collector's window 0, so the first tick
+    starts window 0. Tested with bulk2000 in 1 s windows (stub host monitor) and session_1000 under the dataset
+    profile with the eBPF host monitor in its cgroup: every packet counted, none lost, both pipes combined.
+    The ticks came 2.4-3.8 ms after the collector's boundaries; with the configuration in the same step they had
+    come 19 ms late.
 - The switch runs `basic_fix` again (checked with a replay, 9 of 9 packets).
 
 ## 6. Switch CPU side
@@ -1036,7 +1042,9 @@ Section 6 measures the switch CPU, not the P4 program, and can be left out.
   - **Every pipe has its own window clock.** The reader leaves out, and reports, the packets of a pipe whose
     clock lags. With markers, only the pipe of the marker port has a clock. With a timer on each pipe, the
     pipes are combined if their ticks are less than 50 ms apart; the timers started back to back are 1 ms
-    apart. The collector has no timer mode.
+    apart. With the timer (`--window-markers timer`), the switch's windows drift against the host's by the two
+    clocks' rate difference: under 40 ppm on the Wedge, about 1 ms over a 27 s run, so long runs drift
+    further.
   - **A window must be read within one window of slack**, or it is marked lost.
   - **11 ingress stages:** 421 ns of latency against 315 ns.
   - **No per-flow counters**, so the live test's socket-level join still needs `basic_fix`.
