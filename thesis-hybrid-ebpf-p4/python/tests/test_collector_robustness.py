@@ -61,17 +61,25 @@ def run_reset_inner(bfrt):
     return out.getvalue().splitlines()
 
 
+# The registers of the two global-totals builds (perf/variants/gtot and its -DP4_GLOBAL_TOTALS_SPLIT=1 build)
+GTOT_BUILD = [n for n in reset_registers.REGISTERS if n not in ("reg_g_pkts_ba", "reg_g_bytes_ba")]
+GTOT_BA_BUILD = [n for n in reset_registers.REGISTERS if n not in ("reg_g_pkts", "reg_g_bytes")]
+
+
 class ResetScriptTests(unittest.TestCase):
     def test_no_fstrings_for_python_3_4(self):
         tree = ast.parse(reset_registers.build_inner_script())
         self.assertFalse([n for n in ast.walk(tree) if isinstance(n, ast.JoinedStr)])
 
     def test_clears_and_checks_every_register(self):
-        bfrt, regs = fake_bfrt(reset_registers.REGISTERS)
-        lines = run_reset_inner(bfrt)
-        self.assertTrue(all(r.cleared for r in regs.values()))
-        self.assertEqual(len(regs), 22)
-        self.assertTrue(lines[-1].startswith("[RESET-OK] 22 registers cleared"))
+        for build in (GTOT_BUILD, GTOT_BA_BUILD):
+            bfrt, regs = fake_bfrt(build)
+            lines = run_reset_inner(bfrt)
+            self.assertTrue(all(r.cleared for r in regs.values()))
+            self.assertEqual(len(regs), 22)
+            self.assertTrue(lines[-1].startswith("[RESET-OK] 22 registers cleared"))
+        self.assertIn("[RESET-SKIP] reg_g_pkts is not in this build", lines)
+        self.assertIn("[RESET] reg_g_pkts_ba", "\n".join(lines))
 
     def test_a_build_without_a_register_skips_it(self):
         # the deployed basic_fix: no reg_newconn_dst, no global totals
@@ -84,7 +92,7 @@ class ResetScriptTests(unittest.TestCase):
 
     def test_the_one_entry_global_totals_are_checked_at_cell_0_only(self):
         # perf/variants/gtot: reading cell 1 of a one-entry register fails on the switch
-        bfrt, regs = fake_bfrt(reset_registers.REGISTERS)
+        bfrt, regs = fake_bfrt(GTOT_BUILD)
         for name, reg in regs.items():
             if name.startswith("reg_g_"):
                 reg.cells = {0: [5, 9]}

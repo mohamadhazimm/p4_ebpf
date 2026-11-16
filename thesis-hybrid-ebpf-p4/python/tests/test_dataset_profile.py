@@ -452,6 +452,37 @@ class GlobalTotalsSummaryTests(unittest.TestCase):
                          "windows without usable totals keep the bucket sums")
         self.assertEqual(s[4]["net_bytes_total_delta"], 60)
 
+    def test_the_split_build_takes_b_to_a_as_counted(self):
+        # basic_gtot_ba (PC1.md part 4f): no total registers; B->A counted. A flood window whose A->B was read after
+        # the total gave B->A packets that were never sent on gtot; here B->A grows only with B->A packets.
+        def split(pab, bab, pba, bba, syn=0):
+            return {"pkts_ab": pab, "bytes_ab": bab, "pkts_ba": pba, "bytes_ba": bba, "syn": syn, "ack": 0, "rst": 0}
+        self.assertEqual(hc.gtot_keys(split(1, 2, 3, 4)), hc.GTOT_KEYS_SPLIT)
+        self.assertEqual(hc.gtot_keys(totals(1, 2)), hc.GTOT_KEYS)
+        self.assertIsNone(hc.gtot_keys(dict(split(1, 2, 3, 4), pkts_ba=None)))
+        wrap = (1 << 32) - 3
+        ws = [{"rows": [mkrow(1, 2, nbytes=120)], "totals": split(1000, 60000, 0, 0, syn=1000)},
+              {"rows": [mkrow(1, 3, nbytes=180)], "totals": split(33000, 1980000, 0, 0, syn=33000)},
+              {"rows": [mkrow(1, 4, nbytes=240)], "totals": split(33010, 1980600, wrap, wrap)},
+              {"rows": [mkrow(1, 5, nbytes=300)], "totals": split(33010, 1980600, 4, 5)}]
+        s = hc.build_net_summaries(ws, 0.5, byte_layer="frame", global_totals=True)
+        self.assertEqual([x["net_gtot_used"] for x in s], [1, 1, 1, 1])
+        self.assertEqual([x["net_pkts_ba_delta"] for x in s], [0, 0, wrap, 7], "B->A wraps at 32 bits")
+        self.assertEqual([x["net_pkts_total_delta"] for x in s], [1000, 32000, 10 + wrap, 7])
+        self.assertEqual(s[1]["net_bytes_total_delta"], 1920000 + 14 * 32000)
+        self.assertEqual((s[1]["net_bytes_ba_delta"], s[3]["net_bytes_ba_delta"]), (0, 8 + 14 * 7))
+        self.assertEqual(s[1]["net_syn_delta"], 32000)
+
+    def test_a_change_of_key_set_only_resets_the_baseline(self):
+        ws = [{"rows": [mkrow(1, 1)], "totals": totals(10, 100)},
+              {"rows": [mkrow(1, 2)], "totals": {"pkts_ab": 20, "bytes_ab": 200, "pkts_ba": 0, "bytes_ba": 0,
+                                                 "syn": 0, "ack": 0, "rst": 0}},
+              {"rows": [mkrow(1, 3)], "totals": {"pkts_ab": 25, "bytes_ab": 250, "pkts_ba": 1, "bytes_ba": 10,
+                                                 "syn": 0, "ack": 0, "rst": 0}}]
+        s = hc.build_net_summaries(ws, 0.5, global_totals=True)
+        self.assertEqual([x["net_gtot_used"] for x in s], [1, 0, 1])
+        self.assertEqual(s[2]["net_pkts_total_delta"], 6)
+
     def test_every_row_has_the_same_columns_and_the_socket_join_ignores_the_totals(self):
         ws = [{"rows": [], "totals": totals(0, 0)}, {"rows": [mkrow(1, 3)], "totals": totals(3, 300)},
               {"rows": [mkrow(1, 3)], "totals": totals(9, 900), "owned_indexes": [1]}]

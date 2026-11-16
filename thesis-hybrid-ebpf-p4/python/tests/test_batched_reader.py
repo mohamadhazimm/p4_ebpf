@@ -541,6 +541,27 @@ class GlobalTotalsTests(unittest.TestCase):
         rows = make_batched(self.gtot_switch(), addr="mock:g2").read_window([11, KNOWN_IDX])["rows"]
         self.assertEqual(first["totals"]["bytes"], sum(r["bytes"] for r in rows))
 
+    def test_the_split_build_counts_b_to_a_in_place_of_the_totals(self):
+        # -DP4_GLOBAL_TOTALS_SPLIT=1 (basic_gtot_ba, PC1.md part 4f)
+        sw = bfrt_mock.MockSwitch(registers=bfrt_mock.REG_NAMES + bfrt_mock.GLOBAL_NAMES_SPLIT)
+        play_known_answer(sw)
+        for k in range(3):
+            sp, dp = (1011, 80) if k < 2 else (80, 1011)
+            sw.packet(11, 0, 60 + k, sp, dp, 6, 0x10 if k else 0x02, 1000 + k)
+        reader = make_batched(sw)
+        self.assertEqual(list(reader.global_tables), batched_reader.GLOBAL_NAMES_SPLIT)
+        payload = json.loads(json.dumps(reader.read_window([11, KNOWN_IDX], totals=True)))
+        rows, t = payload["rows"], payload["totals"]
+        self.assertEqual(sorted(t), sorted(k[len("reg_g_"):] for k in batched_reader.GLOBAL_NAMES_SPLIT))
+        for key in ("pkts_ab", "bytes_ab", "pkts_ba", "bytes_ba", "syn", "ack", "rst"):
+            self.assertEqual(t[key], sum(r[key] for r in rows), key)
+        self.assertEqual(t["pkts_ab"] + t["pkts_ba"], sum(r["pkts"] for r in rows))
+        self.assertEqual(payload["errors"], [])
+
+    def test_a_program_with_part_of_either_set_has_no_totals(self):
+        sw = bfrt_mock.MockSwitch(registers=bfrt_mock.REG_NAMES + ["reg_g_pkts_ab", "reg_g_pkts_ba"])
+        self.assertEqual(list(make_batched(sw).global_tables), [])
+
     def test_a_program_without_totals_says_so_and_nothing_changes_without_the_flag(self):
         sw = bfrt_mock.MockSwitch()
         play_known_answer(sw)

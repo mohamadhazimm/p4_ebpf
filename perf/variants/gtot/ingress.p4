@@ -20,6 +20,15 @@
 #error global totals require feature collection
 #endif
 
+/* -DP4_GLOBAL_TOTALS_SPLIT=1 (build basic_gtot_ba, PC1.md part 4f): the packet and
+ * byte totals count B->A instead (reg_g_pkts_ba, reg_g_bytes_ba); the control plane
+ * adds A->B and B->A. The seven registers are read one after another, so with the
+ * totals a flood's A->B, read later than the total, made B->A packets that were
+ * never sent; a B->A register grows only with B->A packets. */
+#ifndef P4_GLOBAL_TOTALS_SPLIT
+#define P4_GLOBAL_TOTALS_SPLIT 0
+#endif
+
 #if P4_ENABLE_FEATURES
 const bit<32> FLOW_BUCKETS = 65536;
 #endif
@@ -204,20 +213,42 @@ control Ingress(
      * the other windows they equal the sum over the buckets. 32-bit: the byte
      * counters wrap after 4.3 GB per pipe, below the read interval only above
      * ~69 Gb/s per pipe at 0.5 s windows. */
+#if P4_GLOBAL_TOTALS_SPLIT
+    Register<bit<32>, bit<1>>(1) reg_g_pkts_ba;
+    Register<bit<32>, bit<1>>(1) reg_g_bytes_ba;
+#else
     Register<bit<32>, bit<1>>(1) reg_g_pkts;
     Register<bit<32>, bit<1>>(1) reg_g_bytes;
+#endif
     Register<bit<32>, bit<1>>(1) reg_g_pkts_ab;
     Register<bit<32>, bit<1>>(1) reg_g_bytes_ab;
     Register<bit<32>, bit<1>>(1) reg_g_syn;
     Register<bit<32>, bit<1>>(1) reg_g_ack;
     Register<bit<32>, bit<1>>(1) reg_g_rst;
 
+#if P4_GLOBAL_TOTALS_SPLIT
+    RegisterAction<bit<32>, bit<1>, bit<32>>(reg_g_pkts_ba) g_pkts_inc = {
+        void apply(inout bit<32> v) {
+            if (meta.dir_ab == 1w0) {
+                v = v + 32w1;
+            }
+        }
+    };
+    RegisterAction<bit<32>, bit<1>, bit<32>>(reg_g_bytes_ba) g_bytes_add = {
+        void apply(inout bit<32> v) {
+            if (meta.dir_ab == 1w0) {
+                v = v + (bit<32>) meta.pkt_len;
+            }
+        }
+    };
+#else
     RegisterAction<bit<32>, bit<1>, bit<32>>(reg_g_pkts) g_pkts_inc = {
         void apply(inout bit<32> v) { v = v + 32w1; }
     };
     RegisterAction<bit<32>, bit<1>, bit<32>>(reg_g_bytes) g_bytes_add = {
         void apply(inout bit<32> v) { v = v + (bit<32>) meta.pkt_len; }
     };
+#endif
     RegisterAction<bit<32>, bit<1>, bit<32>>(reg_g_pkts_ab) g_pkts_ab_update = {
         void apply(inout bit<32> v) {
             if (meta.dir_ab == 1w1) {

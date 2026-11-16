@@ -1119,3 +1119,82 @@ order) replaces `replay_rows_v3.csv`.
 windows inside the bounds); `enp5s0` down. `live_test/committee_replay/pc1_20261115_gtot_all.tar.xz`: both reruns and
 both trials (rows, `rerun.log`, per run `summary.json`, `timing.jsonl`, `windows.csv`, `collector.log`),
 `gtot_all_compare.csv`, `replay_rows_gtot.csv`, the scripts and patches, the setup logs.
+
+## Results, part 4f (PC1, 2026-11-16): B->A counted in the data plane, the six floods rerun
+
+**Why.** Part 4e left one new limitation: the reader reads the seven totals one after another, so in a flood
+B->A = total - A->B picked up packets that were never sent (6-26 in six floods), and the captures without B->A
+traffic lost all 30 B->A columns.
+
+**The build** (`basic_gtot_ba`): `perf/variants/gtot` compiled with `-DP4_GLOBAL_TOTALS_SPLIT=1`. `reg_g_pkts` and
+`reg_g_bytes` become `reg_g_pkts_ba` and `reg_g_bytes_ba`, which count only the packets with `dir_ab` 0 (the
+packets the flow registers count as B->A). A B->A register grows only with B->A packets, so the order of the reads
+can move a packet into the next window but cannot create one. Without the define the sources compile `gtot` as
+before. bf-p4c 9.6.0 on the switch, 21.9 s (`perf/results/gtot_ba_build_20261116/resources.md`): the same 6 ingress
+stages, SRAM, map RAM and 21 stateful ALUs as `gtot`. The compiler estimates 133 ingress cycles against `gtot`'s 135,
+so the latency should be no higher. **Latency and line rate were not measured** for this build; the user chose to
+rerun only the six floods.
+
+**The software.** Both builds' totals are handled by the same code:
+- `batched_reader.py` takes whichever full set of seven registers the program has (`GLOBAL_NAMES` or
+  `GLOBAL_NAMES_SPLIT`) and reads each direction's packets and bytes one after the other.
+- `hybrid_collector.py` (`gtot_keys`) takes B->A as counted and sets the totals to A->B + B->A, each difference
+  modulo 2^32. A change of key set between two windows only resets the baseline.
+- `reset_registers.py` also clears the two B->A registers.
+- `bfrt_mock.py` models both builds.
+- Tests: 4 new, 185 run, 1 error (the release's Python 3.9 operator).
+- `perf/tools/sw_pktgen_run.py --global-totals` still knows only `gtot`'s names.
+
+**On the switch.** Our `basic_fix` switchd was stopped and `basic_gtot_ba` started in `hz_sw`; `run_bfrt.sh setup`
+added the ports, forwarding and mirror (`setup_gtot_ba/`). The reader found the split set. The first cohort capture
+was replayed with `--global-totals 1` as a check (`runs_gtot_ba_check/`): 9 / 9 packets, 44 of 44 windows inside the
+bounds, 95 of 95 total columns equal to the published row. Then came the six floods (`runs_gtot_ba/`, 04:03-04:07).
+In all six, every packet and byte was counted over the 44 windows and 44 of 44 windows were inside the bounds
+(`gtot_ba_compare.csv`):
+
+| capture | sent | B->A packets: published / gtot / gtot_ba | windows with A->B above all: gtot / gtot_ba | 30 B->A columns equal: basic_fix / gtot / gtot_ba | 95 total columns equal | all 145 equal |
+|---|---|---|---|---|---|---|
+| udp_sink_60k | 60,000 | 0 / 6 / **0** | 2 / 0 | 30 / 0 / **30** | 67 / 37 / **75** | 109 / 79 / **117** |
+| udp_sink_150k | 150,000 | 0 / 10 / **0** | 2 / 0 | 30 / 0 / **30** | 67 / 37 / **83** | 109 / 79 / **125** |
+| udp_sink_250k | 250,000 | 0 / 26 / **0** | 3 / 0 | 30 / 0 / **30** | 67 / 37 / **75** | 109 / 79 / **117** |
+| udp_fan_60k | 59,776 | 0 / 17 / **0** | 1 / 0 | 30 / 0 / **30** | 49 / 27 / **75** | 58 / 36 / **84** |
+| syn_fan_100k | 99,640 | 1 / 5 / 0 | 1 / 0 | 0 / 0 / 0 | 4 / 16 / **29** | 8 / 20 / **33** |
+| syn_fan_150k | 149,425 | 2 / 10 / 0 | 5 / 0 | 0 / 0 / 0 | 1 / 27 / **29** | 5 / 31 / **33** |
+
+The median relative error of the 95 columns is 0.0000 in all six on `gtot_ba` (`gtot`: up to 0.33 for
+udp_fan_60k, 0.20 for syn_fan_100k). The udp_sink captures now also beat `basic_fix` (67) by 8-16 columns, the A->B
+ratios and average sizes. `basic_fix` reads a bucket's registers at slightly different times too: an A->B ratio
+of 1.019 in a window, and an average size of 74.47 B for 74 B frames. On `gtot_ba` the total is A->B + B->A of the
+same read, so the ratio is exactly 1 and the size exactly 74 B. The SYN fan-outs' 1 and 2 real B->A packets count as A->B on every build:
+with ~100,000 flows over 65,536 buckets their replies land in buckets another flow holds (part 4e's direction
+limit). Their B->A columns are therefore 0, against 1 and 2 published.
+
+**The other 103 rows** stay from `runs_gtot_boundary/` (part 4e, `gtot`). `scripts/totals_read_exposure.py` counts,
+for each run, the sent packets whose time lies inside a window's totals read, widened by half the shortest round
+trip (`totals_read_exposure.tsv`):
+- In 67 of the 109 runs no packet was sent during a totals read, so `gtot_ba` would read the same totals there.
+- In 36 others besides the six floods, at least one packet was. Most had 1-174 such packets; Chaos had 1,520,
+  syn_sink_40k 887 and goldeneye_r10 402.
+- There, the old order can move a B->A count between two adjacent windows. It adds B->A that was never sent only
+  after a window with more A->B packets than packets in all, and none of the 103 has one (part 4e).
+- Rerunning those 36 (~35 min) or all 103 (~80 min) on `gtot_ba` would put every row on one build.
+
+**The rows for the thesis:** `replay_rows_gtot_ba.csv` is `replay_rows_gtot.csv` with these six rows from
+`runs_gtot_ba/`:
+
+| | gtot (part 4e) | with the six from gtot_ba |
+|---|---|---|
+| calm (96): 95 total columns equal, median / mean | 95 / 81.5 | 95 / 82.8 |
+| calm: all 145 equal, mean | 119.4 | 120.7 |
+| overloaded on basic_fix (11): 95 total columns equal, median / mean | 41 / 39.1 | **45 / 44.8** |
+| overloaded: all 145 equal, median / mean | 49 / 46.1 | 52 / 51.8 |
+
+**Still open:** the direction of a packet whose flow shares a bucket (part 4e; Chaos, the SYN fan-outs), the cut
+4-5 ms after the boundary and later when the collector falls behind on the reports, and the sampled per-flow
+columns under overload.
+
+**State after:** `basic_fix` running again (pid 17781 in `hz_sw`), ports 132/140, forwarding and mirror set by
+`run_bfrt.sh setup` (`setup_basic_fix_restored_4f/`), checked with the first cohort capture (9 / 9 packets, 40 of 40
+windows inside the bounds); `enp5s0` down. The build stays on the switch in `/root/hazim_perf/build/basic_gtot_ba`.
+`live_test/committee_replay/pc1_20261116_gtot_ba.tar.xz`: the runs, the check, `gtot_ba_compare.csv`,
+`replay_rows_gtot_ba.csv`, `totals_read_exposure.tsv`, the scripts, the build's resource report and the setup logs.

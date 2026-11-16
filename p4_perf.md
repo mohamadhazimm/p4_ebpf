@@ -583,10 +583,12 @@ PC1.md part 4e reran all 109 captures on it, with the totals read from hardware 
 window boundary (a reader and collector change; the P4 program is the one measured here). Every packet then
 counts in the 40 dataset windows in all 109 runs. The calm captures match the published rows as on `basic_fix`
 (median 95 of the 95 total-based columns). The 11 that overload `basic_fix` go from a median of 4 to 41 of those
-columns. Left open: the seven registers are read one after another, ~0.4 ms apart, so in a flood
-B→A = total − A→B picks up packets that were never sent (6–26 in six floods). Counting B→A in two of the
-registers in place of the packet and byte totals would avoid it, with the same seven registers. Between runs the
-switch runs `basic_fix`.
+columns. The seven registers are read one after another, ~0.4 ms apart, so in a flood B→A = total − A→B
+picked up packets that were never sent (6–26 in six floods). `-DP4_GLOBAL_TOTALS_SPLIT=1` (build
+`basic_gtot_ba`, PC1.md part 4f) counts B→A in place of the packet and byte totals. It uses the same seven registers,
+6 stages and 21 stateful ALUs; the compiler estimates 133 ingress cycles against 135; latency and line rate were not
+measured. On it the six floods have no such packets, and they match 29–83 of the 95 columns instead of 16–37.
+Between runs the switch runs `basic_fix`.
 - **Sources:** `perf/variants/gtot/`: the fixed build of Section 5.5 (`basic_fix`, same hashes) with the seven
   registers in `ingress.p4`; `-DP4_ENABLE_GLOBAL_TOTALS=0` compiles `basic_fix`. The instrumented copy for the
   latency is `perf/variants/hwl/make_hwl_sources.sh perf/variants/gtot OUT_DIR`; it differs from Section 5.5's

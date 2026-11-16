@@ -28,7 +28,9 @@ REGISTERS = ["reg_pkts", "reg_bytes", "reg_pkts_ab", "reg_bytes_ab", "reg_ref_sr
              "reg_ref_dst_port", "reg_dir_valid", "reg_min_len", "reg_max_len", "reg_first_ts",
              "reg_last_ts", "reg_syn", "reg_ack", "reg_rst", "reg_newconn_dst",
              # the one-entry global totals of the test build perf/variants/gtot (skipped where absent)
-             "reg_g_pkts", "reg_g_bytes", "reg_g_pkts_ab", "reg_g_bytes_ab", "reg_g_syn", "reg_g_ack", "reg_g_rst"]
+             "reg_g_pkts", "reg_g_bytes", "reg_g_pkts_ab", "reg_g_bytes_ab", "reg_g_syn", "reg_g_ack", "reg_g_rst",
+             # its -DP4_GLOBAL_TOTALS_SPLIT=1 build (basic_gtot_ba): B->A in place of reg_g_pkts and reg_g_bytes
+             "reg_g_pkts_ba", "reg_g_bytes_ba"]
 # Cells read back after each clear (the flow and destination registers have 65,536 buckets; the one-entry
 # reg_g_* only cell 0).
 CHECK_INDEXES = [0, 1, 32767, 65535]

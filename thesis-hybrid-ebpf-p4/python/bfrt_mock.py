@@ -37,6 +37,9 @@ DST_REG_NAME = "reg_newconn_dst"
 # The one-entry global totals of the test build perf/variants/gtot (absent from the deployed program).
 GLOBAL_NAMES = ["reg_g_pkts", "reg_g_bytes", "reg_g_pkts_ab", "reg_g_bytes_ab", "reg_g_syn", "reg_g_ack",
                 "reg_g_rst"]
+# Its -DP4_GLOBAL_TOTALS_SPLIT=1 build: B->A in place of the packet and byte totals.
+GLOBAL_NAMES_SPLIT = ["reg_g_pkts_ab", "reg_g_bytes_ab", "reg_g_pkts_ba", "reg_g_bytes_ba", "reg_g_syn",
+                      "reg_g_ack", "reg_g_rst"]
 WIDTH_BITS = {"reg_ref_src_port": 16, "reg_ref_dst_port": 16, "reg_dir_valid": 8,
               "reg_min_len": 16, "reg_max_len": 16}
 TABLE_PREFIX = "pipe.Ingress."
@@ -183,16 +186,20 @@ class MockSwitch(object):
             if (flags & 0x12) == 0x02 and dst_idx is not None and DST_REG_NAME in hw:
                 d = self.cell(hw, DST_REG_NAME, dst_idx)
                 d[pipe] = (d[pipe] + 1) & m32
-        if GLOBAL_NAMES[0] in hw:
-            # perf/variants/gtot: the same packet into the one-entry totals of its pipe
+        if "reg_g_pkts_ab" in hw:
+            # perf/variants/gtot: the same packet into the one-entry totals of its pipe (either build)
             def g(name, add):
-                cell = self.cell(hw, name, 0)
-                cell[pipe] = (cell[pipe] + add) & m32
+                if name in hw:
+                    cell = self.cell(hw, name, 0)
+                    cell[pipe] = (cell[pipe] + add) & m32
             g("reg_g_pkts", 1)
             g("reg_g_bytes", length)
             if dir_ab:
                 g("reg_g_pkts_ab", 1)
                 g("reg_g_bytes_ab", length)
+            else:
+                g("reg_g_pkts_ba", 1)
+                g("reg_g_bytes_ba", length)
             if proto == 6:
                 g("reg_g_syn", 1 if flags & 0x02 else 0)
                 g("reg_g_rst", 1 if flags & 0x04 else 0)

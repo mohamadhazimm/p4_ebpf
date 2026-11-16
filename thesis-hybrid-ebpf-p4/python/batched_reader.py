@@ -116,6 +116,10 @@ DST_REG_NAME = "reg_newconn_dst"
 # The one-entry global totals of the test build perf/variants/gtot; payload "totals" uses the names without reg_g_.
 GLOBAL_NAMES = ["reg_g_pkts", "reg_g_bytes", "reg_g_pkts_ab", "reg_g_bytes_ab", "reg_g_syn", "reg_g_ack",
                 "reg_g_rst"]
+# Its -DP4_GLOBAL_TOTALS_SPLIT=1 build (basic_gtot_ba, PC1.md part 4f): B->A in place of the packet and byte totals,
+# each direction's packets and bytes read next to each other.
+GLOBAL_NAMES_SPLIT = ["reg_g_pkts_ab", "reg_g_bytes_ab", "reg_g_pkts_ba", "reg_g_bytes_ba", "reg_g_syn",
+                      "reg_g_ack", "reg_g_rst"]
 TABLE_PREFIX = "pipe.Ingress."
 DATA_PREFIX = "Ingress."
 KEY_FIELD = "$REGISTER_INDEX"
@@ -604,14 +608,15 @@ class BatchedRegisterReader(object):
             self.dst_table = RegisterTable(DST_REG_NAME, info.table_get(TABLE_PREFIX + DST_REG_NAME))
         except KeyError:
             self.dst_table = None
-        # perf/variants/gtot: all seven one-entry totals, or none
+        # perf/variants/gtot: all seven one-entry totals of one of its two builds, or none
         self.global_tables = OrderedDict()
-        for name in GLOBAL_NAMES:
+        for names in (GLOBAL_NAMES, GLOBAL_NAMES_SPLIT):
             try:
-                self.global_tables[name] = RegisterTable(name, info.table_get(TABLE_PREFIX + name))
+                self.global_tables = OrderedDict((name, RegisterTable(name, info.table_get(TABLE_PREFIX + name)))
+                                                 for name in names)
+                break
             except KeyError:
                 self.global_tables = OrderedDict()
-                break
         # None: not checked yet; True/False after the first totals read (_read_totals)
         self.totals_one_request = None if all(t.ids_ok for t in self.global_tables.values()) else False
         self.flow_tables = [t for t in self.tables.values() if t is not None]

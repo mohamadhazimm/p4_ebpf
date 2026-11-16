@@ -1040,6 +1040,19 @@ DORMANT_RESUME_RESERVE = 8
 # The one-entry global totals of the test build perf/variants/gtot (reg_g_<key>), per window as the reader sums
 # them over the pipes; --global-totals takes the window totals from them (PC1.md part 4d).
 GTOT_KEYS = ["pkts", "bytes", "pkts_ab", "bytes_ab", "syn", "ack", "rst"]
+# The same build with -DP4_GLOBAL_TOTALS_SPLIT=1 (basic_gtot_ba, PC1.md part 4f): B->A counted in place of the
+# packet and byte totals, so that B->A grows only with B->A packets; the totals are A->B + B->A.
+GTOT_KEYS_SPLIT = ["pkts_ab", "bytes_ab", "pkts_ba", "bytes_ba", "syn", "ack", "rst"]
+
+
+def gtot_keys(totals: Any) -> Optional[List[str]]:
+    """The keys of a complete read of the global totals (GTOT_KEYS or GTOT_KEYS_SPLIT), else None."""
+    if isinstance(totals, dict):
+        for keys in (GTOT_KEYS, GTOT_KEYS_SPLIT):
+            if all(totals.get(k) is not None for k in keys):
+                return keys
+    return None
+
 # The flow timestamps are the low 32 bits of a ns clock.
 TS_WRAP_S = (1 << 32) / 1e9
 
@@ -1506,7 +1519,7 @@ def collect_windows_live(
             try:
                 # (global_totals is off without the batched reader, so read_fn is set here)
                 bp = read_fn([], w, snapshot=snapshot, clear_if_unchanged={}, dst_indexes=[], totals=True)
-                if isinstance(bp.get("totals"), dict) and all(bp["totals"].get(k) is not None for k in GTOT_KEYS):
+                if gtot_keys(bp.get("totals")) is not None:
                     boundary_totals = bp["totals"]
                     boundary_timing = {k: v for k, v in (bp.get("timing") or {}).items() if k in TOTALS_CLOCK_KEYS}
                 else:
@@ -1961,16 +1974,21 @@ class NetSummarizer:
         summary["net_gtot_bucket_pkts_delta"] = summary["net_pkts_total_delta"]
         summary["net_gtot_bucket_bytes_delta"] = summary["net_bytes_total_delta"]
         used = 0
-        valid = isinstance(totals, dict) and all(totals.get(k) is not None for k in GTOT_KEYS)
-        if not valid:
+        keys = gtot_keys(totals)
+        if keys is None:
             self.totals_baseline_ok = False          # the next window's difference would span two windows
         else:
-            now = {k: int(totals[k]) for k in GTOT_KEYS}
-            prev = self.prev_totals if self.prev_totals is not None else dict.fromkeys(GTOT_KEYS, 0)
-            if self.totals_baseline_ok and whole_switch:
+            now = {k: int(totals[k]) for k in keys}
+            prev = self.prev_totals if self.prev_totals is not None else dict.fromkeys(keys, 0)
+            if self.totals_baseline_ok and whole_switch and set(prev) == set(keys):
                 # 32-bit registers: differences modulo 2^32
-                d = {k: (now[k] - prev[k]) % (1 << 32) for k in GTOT_KEYS}
-                pkts_ba, bytes_ba = max(0, d["pkts"] - d["pkts_ab"]), max(0, d["bytes"] - d["bytes_ab"])
+                d = {k: (now[k] - prev[k]) % (1 << 32) for k in keys}
+                if "pkts_ba" in d:
+                    # basic_gtot_ba: B->A as counted; read apart from A->B, it cannot hold A->B packets
+                    pkts_ba, bytes_ba = d["pkts_ba"], d["bytes_ba"]
+                    d["pkts"], d["bytes"] = d["pkts_ab"] + pkts_ba, d["bytes_ab"] + bytes_ba
+                else:
+                    pkts_ba, bytes_ba = max(0, d["pkts"] - d["pkts_ab"]), max(0, d["bytes"] - d["bytes_ab"])
                 summary["net_pkts_total_delta"] = d["pkts"]
                 summary["net_bytes_total_delta"] = d["bytes"] + header * d["pkts"]
                 summary["net_pkts_ab_delta"] = d["pkts_ab"]
