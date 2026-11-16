@@ -89,4 +89,6 @@ The totals agree with an independent scapy pass over both captures.
 - `cohort-extra.tar.gz`: the 33 network-attack and network-benign runs, sanitized the same way
   (771 MB unpacked, so committed as a tarball; unpack with
   `tar xzf live_test/captures/cohort-extra.tar.gz -C live_test/captures`; its `README.md` has the
-  details). With `cohort/` they are the 110 captures of PC1.md Part 4.
+  details). With `cohort/` they are the 110 captures of PC1.md Part 4. Three of them, `bulkup_200`,
+  `bulkup_400` and `bulkup_700`, hold frames larger than 1514 B (the guest captured its upload's segments before
+  segmentation offload split them) and cannot be replayed on a 1500-byte wire as they are.

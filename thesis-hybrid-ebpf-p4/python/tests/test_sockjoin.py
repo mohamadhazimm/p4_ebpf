@@ -183,3 +183,51 @@ class CollectorJoinTests(unittest.TestCase):
                                   "--command", "true", "--sockowner", "/x"])
         self.assertEqual(args.sockowner_attach, "/sys/fs/cgroup")
         self.assertIsNone(args.hostmon_cgroup)
+
+
+class IpScopeTests(unittest.TestCase):
+    """The host-level join (--scope-ip): one host's network features are those of its own flows."""
+
+    def setUp(self):
+        import hybrid_collector as hc  # noqa: E402
+        self.hc = hc
+
+    def windows(self):
+        row = lambda idx, pkts, by: {"idx": idx, "pkts": pkts, "bytes": by, "pkts_ab": pkts, "bytes_ab": by,  # noqa: E731
+                                     "syn": 1, "ack": pkts, "rst": 0, "min_len": 60, "max_len": 100,
+                                     "first_ts": 1000, "last_ts": 2000, "dir_valid": 1}
+        # bucket 7: host 10.0.0.10's connection; bucket 9: host 10.0.0.11's, cleared after window 1, reported again
+        return [
+            {"net_window_id": 0, "net_window_start_sec": 0.0, "net_window_end_sec": 0.5,
+             "report_keys": [[7, 6, "10.0.0.10", 40001, "10.0.0.2", 80], [9, 17, "10.0.0.11", 50001, "10.0.0.2", 53]],
+             "rows": [row(7, 10, 1000), row(9, 4, 400)], "cleared_indexes": []},
+            {"net_window_id": 1, "net_window_start_sec": 0.5, "net_window_end_sec": 1.0, "report_keys": [],
+             "rows": [row(7, 15, 1500), row(9, 6, 600)], "cleared_indexes": [9]},
+            {"net_window_id": 2, "net_window_start_sec": 1.0, "net_window_end_sec": 1.5,
+             "report_keys": [[9, 17, "10.0.0.11", 50002, "10.0.0.2", 53]],
+             "rows": [row(7, 15, 1500), row(9, 3, 300)], "cleared_indexes": []},
+        ]
+
+    def test_two_hosts_partition_the_window(self):
+        a = sj.ip_scope_windows(self.windows(), ["10.0.0.10"])
+        b = sj.ip_scope_windows(self.windows(), ["10.0.0.11"])
+        server = sj.ip_scope_windows(self.windows(), ["10.0.0.2"])
+        self.assertEqual([w["owned_indexes"] for w in a], [[7], [7], [7]])
+        self.assertEqual([w["owned_indexes"] for w in b], [[9], [9], [9]])
+        self.assertEqual([w["owned_indexes"] for w in server], [[7, 9], [7, 9], [7, 9]])
+        self.assertEqual([w["owned_indexes"] for w in sj.ip_scope_windows(self.windows(), ["192.0.2.1"])], [[], [], []])
+        whole = self.hc.build_net_summaries(self.windows(), 0.5)
+        sa, sb = self.hc.build_net_summaries(a, 0.5), self.hc.build_net_summaries(b, 0.5)
+        for k in range(3):
+            self.assertEqual(sa[k]["net_pkts_total_delta"] + sb[k]["net_pkts_total_delta"], whole[k]["net_pkts_total_delta"])
+            self.assertEqual(sa[k]["net_bytes_total_delta"] + sb[k]["net_bytes_total_delta"], whole[k]["net_bytes_total_delta"])
+        self.assertEqual([s["net_flow_count_seen"] for s in sa], [1, 1, 1])
+        # the server's address takes every flow: the window-level join
+        self.assertEqual(self.hc.build_net_summaries(server, 0.5), whole)
+
+    def test_cli(self):
+        args = self.hc.build_arg_parser().parse_args(["--mode", "command", "--scenario-name", "t", "--label", "benign",
+                                                      "--command", "true", "--scope-ip", "10.0.0.10",
+                                                      "--scope-ip", "10.0.0.11"])
+        self.assertEqual(args.scope_ip, ["10.0.0.10", "10.0.0.11"])
+        self.assertEqual(self.hc.scoped_csv_path("runs/w.csv", "10.0.0.11"), Path("runs/w.scoped-10.0.0.11.csv"))

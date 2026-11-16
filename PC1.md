@@ -663,7 +663,7 @@ accuracy with Table IV and Table V). Offline, with the switch rules emulated, th
 balanced accuracy and zero flips on the held-out split; the replay measures it on the hardware, including the
 read budget under overload, which the offline emulation only approximates.
 
-**Captures.** 110 in all, both sets sanitized (headers only, payload bytes zeroed):
+**Captures.** 110 in all (107 replayable), both sets sanitized (headers only, payload bytes zeroed):
 - the 77 cohort captures in `live_test/captures/cohort/` (rows 0-203 with traffic; Chaos `d538053a...` last:
   it overloads the reader in every window);
 - 33 new ones for the network attacks and network-benign rows (rows 204-239; the 3 null runs have no
@@ -674,6 +674,11 @@ read budget under overload, which the offline emulation only approximates.
 
   Its `manifest.csv` has the cohort's columns plus `attack_type`. Replay the 8 runs with `expect_overload` 1
   last (the fan-out floods, `slowloris_1000`, the two GoldenEye runs).
+- **Skip `bulkup_200`, `bulkup_400`, `bulkup_700`** (found 2026-11-15): they hold 4,370, 8,824 and 15,072 frames
+  larger than 1514 B (up to 65,226 B). The guest's capture took the upload's segments before the NIC split them
+  (transmit segmentation offload), so these frames cannot go out on a 1500-byte wire as they are, and the
+  dataset counted each as one packet where a switch would see up to ~45. Note them as not replayable; the other
+  30 extra captures and all 77 cohort captures stay under 1514 B.
 
 **The replay option (done, 2026-11-15).** `live_test/replay_capture.py --profile dataset` runs the collector
 with `--profile dataset --launcher shell --windows K+40` and the replayer with 0.5 s windows, so that collector
@@ -721,6 +726,126 @@ datagram for both. Also record the governor (`cpupower frequency-info`) and whet
 
 **What comes back.** `summary.json`, `bench.jsonl`, `kernel.txt` and the `SOCKOWNER_HEALTH` lines
 (drops and errors must be 0).
+
+## Part 6 (ready, 2026-11-15): the dataset's own static benign programs, live
+
+*Why. Live, PC1's own benign programs (Ubuntu 20.04 builds and busybox, parts 2 and 3) are flagged by the host
+and stacked detectors in 19 of 47 executions, far more than the dataset's benign rows. Two explanations remain:
+the live pipeline differs from the dataset's collector, or PC1's programs differ from the dataset's. The
+dataset's static programs carry their own C library, so running them here separates the two: if their live rows
+are their dataset rows, the pipeline is faithful and the gap comes from PC1's programs.*
+
+**The programs.** 66 static benign programs of the dataset without a network task (45 amd64, 21 i386; GNU
+coreutils, diffutils, gzip, m4, cpio, bzip2, brotli, lz4, ncompress, xxHash, xmlwf, sqlite3), each the exact
+binary of its dataset run, with the input files of its task. They come as `static-benign.tar.gz` (107 MB,
+SHA-256 `e011e8cabb36d2c8b25d8ad1aee5c704bf7187fc048ad9e07daaeac1756372e9`), not committed (compiled GPL programs): copy it from the lab workstation
+(`vbox-runs/hybrid-rf-study-20261010/data/versioned-collector/additional-study-review-20261022/pc1-static-benign/`).
+
+    mkdir -p perf/results/static_benign && cd perf/results/static_benign
+    scp WORKSTATION:.../pc1-static-benign/static-benign.tar.gz . && sha256sum static-benign.tar.gz
+    tar xzf static-benign.tar.gz && cd ../../..
+    (cd perf/results/static_benign/static-benign && python3 -c 'import hashlib,json; m=json.load(open("manifest.json")); bad=[f for f,h in m["files"].items() if hashlib.sha256(open(f,"rb").read()).hexdigest()!=h]; print("bad:", bad or "none")')
+
+The i386 programs need the kernel's 32-bit support (standard in Ubuntu's kernels).
+
+**Run** (from p4_ebpf; about 25 minutes; `--only 2` first as a trial):
+
+    python3 live_test/static_benign/run_static_benign.py --root perf/results/static_benign/static-benign \
+        --out perf/results/static_benign/runs --startup-free [--pfexec PATH_OF_PART_3_PFEXEC]
+
+`--startup-free` starts each program as part 3 did: `pfexec` (built from `live_test/prologuefree/pfexec.c`)
+moves it into `/sys/fs/cgroup/unified/hazim_prog` at its exec, the launcher's bash stays in `hazim_launch`,
+and the runner writes part 3's two-line `hostmon_agg` wrapper itself. Each case is the common collector
+command C of section 0 with `--command "pfexec ... -o OUT/ID.stdout PROGRAM ARGS"` (every path absolute), then
+`dataset_row.py` with the case's dataset `execution_id`. Without `--startup-free` it runs as part 2 (the
+launcher in the cgroup, `bin/outto` for stdout); compare those rows with the published table instead.
+
+**Compare:**
+
+    ../venv/bin/python3 live_test/static_benign/compare_static_benign.py perf/results/static_benign/runs/rows.csv \
+        --dataset live_test/prologuefree/features_05s_prologuefree.csv --json perf/results/static_benign/compare.json
+
+Per program: the live and dataset system-call counts, how many of the 90 host columns agree within 1% and 10%,
+and the four detectors' scores (host-only, network-only, concatenated, stacked; trained on the 240 start-up-free
+rows *without the program's project*) for the live row and for its dataset twin, side by side. The dataset
+twins themselves are flagged by host 6, network 0, concatenated 6, stacked 2 of 66 (checked on the workstation:
+the script given the dataset's own rows reproduces them exactly, 90 of 90 host columns, identical scores). So a
+faithful pipeline gives about those numbers; part 3's 19 of 47 would show as many more live flags here.
+
+**What comes back.** The comparison's printed table and `compare.json`, `runs/rows.csv`, and any case whose
+collector failed or whose exit code differs from `cases.tsv` (the runner prints both). Expected differences
+worth noting rather than fixing: a few calls from PC1's kernel, and programs whose count depends on timing.
+
+## Part 7 (ready, 2026-11-15): a verdict every window, and a drop rule on the verdict
+
+*For the committee's items 5 (online detection) and 6 (closing the loop: on a malicious verdict, have the switch
+drop the host's flows, and measure time-to-containment). Offline (committee-eval-20261113 REPORT.md 2.6), a model
+trained on observation prefixes makes about 95% of its detections in the first 0.5-s window, floods 98%.*
+
+**Tool.** `live_test/streaming/stream_verdicts.py COLLECTOR.csv`: the paper's forests trained on every dataset
+run at the prefixes 1, 2, 4, 6, 10, 16, 20, 30, 40 windows (`live_test/streaming/dataset_windows.csv.gz`: the
+240 runs' 0.5-s window signals, 170 kB; the 40-window summaries reproduce every published row); after each new
+window it summarizes the run so far like a dataset row and prints a probability. `--detector network` (default:
+a replay has no host side), `--hold-out-group G` trains without the dataset runs of group G (the replayed run's
+`cv_group` in the manifest; otherwise the verdict is in-sample), `--skip-windows K` for a replay anchored on
+window K, `--follow` to score while the collector writes, `--on-alarm "CMD"` runs CMD once at the first window
+over `--threshold` (STREAM_WINDOW and STREAM_PROBABILITY in its environment), `--log` a JSONL record. Checked on
+the workstation: syn_fan_40k held out alarms at window 0 (p 0.98), bulk2000 and a coreutils run do not alarm;
+in `--follow` mode it scored rows as they were appended and ran the hook once. Training takes ~1 s (network) to
+~15 s (stacked).
+
+**Step 1, no switch change: verdicts on the switch's own windows.** After Part 4, for each replay directory:
+
+    ../venv/bin/python3 live_test/streaming/stream_verdicts.py DIR/windows.csv --skip-windows 4 \
+        --hold-out-group CV_GROUP --log DIR/stream.jsonl
+
+and note the first alarm window per run (attacks, network-benign and malware separately). The offline value to
+compare with comes from the same windows in the dataset.
+
+**Step 2, the drop rule (a switch change for this part only).** Add to `ingress.p4` a table after
+`forwarding.apply()`, only for valid IPv4, keyed exactly on `hdr.ipv4.srcAddr`, with the actions `drop` (the
+existing one) and `NoAction` (default), size 1,024; the flow registers are updated earlier, so blocked packets are
+still counted. A small control-plane script (bfrt, like `program_forwarding.py`) adds and removes an entry and
+prints the time the add call returned. Record the compiler's stages and resources, since the table may cost a
+stage, and keep the build separate from the measured detector of section 4 / 5.5.
+
+**Step 3, time to containment.** Replay one attack capture at a time (from `cohort-extra`: `udp_sink_60k`,
+`syn_sink_40k`, `syn_fan_40k` and a GoldenEye run) through the switch with the collector (`--profile dataset`,
+as Part 4) and, beside it,
+
+    ../venv/bin/python3 live_test/streaming/stream_verdicts.py DIR/windows.csv --follow --skip-windows 4 \
+        --hold-out-group CV_GROUP --log DIR/stream.jsonl --on-alarm "python3 MITIGATE add 10.0.0.10"
+
+and count, behind port 140 (a capture on PC2, or the port's counters), the replay's packets forwarded before and
+after the rule. Per run: first attack packet sent, alarm window and time, rule-install time, last forwarded packet,
+and the share of the attack dropped. Then the same with three benign replays (`bulk2000`, `session_1000`,
+`dns_10k`): does any get blocked, and when? Remove the entry after every run.
+
+**What comes back.** Step 1's first-alarm windows; for step 3 the per-run times and counts, the `stream.jsonl`
+files, the compiler's resource lines for the variant with the table, and any failure.
+
+## Part 8 (proposed, 2026-11-15): several hosts behind the switch
+
+*For the committee's item 9 (several hosts behind the Tofino, with background traffic). Needs a testbed change on
+PC1, so run it only if the user agrees.*
+
+**What the collector can do now.** `hybrid_collector.py --scope-ip ADDR` (repeatable) writes, next to the run's
+rows, one more CSV per address (`<out-csv stem>.scoped-ADDR.csv`) whose network features count only the flows
+with ADDR as source or destination (`sockjoin.ip_scope_windows`: a bucket's flow is the 5-tuple of its latest CPU
+report; cleared buckets lose their owner until they report again). Tested: two hosts' flows partition each window
+(their packet and byte deltas add up to the whole window's), and the server's address gives back the
+window-level join (`test_sockjoin.py`, the collector suite is 152 OK).
+
+**Proposed run.** With only PC1 and PC2 every flow touches both, so the hosts are two client namespaces on PC1
+bridged onto `eth1`, with their own addresses (A 10.0.0.11, B 10.0.0.12), talking to `validation/hybrid/servers.py`
+on PC2 (10.0.0.2):
+1. A alone (`http_poll`), B alone (`http_bulk`), each one collector run with `--scope-ip` its address;
+2. A and B at the same time, one collector run with `--scope-ip 10.0.0.11 --scope-ip 10.0.0.12`;
+3. step 2 again with background traffic from a third namespace (`bulk2000` replayed from it).
+Compare per host, window by window, the scoped rows of steps 2 and 3 with the solo rows of step 1, and with the
+window-level rows (every flow); score all three with `validation/hybrid/score.py`'s network detector. Expected:
+scoped equals solo up to timing, the window-level rows mix the hosts. The host side stays this machine's monitor
+on the monitored host's cgroup (a per-host monitor on each host is the deployment, not tested here).
 
 ## Results, part 4 (PC1, 2026-11-15): 109 of the 110 captures through the Wedge
 

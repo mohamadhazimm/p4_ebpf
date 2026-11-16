@@ -239,3 +239,24 @@ def socket_join_windows(net_windows: Sequence[Dict[str, object]], table: OwnerTa
         for idx in win.get("cleared_indexes", []) or []:
             owner_by_idx.pop(int(idx), None)
     return out
+
+
+def ip_scope_windows(net_windows: Sequence[Dict[str, object]], addresses: Iterable[str]) -> List[Dict[str, object]]:
+    """Copies of the collector's windows with "owned_indexes": the buckets whose flow (the 5-tuple of the
+    bucket's latest CPU report, "report_keys") has one of `addresses` as its source or destination. This is
+    the host-level join for several hosts behind the switch: one host's network features are those of its
+    own flows. A bucket cleared after a read loses its owner until it reports again; a flow between two of
+    the given hosts counts for both."""
+    want = {str(a) for a in addresses}
+    owner_by_idx: Dict[int, bool] = {}
+    out: List[Dict[str, object]] = []
+    for win in net_windows:
+        for item in win.get("report_keys", []) or []:
+            idx, _protocol, src, _sport, dst, _dport = item
+            owner_by_idx[int(idx)] = str(src) in want or str(dst) in want
+        copy = dict(win)
+        copy["owned_indexes"] = sorted(idx for idx, own in owner_by_idx.items() if own)
+        out.append(copy)
+        for idx in win.get("cleared_indexes", []) or []:
+            owner_by_idx.pop(int(idx), None)
+    return out
