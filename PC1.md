@@ -2192,7 +2192,219 @@ The captures below 135 on the sweep or the exact build:
 - **Overall a tie:** 103 against 102 rows, 131.8 against 131.9 columns on average. The sweep build takes 6
   ingress stages against 11 and 337 against 421 ns.
 
-**Not run yet:** 9E's two line-rate runs with the sweep's generator beside the line-rate app.
+**Not run yet:** 9E's two line-rate runs with the sweep's generator beside the line-rate app (run in part 9f).
 
 **State after:** the switch runs `basic_fix` again (pid 29739). The first cohort capture gave 9 of 9 packets and 40
 of 40 windows inside the bounds (`restored_check_3/`, with `enp5s0` up for it); `enp5s0` down.
+
+## Results, part 9d (PC1, 2026-11-17): a collision counter in the sweep build
+
+Part 9c showed that the bucket table merges colliding flows without saying so. The build now counts them.
+- **The counter:** `reg_coll`, one byte per bucket, saturating at 255.
+  - A data packet adds 1 when it matches neither direction of its bucket's reference ports (the direction logic's
+    fallback branch), which makes it a second flow in the bucket.
+  - A probe reads the count into `sweep_t.coll`, the record's former reserved byte. The probe takes the same fallback
+    branch, so the table has one application for both kinds of packet.
+  - The table is pinned to stage 3, the first stage with the reference ports in the PHV and a free stateful ALU.
+  - Two flows with the same ports and different addresses are not seen, because the bucket keeps no addresses.
+- **On the host:** `sweep_features.SweepWindows` adds 4 columns per window:
+  - `net_sweep_coll_pkts`: the counts' rise in the window;
+  - `net_sweep_coll_saturated`: the buckets at 255;
+  - `net_sweep_merged_active`: the active buckets with a count;
+  - `net_sweep_merged_buckets`: all buckets with a count so far.
+
+  The software model counts the same, and `sweep_reader.py` clears `reg_coll` with the other registers.
+- **Build** (`basic_sweep_coll`; `perf/results/part9_20261117/builds_coll/resources_coll.md`):
+
+| Build | Stages ig/eg | Critical path | SRAM | TCAM | Stateful ALUs | Ingress cycles | Median latency |
+|---|---|---|---|---|---|---|---|
+| basic_sweep_final (part 9b, no counter) | 6/1 | 5 | 239 | 20 | 22 | 158 | 337 ns |
+| basic_sweep_coll | 7/1 | 5 | 245 | 20 | 23 | 164 | 342 ns |
+| basic_sweep_coll_ctrl (`-DP4_ENABLE_SWEEP=0 -DP4_FRAME_LEN=0`) | 6/1 | 4 | 211 | 3 | 21 | 133 | (basic_gtot_ba) |
+
+- The control build has exactly `basic_gtot_ba`'s resources, as before.
+- **Latency** (`latency_coll/`, hairpin as in part 9, 3 runs per build, 1,010 reports per run, none missing): baseline
+  246 ns, `basic_sweep_final` 337 ns, `basic_sweep_coll` 342 ns (p99 346 ns). The counter costs a seventh ingress
+  stage, 6 cycles and 5 ns.
+- **In-band replays** (`sweep_coll/`): 4 captures, every check of part 9 passing. The collision counts equal the
+  model's in every window.
+
+| Capture | Colliding packets | Merged buckets | Windows with merged active buckets | Row vs published (of 135) |
+|---|---|---|---|---|
+| cohort 0004b57f | 0 | 0 | 0 | 135 |
+| bulk2000 | 0 | 0 | 0 | 135 |
+| syn_fan_40k | 10,050 | 8,185 | 5 | 120 |
+| Chaos (d538053) | 55,245 | 14,899 | 40 | 67 |
+
+- **Generator check** (`sweep_generator_coll/`, `sweep_generator_check.py`, 2 µs): 15 whole sweeps, every record after
+  the traffic equal to the model's, all checks passing.
+- **Unit test:** `test_collisions_are_counted_and_saturate` (`tests/test_sweep.py`).
+- **Line rate** (`linerate_coll/`, the 27-run matrix of p4_perf 3.2 with `--global-totals`, the same script as part
+  9b's, `summary.md` from `linerate_coll/summarize.py`): every rate equals the build without the counter to within 0.01
+  points (91.09% at 64 B; 99.87-99.89% paced and 100.00% saturating from 128 to 1518 B). There is no loss beyond the
+  saturating runs' excess, and all checks pass: the flow's registers and the split totals are exact for 13.1 billion
+  packets in both pipes.
+- **The 109 captures** (`sweep_replays_coll/`, `run_sweep_replays.py --include-oversize` with part 9c's list, in-band
+  probes, 52.9 minutes; `runs.csv` now has the collision columns):
+  - **The same as without the counter:** 103 of 109 rows equal to the published row in all 135 non-duration columns,
+    mean 131.8. Every one of the 109 captures has the same score as on `basic_sweep_final` (part 9c).
+  - **Against the model:** 107 of 109 equal in all 135 columns, the collision counts included. The other 2 are again
+    `bulkup_200` and `bulkup_400`, whose GSO super-frames eth1's MTU refuses. Probes = exports = 475,080, none lost.
+  - **The counter flags exactly the floods that are not exact.** 4 captures have collisions, and they are the 4 whose
+    rows the bucket table cannot make equal to the published row:
+
+| Capture | Colliding packets | Merged buckets | Windows with merged active buckets (of 40) | Row vs published (of 135) |
+|---|---|---|---|---|
+| syn_fan_150k | 90,599 | 43,388 | 16 | 67 |
+| Chaos (d538053) | 55,245 | 14,899 | 40 | 67 |
+| syn_fan_100k | 48,461 | 29,463 | 8 | 70 |
+| syn_fan_40k | 10,050 | 8,185 | 5 | 120 |
+
+  - The other 105 captures have no collision. All of them equal the published row except the 2 bulk uploads, which
+    the replay limits. `udp_fan_60k`'s flows land in separate buckets, so its row is exact and the counter shows 0.
+
+## Results, part 9e (PC1, 2026-11-17): how fast PC1 takes the exports
+
+The generator sweeps all 65,536 buckets each window, and every used bucket comes back as a 104-byte record. These
+runs measure how fast PC1's eth1 takes them.
+- **How:** `live_test/sweep_generator_check.py --flows N --ipg-ns GAP` on `basic_sweep_coll` (part 9d), with the
+  exports written to `/dev/shm` (the disk was full). Lost = exports the switch counted minus records captured. The NIC's
+  `rx_out_of_buffer` and `rx_discards_phy` were read before and after each run (`nic_counters.txt`).
+- **Results:** `perf/results/part9_20261117/sweep_export_rate/`; the 10 runs' `exports.pcap` are in
+  `exports_pcaps.tar.xz` there (14 MB).
+
+| Flows (used buckets) | Gap (a sweep) | eth1 ring 1,024 (default): lost / exported | ring 8,192: lost / exported |
+|---|---|---|---|
+| 30,000 (17,788) | 2 µs (131 ms) | 251 / 193,009 | 0 / 190,706 |
+| 30,000 (17,788) | 1 µs (66 ms) | 3,015 / 191,901 | 0 / 175,497 |
+| 30,000 (17,788) | 0.5 µs (33 ms) | 3,406 / 174,251 | 0 / 173,857 |
+| 30,000 (17,788) | 0, the generator's rate (0.64 ms) | 155,224 / 173,406 | 81,942 / 175,218 |
+| 60,000 (19,720) | 2 µs (131 ms) | 320 / 275,738 | 0 / 275,666 |
+
+- **The losses are PC1's NIC, not the switch or tcpdump.** tcpdump dropped none in any run. Where the counters were
+  read, the loss equals the rise of `rx_out_of_buffer`: 3,406 at 0.5 µs, 320 at 60,000 flows. At the generator's full
+  rate `rx_discards_phy` rose too (23,677 and 31,671).
+- **With 8,192 receive descriptors** (`ethtool -G eth1 rx 8192`, the NIC's maximum) **no export was lost down to a
+  0.5 µs gap.** At the generator's full rate about half is lost either way.
+- The ring was set back to 1,024 after the runs.
+
+## Results, part 9f (PC1, 2026-11-17): line rate beside the sweep's generator (9E)
+
+**First attempt (`linerate_9e_wedged_port69_alone/`):** the line-rate app ran alone on local port 69, before the sweep
+held port 68. The generator sent 2 packets, and pipe 1's generator then sent nothing from any port, the sweep's
+included, until switchd was restarted. This is part 6d's rule: a port other than 68 sends only while 68 of the same
+pipe is a generator port. The runs below put the line-rate app alone on port 68.
+
+**Form 1: both apps on pipe 1's generator (`linerate_9e/`).** The sweep runs on local port 68 (65,536 probes, 2 µs apart,
+every 0.5 s) and the line-rate app on port 69 (`--first-local-port 69 --buffer-offset 4096`), 10 s per run.
+
+| Frame | Alone (port 68) | Beside the sweep (port 69) | 1 − 131 ms / 500 ms of the alone rate |
+|---|---|---|---|
+| 1518 B, paced at 100% | 99.99% | 73.88% | 73.78% |
+| 64 B, the generator's maximum | 91.09% | 67.26% | 67.21% |
+
+- **The generator serves one app at a time.** While the sweep's batch runs (131 ms of every 500 ms), the line-rate app
+  sends nothing. This is the generator's limit, not a data-plane cost.
+- Every generated packet was counted (the flow's `reg_pkts` and the totals equal the generated packets in both pipes),
+  with no drop at the traffic manager.
+- 54 sweeps, 108 exports (bucket 0 and the flow's bucket), all 108 captured on PC1.
+
+**Form 2: line rate from pipe 0 into the swept pipe (`linerate_9e2/`).** Pipe 0's generator sends the line-rate flow
+(`--pipe 0`) to the sink dev_port 148 (port 3/0, pipe 1, MAC near loopback), so the traffic enters pipe 1, where pipe 1's
+generator sweeps the same registers.
+
+| Frame | Alone | With the sweep in pipe 1 |
+|---|---|---|
+| 1518 B, paced at 100% | 99.99% (89,985,885 packets) | 99.99% (89,894,607) |
+| 64 B, the generator's maximum | 91.09% (1,500,971,008) | 91.09% (1,499,725,824) |
+
+- **The sweep costs the line rate nothing.** No drop at the traffic manager. The flow's `reg_pkts` and the totals grew by
+  exactly the generated packets in both pipes.
+- 55 sweeps, 110 exports, all 110 captured on PC1, tcpdump dropping none.
+- The generator stopped between two sweeps (its counter 3,604,480 = 55 × 65,536). Cleanup removed the sink port and
+  the forwarding entries.
+
+## Results, part 9g (PC1, 2026-11-17): hybrid_collector.py --switch-program sweep
+
+The user asked for `hybrid_collector.py` to fit the sweep build.
+
+**The collector** (`hybrid_collector.py`):
+- **The reader:** `sweep_reader.py --serve` runs on the switch. It sets the program up (reset, `frame_len`, probe
+  and export ports) and drives the generator: prepare, enable, and a stop between two sweeps.
+- **`--sweep-probes generator`** (the deployment): the generator is enabled one period before the collector's window 0,
+  so its first sweep falls on window 0's start. Measured: the sweeps arrived 1.1–2.6 ms after the collector's
+  boundaries over the 46 windows of a run.
+- **`--sweep-probes inband`** (replays): the scenario sends the probes with its frames.
+- **The windows:** `collect_windows_sweep()` turns each pair of consecutive sweeps into a window with
+  `sweep_features.SweepWindows`, the code of `sweep_replay.py`. Each window adds `net_sweep_totals_mismatch`,
+  `net_sweep_coll_pkts`, `net_sweep_coll_saturated`, `net_sweep_merged_active`, `net_sweep_merged_buckets`,
+  `net_sweep_buckets` and `net_sweep_span_us`.
+- There is no CPU report and no register read in this mode. `--sockowner`, `--global-totals` and `--scope-ip` are
+  refused.
+
+**The replay driver:** `live_test/replay_capture.py --sweep inband|generator` sends one capture through the collector.
+It compares every window with the program's software model on the same frames, with in-band probes and perfect cuts,
+and compares the dataset row with the model's and the published one. `live_test/run_sweep_collector.py` runs a list
+of captures through it. The dataset's window 0 is the collector's window 6, so that the replayer has loaded a flood
+before its first frame is due.
+
+**In-band probes** (`sweep_collector_inband/`, the 4 captures of part 9d):
+
+| Capture | Windows equal to the model (27 non-duration features) | Packets, collector / model | Colliding packets, collector / model | Row vs published (of 135) |
+|---|---|---|---|---|
+| cohort 0004b57f | 46 / 46 | 9 / 9 | 0 / 0 | 135 |
+| bulk2000 | 46 / 46 | 24,000 / 24,000 | 0 / 0 | 135 |
+| syn_fan_40k | 46 / 46 | 39,847 / 39,847 | 10,050 / 10,050 | 120 |
+| Chaos (d538053) | 46 / 46 | 221,733 / 221,733 | 55,245 / 55,245 | 67 |
+
+- **Every window equals the model's**, and the rows equal those of `sweep_replay.py` (part 9c): through the collector,
+  in-band, the sweep build gives the same rows.
+- **Fix 1: a late in-band start.** Chaos first failed: "sweep 1: no export within 5.0 s". The replayer plans Chaos's
+  106,363 probes before it starts, so it began 5.95 s late and shifted its whole schedule. The collector now waits up
+  to 120 s for the first in-band sweep, then awaits each later one from its boundary plus that shift
+  (`inband_shift_s` in the timing file).
+
+**Generator probes** (0.5 µs gap, eth1's ring at 8,192, set back to 1,024 after):
+- **Fix 2: the capture.** With an AF_PACKET socket read by a Python thread (`sweep_collector_gen500_socket/`), the two
+  floods failed. In `syn_fan_40k` the records came in later each window from window 12 on (0.16 s, then up to 4.9 s
+  late). From window 17 the socket dropped them (129,000 by window 21), until a whole sweep was missing. PC1 has 2
+  cores and was replaying the flood at the same time. The collector now has tcpdump write the records into a file in
+  `/dev/shm` and parses it behind (`--sweep-capture tcpdump`, the default). With it (`sweep_collector_gen500_tcpdump_v1/`)
+  both floods completed: Chaos gave 46 windows from 1,636,958 records, tcpdump dropping none, and `syn_fan_40k` counted
+  all 39,847 packets, its collisions equal to the model's.
+- **Fix 3: when a sweep is complete.** In that run `bulk2000` counted 23,388 of 24,000 packets. tcpdump handed the
+  records over in blocks up to 1 s late, and the collector judged a sweep complete by the records' own arrival
+  timestamps, so it closed sweeps that tcpdump still held part of. Now tcpdump runs with `--immediate-mode`. A sweep is
+  complete once a later one has begun, or once the file is read to its end and no record of the sweep has come in for
+  0.25 s of this host's time.
+- **After the fixes** (`sweep_collector_gen500/`):
+
+| Capture | Windows equal to the model | Packets, collector / model | Row vs published (the model's in-band row: 135) |
+|---|---|---|---|
+| cohort 0004b57f | 44 / 46 | 9 / 9 | 91 |
+| bulk2000 | 6 / 46 | 24,000 / 24,000 | 44 |
+
+- **PC1 hung during `syn_fan_40k`.** The last kernel message, at 13:05:41, is the export capture starting. The journal
+  then stalls, with entries written up to a minute late, and ends at 13:09:32 without a shutdown. PC1 came back at
+  13:10:30 after a reset. Nothing logged an out-of-memory kill or a panic. PC1 has 2 cores, 3.9 GB and no swap, and was
+  replaying the flood while taking the exports' bursts. The floods were not run again in this mode.
+- **PC1's NIC drops exports under a flood** even with 8,192 descriptors: 80,443 during `syn_fan_40k` and 27,812 during
+  Chaos (`tcpdump_v1`). A lost record leaves its bucket's last one in place, so that bucket's packets count in a later
+  window and no packet is lost over the run.
+- **Why generator mode loses parity: the cut.** Bucket *i* is read at its boundary + 1.1–2.6 ms + *i* × 0.5 µs, over
+  33 ms. A packet in that time counts in the window before for every bucket probed after it. The dataset's captures
+  begin a few ms after their anchor, so their first packets are exactly such packets. In `bulk2000`'s continuous
+  traffic, the cut of almost every window differs from the perfect cut, while every packet is still counted.
+- **So the 103 of 109 (part 9c) holds with in-band probes, not with the generator.** The exact build's timer mode
+  (part 6e) cuts in one instant, 2.4–3.8 ms after the collector's boundaries, but its rows have not been scored on the
+  109 captures either.
+
+**Tests:** `thesis-hybrid-ebpf-p4/python/tests/test_sweep.py`, 36 tests, all pass. They cover the collector's
+generator and in-band windows against the sweeps', a late in-band start, tcpdump's file read as it grows with a record
+split across two writes, a missing sweep, the summary columns, and the options refused. In the full suite (248 tests)
+one test fails as before: `test_sockjoin` runs the release's `switch_model.py`, which needs Python 3.9 (PC1 has 3.8).
+
+**Results of parts 9d-9g** are in `perf/results/part9_20261117/` and, without the captures' pcaps, in the archive
+`live_test/committee_replay/pc1_20261117_part9d.tar.xz`.
+
+**State after:** the switch runs `basic_sweep_coll` with the generator stopped; eth1's ring is at 1,024.

@@ -12,7 +12,9 @@ one table for both kinds of packet (the "merged" layout, `ingress.p4`'s header c
   317 ns (the exact build: 421 ns). The line rate is `basic_fix`'s, lossless, the totals exact.
 - **With the collision counter** (`reg_coll`, added after part 9c; `PC1.md` "Results, part 9d"): 7 ingress stages, 164
   cycles, 342 ns, 23 stateful ALUs. These sources include it; the 6-stage figures above are the build without it
-  (`basic_sweep_final`, the 109 captures of part 9c).
+  (`basic_sweep_final`, the 109 captures of part 9c). With the counter the line-rate matrix and the 109 captures give
+  the same results: 103 rows equal to the published one, every capture with the same score. Collisions show in exactly
+  the 4 floods whose rows are not exact.
 - **On the switch:** in-band replays equal to the program's model in all 135 non-duration columns (5 captures,
   Chaos included). The generator path: whole sweeps every 0.5 s, every record equal to the model's, at 2 µs, 0.5 µs
   and the generator's full rate (a sweep in 0.64 ms).

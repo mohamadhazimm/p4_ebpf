@@ -31,7 +31,8 @@ CHAOS = "d538053ada48405e02cfac24bc145c79bb2ae56470cc1b4bae4ee3c916d772e1"
 RUN_FIELDS = ["execution_id", "status", "frames", "frames_sent", "frames_failed", "probes_sent", "switch_probes",
               "model_probes", "exports", "switch_exported", "model_exports", "sweeps", "seq_contiguous",
               "totals_mismatch_windows", "pkts", "pkts_model", "exact_nodur", "model_exact_nodur",
-              "equal_model_nodur", "checks_ok", "failed_checks", "mismatch_nodur", "sweep_span_us_max", "seconds"]
+              "equal_model_nodur", "checks_ok", "failed_checks", "mismatch_nodur", "sweep_span_us_max",
+              "coll_pkts", "coll_pkts_model", "merged_buckets", "merged_buckets_model", "merged_windows", "seconds"]
 
 
 def items():

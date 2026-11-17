@@ -858,6 +858,7 @@ and no flow should go unread under a flood. **Where the remaining errors came fr
   | basic_gtot_ba | 6/1 | 4 | 211 | 3 | 21 | 133 | 317 ns |
   | sweep, merged, pinned (`perf/variants/sweep`) | 6/1 | 5 | 239 | 20 | 22 | 158 | 337 ns |
   | sweep, merged, no pins (`-DSWEEP_PIN_STAGES=0`) | 7/1 | 5 | 239 | 20 | 22 | 166 | 344 ns |
+  | sweep with the collision counter (`basic_sweep_coll`, `perf/variants/sweep` now) | 7/1 | 5 | 245 | 20 | 23 | 164 | 342 ns |
   | exact (Section 5.7, its first build) | 11/1 | – | 120 | – | 23 | 260 | 421 ns |
 
   - **Latency:** hairpin as in Section 4.1, 3 runs per program, baseline 246 ns the same day. The data path reaches its
@@ -883,7 +884,48 @@ and no flow should go unread under a flood. **Where the remaining errors came fr
     overflows) and worse on Chaos (67 against 71) and `syn_fan_150k` (67 against 77), where flows share buckets.
     The other 106 captures score the same on both.
   - **The cost:** the same parity as the exact build with 6 ingress stages instead of 11 and 337 instead of 421 ns.
-- **Not run yet:** the line rate with the sweep's generator running beside the line-rate app (PC1.md 9E).
+- **The collision counter** (`basic_sweep_coll`, PC1.md "Results, part 9d"). The bucket table merges colliding flows
+  without saying so, so the build now counts them.
+  - `reg_coll` keeps one byte per bucket, saturating at 255. A data packet adds 1 when it matches neither direction of
+    its bucket's reference ports, which makes it a second flow in the bucket. A probe reads the count into its record.
+  - The host gets, per window, the colliding packets and the active buckets that merge flows
+    (`net_sweep_coll_pkts`, `net_sweep_merged_active`), so it knows which windows the bucket table cannot make exact.
+    The exact build has its untracked count for the same purpose. Two flows with the same ports and different
+    addresses are not seen, because the bucket keeps no addresses.
+  - Cost: a seventh ingress stage, +6 cycles and +5 ns (342 against 337 ns, 3 runs each, the same day). The counts
+    change nothing else.
+  - **Tested:** 4 in-band replays (Chaos and `syn_fan_40k` among them) equal to the model in every window, collision
+    counts included: Chaos 55,245 colliding packets in 14,899 buckets, `syn_fan_40k` 10,050 in 8,185. The generator
+    check also passes.
+  - **Line rate:** the 27-run matrix gives the same rates as without the counter to within 0.01 points, lossless,
+    the totals and the flow's registers exact for 13.1 billion packets.
+  - **The 109 captures** (PC1.md part 9d): 103 rows equal to the published row and 107 to the model, mean 131.8. Every
+    capture has the same score as without the counter. Exactly 4 captures have collisions: `syn_fan_150k` (90,599
+    colliding packets), Chaos (55,245), `syn_fan_100k` (48,461) and `syn_fan_40k` (10,050). They are the 4 floods whose
+    rows are not exact, so the counter flags every inexact row and no exact one (the 2 bulk uploads are limited by the
+    replay's MTU).
+- **The line rate beside the generator's sweep** (PC1.md 9E, "Results, part 9f"). Line-rate traffic from pipe 0's
+  generator was looped into pipe 1 while pipe 1's generator swept its registers every 0.5 s. It ran at 99.99% (1518 B)
+  and 91.09% (64 B, the generator's maximum), the same as without the sweep, with no drop and exact counts.
+  - A line-rate app on the same pipe's generator as the sweep loses the sweep's share of the time instead (73.88%
+    against 99.99%, at 131 ms per 500 ms). The generator runs one app at a time.
+- **The receiver of the exports** (PC1.md "Results, part 9e"). The switch exported every record. PC1's NIC, with its
+  default 1,024 receive descriptors, lost a few (251 of 193,009 at a 2 µs gap with 30,000 flows; 3,406 of 174,251 at
+  0.5 µs). With 8,192 descriptors it lost none at 2, 1 and 0.5 µs. At the generator's full rate (a sweep in 0.64 ms)
+  it lost about half either way.
+- **`hybrid_collector.py --switch-program sweep`** (PC1.md "Results, part 9g"). The collector drives the generator
+  through `sweep_reader.py --serve`, takes the exports with tcpdump into `/dev/shm` and builds each window from two
+  consecutive sweeps.
+  - **In-band probes:** every window of 4 replayed captures, Chaos included, equals the model's. The rows equal the
+    direct replays' (135, 135, 120, 67).
+  - **Generator probes (the deployment), 0.5 µs gap:** every packet counted, but fewer windows equal the dataset's
+    perfect cut. The cohort capture matched in 44 of 46 windows, its row 91 of 135. `bulk2000` matched in 6 of 46, its
+    row 44.
+  - The cause is the cut. Bucket *i* is read *i* × 0.5 µs after the boundary, over 33 ms, so a packet in that time
+    counts in the window before for the buckets probed after it. The dataset's captures begin a few ms after their
+    anchor.
+  - **So the 103 of 109 holds with in-band probes.** With the generator, a replay's rows lose parity. On PC1 (2 cores)
+    a flood replay also cost exports at the NIC and once hung the host.
 
 ## 6. Switch CPU side
 
