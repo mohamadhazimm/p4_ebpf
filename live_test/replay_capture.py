@@ -301,6 +301,71 @@ def analyse(out, capture, anchor_offset, align_window, delay, report_latency, wi
     return summary
 
 
+def sweep_check(capture, rows, anchor_us, window_us, n_windows, frame_min, header_bytes=0, max_frame=None,
+                skip=0, published=None):
+    """--sweep: the collector's windows (rows, by net_window_id) against perf/variants/sweep's software model on the
+    replayer's frames with in-band probes at the collector's window boundaries (sweep_features.simulate_inband,
+    perfect cuts): every non-duration window feature must be equal with --sweep inband. With --sweep generator the
+    same comparison measures what the generator's spread cut (a bucket is cut when its probe passes) changes.
+    Frames longer than max_frame are left out (the interface refuses them). skip: the windows before the dataset's
+    40 (--align-window); published: the release's row of this capture, compared with the row of windows
+    skip..skip+39 (sweep_features.summarize, the release's statistics)."""
+    sys.path.insert(0, str(PYDIR))
+    import sweep_features as sf
+    frames = [(t, f) for t, f in sf.read_pcap_us(str(capture)) if max_frame is None or len(f) <= max_frame]
+    exports, model = sf.simulate_inband(frames, anchor_us, window_us, n_windows, "changed", tuple(frame_min))
+    model_windows = sf.windows_from_sweeps(sf.group_sweeps(exports), window_us / 1e6, header=header_bytes)
+    feats = [f for f in sf.FEATURES if f not in sf.DURATION_FEATURES]
+    equal, missing, differing = 0, [], {}
+    for k, wm in enumerate(model_windows):
+        r = rows.get(k)
+        if r is None:
+            missing.append(k)
+            continue
+        bad = [f for f in feats if not sf.exact(r.get(f) or 0, wm[f])]
+        equal += int(not bad)
+        for f in bad:
+            differing[f] = differing.get(f, 0) + 1
+    num = lambda r, k: float(r.get(k) or 0)
+    out = {"against": "perf/variants/sweep's software model, in-band probes at the collector's window boundaries "
+                      "(perfect cuts), on the capture's frames up to the MTU",
+           "windows_model": len(model_windows), "windows_collector": len(rows),
+           "windows_equal_nodur": equal, "windows_missing": missing,
+           "features_differing": dict(sorted(differing.items(), key=lambda kv: -kv[1])),
+           "pkts_collector": int(sum(num(r, "net_pkts_total_delta") for r in rows.values())),
+           "pkts_model": int(sum(w["net_pkts_total_delta"] for w in model_windows)),
+           "probes_model": model.probes, "exports_model": model.exported,
+           "totals_mismatch_windows": sum(1 for r in rows.values() if num(r, "net_sweep_totals_mismatch") != 0),
+           "coll_pkts_collector": int(sum(num(r, "net_sweep_coll_pkts") for r in rows.values())),
+           "coll_pkts_model": int(sum(w["net_sweep_coll_pkts"] for w in model_windows)),
+           "sweep_span_us_max": max((num(r, "net_sweep_span_us") for r in rows.values()), default=0.0)}
+    if published is not None or skip:
+        ks = list(range(skip, skip + DATASET_WINDOWS))
+        if all(k in rows for k in ks) and len(model_windows) >= skip + DATASET_WINDOWS:
+            row = sf.summarize([rows[k] for k in ks])
+            row_m = sf.summarize(model_windows[skip:skip + DATASET_WINDOWS])
+            _bad, bad_nodur = sf.compare_row(row, row_m)
+            out["row_equal_model_nodur"] = 135 - len(bad_nodur)
+            if published is not None:
+                _bad, bad_nodur = sf.compare_row(row, published)
+                _bad_m, bad_m_nodur = sf.compare_row(row_m, published)
+                out["row_equal_published_nodur"] = 135 - len(bad_nodur)
+                out["row_model_equal_published_nodur"] = 135 - len(bad_m_nodur)
+                out["row_mismatch_published"] = sorted({c.split("__")[0] for c in bad_nodur})
+    return out
+
+
+def published_row(release, execution_id):
+    """The release's dataset/features.csv row of this execution id."""
+    import csv
+    csv.field_size_limit(sys.maxsize)
+    with open(Path(release) / "dataset" / "features.csv") as fh:
+        for r in csv.DictReader(fh):
+            if r["execution_id"] == execution_id:
+                return r
+    sys.exit("execution id %s is not in %s" % (execution_id, Path(release) / "dataset" / "features.csv"))
+
+
 DATASET_WINDOWS = 40
 
 
@@ -351,8 +416,19 @@ def main():
                          "(--switch-program exact --window-markers inband), the replayer sends a window marker at "
                          "each collector window boundary in order with the frames, and the self-check compares "
                          "every window exactly with the frames sent between its markers")
+    ap.add_argument("--sweep", choices=["inband", "generator"],
+                    help="the switch runs perf/variants/sweep: the collector builds the windows from its export "
+                         "records (--switch-program sweep). 'inband': the replayer sends the probes at each collector "
+                         "window boundary in order with the frames (--sweep-probes inband); 'generator': the switch's "
+                         "packet generator sweeps every bucket every window (the deployment). The self-check compares "
+                         "every window with the program's software model on the same frames (exact with inband)")
+    ap.add_argument("--sweep-ipg-ns", type=int, default=None,
+                    help="--sweep generator: the gap between two probes (the collector's default: 2000)")
+    ap.add_argument("--execution-id", help="--sweep, --profile dataset: compare the row of the dataset's 40 windows "
+                                           "with this execution id's published row")
+    ap.add_argument("--release", default=str(REPO.parent / "p4-ebpf-malware-detection"))
     ap.add_argument("--frame-min", action="append", default=None,
-                    help="--exact: DST/PREFIX toward which the switch counts the frame minimum (default with "
+                    help="--exact, --sweep: DST/PREFIX toward which the switch counts the frame minimum (default with "
                          "--profile dataset: 10.0.0.10/32, the dataset's guest)")
     argv, extra = sys.argv[1:], []
     if "--" in argv:                        # after --: extra hybrid_collector.py options
@@ -368,18 +444,31 @@ def main():
     window_sec, profile_args = profile_settings(args.profile, args.align_window)
     frame_min = args.frame_min if args.frame_min is not None else (["10.0.0.10/32"] if args.profile == "dataset" else [])
     n_windows = None
-    if args.exact:
+    if args.exact and args.sweep:
+        sys.exit("--exact (perf/variants/exact) or --sweep (perf/variants/sweep), not both")
+    if args.execution_id and not (args.sweep and args.profile == "dataset"):
+        sys.exit("--execution-id needs --sweep and --profile dataset")
+    if args.exact or args.sweep:
         if args.replayer != "absolute":
-            sys.exit("--exact needs --replayer absolute (it sends the window markers)")
+            sys.exit("--exact and --sweep need --replayer absolute (it schedules from the collector's window origin "
+                     "and sends the markers or probes)")
         if args.profile == "dataset":
             n_windows = args.align_window + DATASET_WINDOWS
         else:
             frames = read_pcap(capture, snap=1)
             span = frames[-1][0] - (frames[0][0] + args.anchor_offset) if frames else 0.0
             n_windows = args.align_window + int(span // window_sec) + 2
+    if args.exact:
         profile_args = profile_args + ["--switch-program", "exact", "--window-markers", "inband",
                                        "--marker-port", args.int_port, "--windows", str(n_windows)] + \
             sum((["--frame-min", f] for f in frame_min), [])
+    if args.sweep:
+        profile_args = profile_args + ["--switch-program", "sweep", "--sweep-probes", args.sweep,
+                                       "--sweep-export-port", args.int_port, "--sweep-export-iface", args.tx_iface,
+                                       "--windows", str(n_windows)] + \
+            (["--sweep-probe-port", args.int_port] if args.sweep == "inband" else []) + \
+            (["--sweep-ipg-ns", str(args.sweep_ipg_ns)] if args.sweep_ipg_ns is not None else []) + \
+            (sum((["--frame-min", f] for f in frame_min), []) if frame_min else ["--frame-min", "none"])
     delay = None
     if args.replayer == "tcpreplay":
         delay = args.align_window * window_sec - args.anchor_offset - args.start_latency
@@ -392,7 +481,8 @@ def main():
         scenario = "exec %s %s --iface %s --align-window %d --anchor-offset %.6f --window-sec %s %s%s" % (
             shlex.quote(sys.executable), shlex.quote(str(REPO / "live_test" / "replay_absolute.py")),
             shlex.quote(args.tx_iface), args.align_window, args.anchor_offset, repr(window_sec),
-            shlex.quote(str(capture)), " --markers --marker-windows %d" % n_windows if args.exact else "")
+            shlex.quote(str(capture)), " --markers --marker-windows %d" % n_windows if args.exact else
+            " --probes changed --probe-windows %d" % n_windows if args.sweep == "inband" else "")
     stub = out / "hostmon_stub"
     stub.write_text("#!/bin/sh\n# stand-in HostMon: the host side of a replay comes from the recorded run\nexec sleep 86400\n")
     stub.chmod(0o755)
@@ -449,6 +539,20 @@ def main():
         tx_side = exact_check(read_pcap(out / "tx.pcap"), rows, header_bytes=hb, frame_min=frame_min)
         summary["exact_check"]["tx_capture"] = {k: tx_side[k] for k in ("windows_exact", "sent_pkts_total",
                                                                         "sent_bytes_total")}
+    if args.sweep:
+        import csv
+        csv.field_size_limit(sys.maxsize)
+        rows = {int(float(r["net_window_id"])): r for r in csv.DictReader(open(out / "windows.csv"))}
+        window_us = int(round(window_sec * 1e6))
+        first_us = int(round(read_pcap(capture, snap=1)[0][0] * 1e6))
+        mtu = int(open("/sys/class/net/%s/mtu" % args.tx_iface).read())
+        pub = published_row(args.release, args.execution_id) if args.execution_id else None
+        summary["sweep_check"] = sweep_check(
+            capture, rows, first_us + int(round(args.anchor_offset * 1e6)) - args.align_window * window_us, window_us,
+            n_windows, frame_min, header_bytes=self_check_header_bytes(args.profile), max_frame=mtu + 14,
+            skip=args.align_window if args.profile == "dataset" else 0, published=pub)
+        summary["sweep_check"].update(probes=args.sweep, frame_min=frame_min, execution_id=args.execution_id,
+                                      ipg_ns=args.sweep_ipg_ns)
     (out / "summary.json").write_text(json.dumps(summary, indent=1) + "\n")
     uid, gid = os.environ.get("SUDO_UID"), os.environ.get("SUDO_GID")
     if uid and gid:
@@ -467,6 +571,19 @@ def main():
                   ec["windows_exact"], ec["windows_checked"], ec["switch_pkts_total"], ec["sent_pkts_total"],
                   ec["switch_bytes_total"], ec["sent_bytes_total"], ec["untracked_pkts"], ec["windows_lost"],
                   ec["tx_capture"]["sent_pkts_total"]))
+    elif args.sweep:
+        c = summary["sweep_check"]
+        print("[replay] sweep check (%s probes): %d of %d windows equal to the model's in the 27 non-duration features; "
+              "packets collector %d / model %d; colliding packets %d / %d; windows whose totals disagree %d; longest "
+              "sweep %.1f ms%s%s" % (
+                  c["probes"], c["windows_equal_nodur"], c["windows_model"], c["pkts_collector"], c["pkts_model"],
+                  c["coll_pkts_collector"], c["coll_pkts_model"], c["totals_mismatch_windows"],
+                  c["sweep_span_us_max"] / 1000.0,
+                  "; row equal to the model's in %d of 135" % c["row_equal_model_nodur"]
+                  if "row_equal_model_nodur" in c else "",
+                  "; to the published row in %d (the model's: %d)" % (c["row_equal_published_nodur"],
+                                                                      c["row_model_equal_published_nodur"])
+                  if "row_equal_published_nodur" in c else ""))
     else:
         print("[replay] self-check: %d of %d windows inside the bounds; packets switch %d / sent %d, bytes switch %d / "
               "sent %d" % (sc["windows_inside_bounds"], sc["windows_checked"], sc["switch_pkts_total"],

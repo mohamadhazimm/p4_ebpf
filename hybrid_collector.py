@@ -41,6 +41,8 @@ DEFAULT_P4_FORWARDER = "/home/ubuntu/Desktop/p4_ebpf/thesis-hybrid-ebpf-p4/pytho
 DEFAULT_P4_RESETTER = str(Path(__file__).resolve().parent / "thesis-hybrid-ebpf-p4" / "python" / "reset_registers.py")
 DEFAULT_BATCHED_READER = str(Path(__file__).resolve().parent / "thesis-hybrid-ebpf-p4" / "python" / "batched_reader.py")
 DEFAULT_WINDOW_READER = str(Path(__file__).resolve().parent / "thesis-hybrid-ebpf-p4" / "python" / "window_reader.py")
+DEFAULT_SWEEP_READER = str(Path(__file__).resolve().parent / "thesis-hybrid-ebpf-p4" / "python" / "sweep_reader.py")
+SWEEP_PYDIR = str(Path(__file__).resolve().parent / "thesis-hybrid-ebpf-p4" / "python")
 DEFAULT_GRPC_ADDR = "127.0.0.1:50052"
 
 DEFAULT_OUT_CSV = "hybrid_windows.csv"
@@ -929,6 +931,276 @@ class WindowReaderProcess(BatchedReaderProcess):
         reply = json.loads(self._get_line(timeout))
         reply["collector_t_sent"], reply["collector_t_reply"] = t_sent, time.time()
         return reply
+
+
+class SweepReaderProcess(WindowReaderProcess):
+    """`sweep_reader.py --serve` for perf/variants/sweep (--switch-program sweep): setup, the packet generator
+    (prepare, enable, stop) and the switch's state, one JSON reply per command. On the switch, as the batched
+    reader runs. stop() stops the generator first (between two sweeps: a stop in a batch leaves the pipe's
+    generator dead until switchd is restarted, PC1.md Results, part 9b)."""
+
+    def __init__(self, script: str = DEFAULT_SWEEP_READER, grpc_addr: str = DEFAULT_GRPC_ADDR,
+                 client_id: int = 9, p4_name: str = "basic", switch_ssh: Optional[str] = None,
+                 remote_sde_install: str = DEFAULT_REMOTE_SDE_INSTALL, pipes: Optional[List[int]] = None,
+                 local_port: int = 68, start_timeout: float = 90.0, echo: bool = True):
+        super().__init__(script, grpc_addr=grpc_addr, client_id=client_id, p4_name=p4_name, switch_ssh=switch_ssh,
+                         remote_sde_install=remote_sde_install, start_timeout=start_timeout, echo=echo)
+        self.pipes = list(pipes or [1])
+        self.local_port = int(local_port)
+        self.remote_name = "sweep_reader"
+        self.generator_running = False
+
+    def _args(self) -> List[str]:
+        return ["--serve", "--grpc-addr", self.grpc_addr, "--client-id", str(self.client_id),
+                "--p4-name", self.p4_name, "--pipes", ",".join(str(p) for p in self.pipes),
+                "--local-port", str(self.local_port)]
+
+    def request(self, req: Dict[str, Any], timeout: Optional[float] = None) -> Dict[str, Any]:
+        reply = super().request(req, timeout)
+        if req.get("cmd") == "generator" and "error" not in reply:
+            if req.get("stop"):
+                self.generator_running = False
+            elif req.get("enable"):
+                self.generator_running = True
+        return reply
+
+    def stop(self) -> None:
+        if self.generator_running and self._proc is not None and self._proc.poll() is None:
+            try:
+                r = self.request({"cmd": "generator", "stop": True}, timeout=15)
+                print(f"[INFO] sweep build: generator stopped {json.dumps(r)}")
+            except Exception as error:
+                print(f"[WARN] sweep build: stopping the generator: {error}")
+        super().stop()
+
+
+class ExportCapture:
+    """The sweep build's export records (EtherType 0x88B6) as they arrive on this host's interface, kept per sweep
+    number with their arrival times. Both backends need root, capture promiscuously (an export keeps its probe's
+    destination MAC) and take incoming frames only (an in-band replay's own probes leave through the same interface).
+    "tcpdump" (the collector's default): tcpdump writes the records into a pcap file in /dev/shm and a thread reads
+    and parses the file behind it, so a slow window delays the windows but loses no record. On PC1 (2 cores) while
+    it replayed a flood, the "socket" backend (an AF_PACKET socket read by a Python thread) fell 5 s behind and
+    dropped 129,000 records (syn_fan_40k, generator probes 0.5 us apart; PC1.md part 9g). Arrival times are then
+    tcpdump's (--immediate-mode: per record, not in blocks up to 1 s late). With tcpdump a sweep counts as complete
+    only once a later sweep has begun, or once the file is read to its end and no record of the sweep has come in for
+    quiet_wall_s of this host's time: a record's own timestamp says when it reached the interface, not when tcpdump
+    wrote it (a sweep taken by its timestamps alone missed records: bulk2000 lost 612 packets, PC1.md part 9g).
+    add() takes a frame directly (tests)."""
+
+    ETH_P_SWEEP = 0x88B6
+
+    def __init__(self, iface: str, rcvbuf: int = 64 << 20, backend: str = "socket", pcap_path: Optional[str] = None,
+                 buffer_kib: int = 131072):
+        sys.path.insert(0, SWEEP_PYDIR)
+        from sweep_features import parse_export
+        self.parse_export = parse_export
+        self.iface, self.rcvbuf = iface, rcvbuf
+        if backend not in ("socket", "tcpdump"):
+            raise ValueError(f"unknown export capture backend {backend!r}")
+        self.backend, self.pcap_path, self.keep_pcap, self.buffer_kib = backend, pcap_path, pcap_path is not None, \
+            buffer_kib
+        self._tcpdump: Optional[subprocess.Popen] = None
+        self._tcpdump_err: List[str] = []
+        self._eof = True            # everything written so far is read (always so for the socket backend)
+        self._final = threading.Event()
+        self.last_add: Dict[int, float] = {}
+        self.quiet_wall_s = 0.25
+        self.lock = threading.Lock()
+        self.by_seq: Dict[int, List[Any]] = {}
+        self.first_t: Dict[int, float] = {}
+        self.last_t: Dict[int, float] = {}
+        self.max_seq = 0
+        self.frames = self.records = self.other = 0
+        self.kernel_drops = 0
+        self._stop = threading.Event()
+        self._sock = None
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> "ExportCapture":
+        if self.backend == "tcpdump":
+            return self._start_tcpdump()
+        import socket
+        import struct
+        s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(self.ETH_P_SWEEP))
+        try:
+            s.setsockopt(socket.SOL_SOCKET, 33, self.rcvbuf)        # SO_RCVBUFFORCE (root)
+        except OSError:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, self.rcvbuf)
+        s.bind((self.iface, self.ETH_P_SWEEP))
+        mreq = struct.pack("iHH8s", socket.if_nametoindex(self.iface), 1, 0, b"")   # PACKET_MR_PROMISC
+        s.setsockopt(263, 1, mreq)                                   # SOL_PACKET, PACKET_ADD_MEMBERSHIP
+        s.settimeout(0.2)
+        self._sock = s
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def _run(self) -> None:
+        import socket
+        while not self._stop.is_set():
+            try:
+                frame, addr = self._sock.recvfrom(2048)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if addr[2] == 4:                                         # PACKET_OUTGOING
+                continue
+            self.add(time.time(), frame)
+
+    def _start_tcpdump(self) -> "ExportCapture":
+        if self.pcap_path is None:
+            self.pcap_path = f"/dev/shm/hybrid_sweep_exports_{os.getpid()}.pcap"
+        if os.path.exists(self.pcap_path):
+            if self.keep_pcap:
+                raise P4ReadError(f"--sweep-export-pcap {self.pcap_path} exists")
+            os.unlink(self.pcap_path)
+        cmd = ["tcpdump", "-i", self.iface, "-Q", "in", "-n", "-U", "--immediate-mode", "-s", "256",
+               "-B", str(self.buffer_kib), "-w", self.pcap_path, "ether proto 0x88b6"]
+        self._tcpdump = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.PIPE, text=True)
+        listening = threading.Event()
+
+        def err_reader() -> None:
+            for line in self._tcpdump.stderr:
+                self._tcpdump_err.append(line.rstrip())
+                if "listening on" in line:
+                    listening.set()
+            listening.set()
+
+        threading.Thread(target=err_reader, daemon=True).start()
+        listening.wait(15)
+        if self._tcpdump.poll() is not None or not any("listening on" in l for l in self._tcpdump_err):
+            raise P4ReadError("the export capture (tcpdump) did not start: " + "; ".join(self._tcpdump_err[-3:]))
+        self._eof = False
+        self._thread = threading.Thread(target=self._run_pcap, daemon=True)
+        self._thread.start()
+        return self
+
+    def _run_pcap(self) -> None:
+        """Read tcpdump's file as it grows: one record at a time, a partial record left for the next read. _eof
+        is set once a read finds nothing new; after stop() has ended tcpdump, the file is read to its end."""
+        import struct
+        f = None
+        while f is None:
+            try:
+                f = open(self.pcap_path, "rb")
+            except FileNotFoundError:
+                if self._final.is_set():
+                    return
+                time.sleep(0.01)
+        try:
+            head = b""
+            while len(head) < 24:
+                more = f.read(24 - len(head))
+                if not more:
+                    if self._final.is_set():
+                        return
+                    time.sleep(0.005)
+                head += more
+            endian, frac = {b"\xd4\xc3\xb2\xa1": ("<", 1e-6), b"\xa1\xb2\xc3\xd4": (">", 1e-6),
+                            b"\x4d\x3c\xb2\xa1": ("<", 1e-9), b"\xa1\xb2\x3c\x4d": (">", 1e-9)}[head[:4]]
+            rec = struct.Struct(endian + "IIII")
+            buf = b""
+            while True:
+                chunk = f.read(1 << 20)
+                if not chunk:
+                    self._eof = True
+                    if self._final.is_set():
+                        break
+                    time.sleep(0.002)
+                    continue
+                self._eof = False
+                buf += chunk
+                pos = 0
+                while len(buf) - pos >= 16:
+                    sec, sub, incl, _orig = rec.unpack_from(buf, pos)
+                    if len(buf) - pos - 16 < incl:
+                        break
+                    self.add(sec + sub * frac, buf[pos + 16:pos + 16 + incl])
+                    pos += 16 + incl
+                buf = buf[pos:]
+        finally:
+            self._eof = True
+            f.close()
+
+    def add(self, host_t: float, frame: bytes) -> None:
+        rec = self.parse_export(frame)
+        with self.lock:
+            self.frames += 1
+            if rec is None:
+                self.other += 1
+                return
+            self.records += 1
+            seq = rec["seq"]
+            self.by_seq.setdefault(seq, []).append((host_t, rec))
+            self.first_t.setdefault(seq, host_t)
+            self.last_t[seq] = host_t
+            self.last_add[seq] = time.time()
+            self.max_seq = max(self.max_seq, seq)
+
+    def read_drops(self) -> int:
+        """The socket's drops so far (PACKET_STATISTICS counts since its last read); tcpdump's are known once it
+        has stopped."""
+        if self._sock is not None:
+            import struct
+            try:
+                _packets, drops = struct.unpack("II", self._sock.getsockopt(263, 6, 8))
+                self.kernel_drops += drops
+            except OSError:
+                pass
+        return self.kernel_drops
+
+    def complete(self, k: int, now: float, span_s: float, quiet_s: float) -> bool:
+        """Sweep k is complete once a later sweep has begun, or span_s after its first record and quiet_s after
+        its last."""
+        with self.lock:
+            if k not in self.by_seq:
+                return False
+            if self.max_seq > k:
+                return True
+            if self.backend == "tcpdump":
+                return self._eof and now - self.first_t[k] >= span_s and \
+                    now - self.last_add[k] >= max(quiet_s, self.quiet_wall_s)
+            return now - self.first_t[k] >= span_s and now - self.last_t[k] >= quiet_s
+
+    def take(self, k: int) -> List[Any]:
+        with self.lock:
+            self.first_t.pop(k, None)
+            self.last_t.pop(k, None)
+            self.last_add.pop(k, None)
+            return self.by_seq.pop(k, [])
+
+    def stop(self) -> None:
+        if self._tcpdump is not None:
+            if self._tcpdump.poll() is None:
+                self._tcpdump.send_signal(signal.SIGINT)
+                try:
+                    self._tcpdump.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    self._tcpdump.kill()
+                    self._tcpdump.wait()
+            time.sleep(0.2)                 # the stderr thread takes tcpdump's last lines
+            for line in self._tcpdump_err:
+                m = re.match(r"(\d+) packets dropped by kernel", line)
+                if m:
+                    self.kernel_drops = int(m.group(1))
+            self._tcpdump = None
+            self._final.set()
+            if self._thread is not None:
+                self._thread.join(timeout=60)
+            if not self.keep_pcap and self.pcap_path and os.path.exists(self.pcap_path):
+                os.unlink(self.pcap_path)
+            return
+        self._final.set()
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+        if self._sock is not None:
+            self.read_drops()
+            self._sock.close()
+            self._sock = None
 
 
 # Absolute times a batched read reports (RUNBOOK 19.6); the timing log keeps them per window.
@@ -2082,6 +2354,159 @@ def collect_windows_exact(
     return windows
 
 
+# --switch-program sweep: the columns a window gets besides the model's 29 features (sweep_features.py)
+SWEEP_EXTRA_KEYS = ["net_sweep_totals_mismatch", "net_sweep_coll_pkts", "net_sweep_coll_saturated",
+                    "net_sweep_merged_active", "net_sweep_merged_buckets", "net_sweep_buckets", "net_sweep_span_us"]
+
+
+def sweep_summary(feats: Dict[str, Any], duration_unit: str = "s") -> Dict[str, Any]:
+    """A window's network columns from sweep_features.SweepWindows: the collector's NET_ZERO columns with the
+    sweep's values, and the sweep build's own checks (the totals check, the collision counts)."""
+    out = dict(NET_ZERO)
+    for k in NET_ZERO:
+        if k in feats:
+            out[k] = feats[k]
+    if duration_unit == "ns":
+        out["net_flow_duration_mean"] = feats["net_flow_duration_mean"] * 1e9
+        out["net_flow_duration_max"] = feats["net_flow_duration_max"] * 1e9
+    for k in SWEEP_EXTRA_KEYS:
+        out[k] = feats.get(k, 0)
+    return out
+
+
+def start_sweep_generator(reader: Any, first_sweep_at: float, window_sec: float, ipg_ns: int = 2000,
+                          buckets: int = 65536, clock: Any = None) -> Dict[str, Any]:
+    """--sweep-probes generator: configure the generator ("prepare", about 20 ms), then enable it one window before
+    first_sweep_at (this host's clock): its first sweep, one period after the enable, falls on the start of the
+    collector's window 0 (as start_window_timer does for the exact build's timer)."""
+    clk = clock if clock is not None else time
+    r = reader.request({"cmd": "generator", "prepare": True, "period_ns": int(round(window_sec * 1e9)),
+                        "buckets": int(buckets), "ipg_ns": int(ipg_ns)}, timeout=60)
+    if "error" in r:
+        raise P4ReadError(f"sweep generator: {r['error']}")
+    delay = first_sweep_at - window_sec - clk.time()
+    if delay > 0:
+        clk.sleep(delay)
+    e = reader.request({"cmd": "generator", "enable": True}, timeout=30)
+    if "error" in e:
+        raise P4ReadError(f"sweep generator: {e['error']}")
+    r.update(e)
+    return r
+
+
+def collect_windows_sweep(
+    capture: Any,
+    proc: subprocess.Popen,
+    window_sec: float,
+    global_t0: float,
+    probes: str = "generator",
+    sweep_span_s: float = 0.0,
+    on_window: Optional[Callable[[Dict[str, object]], None]] = None,
+    max_windows: int = 0,
+    stop_fn: Optional[Callable[[], None]] = None,
+    drain_seconds: float = 0.0,
+    sweep_timeout: float = 5.0,
+    quiet_s: float = 0.05,
+    header: int = ETHERNET_HEADER_BYTES,
+    duration_unit: str = "s",
+    timing_path: Optional[str] = None,
+    clock: Any = None,
+    start_timeout: float = 120.0,
+) -> List[Dict[str, object]]:
+    """The windows of perf/variants/sweep (--switch-program sweep). Sweep k is the switch's k-th sweep since the
+    reset (its reg_sweep_seq): sweep 1 is the state at the start of window 0, sweep w + 2 the state at its end,
+    and sweep_features.SweepWindows turns two consecutive sweeps into the window's features. probes "generator":
+    the switch's packet generator sweeps every bucket every window, started by start_sweep_generator(); a sweep
+    takes sweep_span_s (65,536 probes x the generator's gap), and a bucket is cut when its probe passes.
+    "inband": the scenario sends the probes in order with its traffic (live_test/replay_absolute.py --probes);
+    the cut is then exact. After each boundary the collector waits until the sweep is complete in `capture`
+    (ExportCapture: a later sweep has begun, or sweep_span_s after its first record and quiet_s after its last),
+    at most sweep_timeout s. No CPU report and no register read: every bucket is in every window. A bucket missing
+    from a sweep (a lost export) shows in net_sweep_totals_mismatch. With "inband" the scenario may start late (a
+    replay of a flood plans its probes first) and then shifts its whole schedule (replay_absolute.py): the first
+    sweep gets start_timeout s, and the later ones are awaited from the collector's boundaries plus the lateness
+    of the first (inband_shift_s in the timing file); the windows are the probes' either way.
+
+    max_windows: exactly that many windows, then stop_fn() (as collect_windows_live). Otherwise windows continue
+    until the scenario has ended and drain_seconds have passed. timing_path: one JSON line per window."""
+    sys.path.insert(0, SWEEP_PYDIR)
+    from sweep_features import SweepWindows, group_sweeps
+    clk = clock if clock is not None else time
+    sw = SweepWindows(window_sec=window_sec, header=header)
+    timing = open(timing_path, "a") if timing_path else None
+    windows: List[Dict[str, object]] = []
+
+    def wait_sweep(k: int, not_before: float, timeout: Optional[float] = None) -> Dict[str, Any]:
+        timeout = sweep_timeout if timeout is None else timeout
+        deadline = not_before + timeout
+        while True:
+            now = clk.time()
+            if now >= not_before and capture.complete(k, now, sweep_span_s, quiet_s):
+                break
+            if now >= deadline:
+                break
+            clk.sleep(0.005)
+        recs = capture.take(k)
+        if not recs:
+            hint = (" (is the generator running, and --sweep-export-iface the interface of --sweep-export-port?)"
+                    if probes == "generator" else " (does the scenario send the probes?)")
+            raise P4ReadError(f"sweep {k}: no export within {timeout:.1f} s of "
+                              f"{not_before - global_t0:+.3f} s{hint}")
+        sweeps = group_sweeps(recs)
+        sweep = max(sweeps, key=lambda s: s["records"])      # one generator expected (one pipe)
+        sweep["generators"] = len(sweeps)
+        return sweep
+
+    inband = probes == "inband"
+    base = wait_sweep(1, global_t0, max(sweep_timeout, start_timeout) if inband else None)
+    shift = max(0.0, base["host_first"] - global_t0) if inband else 0.0
+    sw.add(base)
+    w = 0
+    ended_at: Optional[float] = None
+    try:
+        while True:
+            boundary = global_t0 + (w + 1) * window_sec
+            sweep = wait_sweep(w + 2, boundary + shift)
+            feats = sw.add(sweep)
+            win: Dict[str, object] = {
+                "net_window_id": w, "net_window_start_sec": w * window_sec,
+                "net_window_end_sec": (w + 1) * window_sec, "net_window_duration_sec": window_sec,
+                "indexes": [], "report_count": 0, "index_mismatches": 0, "cleared_indexes": [],
+                "report_aggregates": dict(REPORT_ZERO), "exact_features": sweep_summary(feats, duration_unit),
+            }
+            windows.append(win)
+            if timing is not None:
+                rec = {"window": w, "t_window_end": boundary, "seq": sweep["seq"], "records": sweep["records"],
+                       "buckets": len(sweep["buckets"]), "duplicates": sweep["duplicates"],
+                       "generators": sweep["generators"], "span_ns": sweep["span_ns"],
+                       "host_first": sweep["host_first"], "host_last": sweep["host_last"],
+                       "lag_s": round(sweep["host_first"] - boundary, 6),
+                       "totals_mismatch": feats.get("net_sweep_totals_mismatch"),
+                       "coll_pkts": feats.get("net_sweep_coll_pkts"),
+                       "capture_drops": capture.read_drops() if hasattr(capture, "read_drops") else None}
+                if w == 0:
+                    rec.update(base_seq=base["seq"], base_host_first=base["host_first"],
+                               base_lag_s=round(base["host_first"] - global_t0, 6), inband_shift_s=round(shift, 6))
+                timing.write(json.dumps(rec) + "\n")
+                timing.flush()
+            if on_window is not None:
+                on_window(win)
+            w += 1
+            if max_windows:
+                if w >= max_windows:
+                    if stop_fn is not None:
+                        stop_fn()
+                    break
+            elif proc.poll() is not None:
+                ended_at = clk.time() if ended_at is None else ended_at
+                if clk.time() - ended_at >= drain_seconds:
+                    break
+    finally:
+        if timing is not None:
+            timing.close()
+    return windows
+
+
 class NetSummarizer:
     """Window features from the register snapshots taken at each window end
     (collect_windows_live): deltas against the previous snapshot of the same
@@ -2644,10 +3069,38 @@ def build_arg_parser(profile: Optional[str] = None) -> argparse.ArgumentParser:
                          "gRPC client, one Sync and one batched Read per register table per window "
                          "(batched_reader.py)")
     ap.add_argument("--batched-reader", default=DEFAULT_BATCHED_READER)
-    ap.add_argument("--switch-program", choices=["buckets", "exact"], default="buckets",
+    ap.add_argument("--switch-program", choices=["buckets", "exact", "sweep"], default="buckets",
                     help="the P4 program on the switch: 'buckets' (basic_fix and its test builds: per-bucket "
-                         "registers read at each window end) or 'exact' (perf/variants/exact: the window features "
-                         "computed in the data plane, read by window_reader.py; p4_perf.md section 5.7)")
+                         "registers read at each window end), 'exact' (perf/variants/exact: the window features "
+                         "computed in the data plane, read by window_reader.py; p4_perf.md section 5.7) or 'sweep' "
+                         "(perf/variants/sweep: the bucket table read by the data plane, its export records "
+                         "captured on --sweep-export-iface; p4_perf.md section 5.8)")
+    ap.add_argument("--sweep-probes", choices=["generator", "inband"], default="generator",
+                    help="sweep: who sends the probes. 'generator': the switch's packet generator, every bucket every "
+                         "--window-sec from the collector's window 0 on (the deployment); 'inband': the scenario, in "
+                         "order with its traffic (a replay with replay_absolute.py --probes), from --sweep-probe-port")
+    ap.add_argument("--sweep-reader", default=DEFAULT_SWEEP_READER)
+    ap.add_argument("--sweep-export-iface", default="eth1",
+                    help="sweep: this host's interface toward --sweep-export-port, where the exports arrive (root)")
+    ap.add_argument("--sweep-export-port", type=int, default=None,
+                    help="sweep: the dev_port the switch sends the export records to (default --forward-int-port)")
+    ap.add_argument("--sweep-probe-port", type=int, default=None,
+                    help="sweep, --sweep-probes inband: the dev_port the scenario's probes enter (default "
+                         "--forward-int-port)")
+    ap.add_argument("--sweep-ipg-ns", type=int, default=2000,
+                    help="sweep, generator: the gap between two probes; a sweep takes 65,536 x this (default 2000: "
+                         "131 ms, at most 500 k exports/s toward --sweep-export-iface)")
+    ap.add_argument("--sweep-pipes", default="1", help="sweep, generator: the pipes whose generator sweeps (one)")
+    ap.add_argument("--sweep-local-port", type=int, default=68, help="sweep, generator: its pipe-local port")
+    ap.add_argument("--sweep-timeout", type=float, default=5.0,
+                    help="sweep: how long after a boundary the collector waits for its sweep")
+    ap.add_argument("--sweep-capture", choices=["tcpdump", "socket"], default="tcpdump",
+                    help="sweep: how this host takes the exports: 'tcpdump' writes them into a file in /dev/shm that "
+                         "the collector parses behind it (no loss when the collector falls behind), 'socket' an "
+                         "AF_PACKET socket read by a thread (drops under a flood on a 2-core host)")
+    ap.add_argument("--sweep-export-pcap", default=None,
+                    help="sweep, --sweep-capture tcpdump: keep the exports' pcap at this new path (default: a file "
+                         "in /dev/shm, deleted at the end)")
     ap.add_argument("--window-markers", choices=["cpu", "inband", "timer"], default="cpu",
                     help="exact: who starts the switch's windows. 'cpu': the reader, from the switch's CPU port "
                          "(--cpu-iface), at the collector's window boundaries; 'inband': the scenario, in order with "
@@ -2802,6 +3255,14 @@ def main() -> None:
         ap.error("--scope-ip needs the CPU reports of --switch-program buckets (the 5-tuple that owns each bucket): "
                  "perf/variants/exact keeps no per-flow rows to split by host")
     timer_mode = exact and args.window_markers == "timer"
+    sweep = args.switch_program == "sweep"
+    if sweep and (args.sockowner or args.global_totals or args.scope_ip):
+        ap.error("--sockowner, --global-totals and --scope-ip are not implemented for --switch-program sweep (its "
+                 "windows come from the export records, not from register reads or CPU reports)")
+    sweep_gen = sweep and args.sweep_probes == "generator"
+    if sweep and len([p for p in args.sweep_pipes.split(",") if p.strip()]) != 1:
+        ap.error("--sweep-pipes: one pipe (the windows are built from one generator's sweeps)")
+    computed = exact or sweep       # the switch program gives the windows: no CPU reports, no register reads
     if args.sockowner and not args.hostmon_cgroup:
         ap.error("--sockowner needs --hostmon-cgroup: the socket-level join selects the flows of that cgroup")
     if args.mode == "pcap" and not args.pcap:
@@ -2812,7 +3273,7 @@ def main() -> None:
         print(f"[WARN] --duration-unit s resolves the 32-bit timestamp wrap from the windows; with {args.window_sec} s "
               f"windows (over {TS_WRAP_S / 2:.2f} s) a duration can be off by a multiple of {TS_WRAP_S:.3f} s")
 
-    for needed in [args.hostmon, args.window_reader if exact else
+    for needed in [args.hostmon, args.window_reader if exact else args.sweep_reader if sweep else
                    (args.p4_reader if args.reader == "legacy" else args.batched_reader)]:
         if not Path(needed).exists():
             raise FileNotFoundError(f"Required file not found: {needed}")
@@ -2820,7 +3281,7 @@ def main() -> None:
     if not args.skip_p4_forwarding and not Path(args.p4_forwarder).exists():
         raise FileNotFoundError(f"Forwarding setup file not found: {args.p4_forwarder}")
 
-    if not exact and not args.no_register_reset and not Path(args.p4_resetter).exists():
+    if not computed and not args.no_register_reset and not Path(args.p4_resetter).exists():
         raise FileNotFoundError(f"Register reset script not found: {args.p4_resetter}")
 
     if args.mode == "pcap" and not Path(args.replay_script).exists():
@@ -2833,6 +3294,7 @@ def main() -> None:
     report_collector = None
     batched_reader = None
     window_reader = None
+    export_capture = None
     cgroup_path: Optional[Path] = None
     cgroup_created = False
 
@@ -2896,6 +3358,29 @@ def main() -> None:
             if "error" in got:
                 raise P4ReadError(f"window reader setup: {got['error']}")
             print(f"[INFO] exact build: {json.dumps({k: v for k, v in got.items() if k != 'sizes'})}")
+        elif sweep:
+            # perf/variants/sweep: its reader clears the registers, installs frame_len, the probe and export ports
+            window_reader = SweepReaderProcess(
+                args.sweep_reader, grpc_addr=args.grpc_addr, p4_name=args.p4_name,
+                switch_ssh=None if args.reader_local else args.switch_ssh,
+                remote_sde_install=args.remote_sde_install,
+                pipes=[int(p) for p in args.sweep_pipes.split(",") if p.strip()], local_port=args.sweep_local_port)
+            print(f"[INFO] sweep reader ready: {json.dumps(window_reader.start())}")
+            frame_min = args.frame_min if args.frame_min is not None else args.frame_min_default
+            frame_min = [f for f in frame_min if f != "none"]
+            export_port = args.sweep_export_port if args.sweep_export_port is not None else int(args.forward_int_port)
+            probe_ports = [] if sweep_gen else [args.sweep_probe_port if args.sweep_probe_port is not None
+                                               else int(args.forward_int_port)]
+            got = window_reader.request({"cmd": "setup", "reset": not args.no_register_reset,
+                                         "frame_min": frame_min, "sweep_ports": probe_ports,
+                                         "export_port": export_port}, timeout=300)
+            if "error" in got:
+                raise P4ReadError(f"sweep reader setup: {got['error']}")
+            print(f"[INFO] sweep build: {json.dumps({k: v for k, v in got.items() if k != 'sizes'})}")
+            export_capture = ExportCapture(args.sweep_export_iface, backend=args.sweep_capture,
+                                           pcap_path=args.sweep_export_pcap).start()
+            print(f"[INFO] sweep build: capturing the exports on {args.sweep_export_iface} ({args.sweep_capture}"
+                  + (f", {export_capture.pcap_path}" if args.sweep_capture == "tcpdump" else "") + ")")
         elif args.no_register_reset:
             print("[WARN] P4 registers not cleared (--no-register-reset): a flow that lands in a bucket left "
                   "from an earlier run sends no CPU report and is not counted")
@@ -2904,7 +3389,7 @@ def main() -> None:
             run_p4_register_reset(args.p4_resetter, switch_ssh=args.switch_ssh)
 
         read_fn = None
-        if args.reader == "batched" and not exact:
+        if args.reader == "batched" and not computed:
             batched_reader = BatchedReaderProcess(
                 args.batched_reader, grpc_addr=args.grpc_addr, client_id=args.grpc_client_id, p4_name=args.p4_name,
                 switch_ssh=None if args.reader_local else args.switch_ssh,
@@ -2921,13 +3406,13 @@ def main() -> None:
         timing_log = make_timing_logger(args.reader, args.reader_timing_file) if timing_on else None
 
         where = f"{args.switch_ssh}:{args.cpu_iface}" if args.switch_ssh else args.cpu_iface
-        if exact:
-            pass   # no CPU reports: the windows come from the window registers
+        if computed:
+            pass   # no CPU reports: the windows come from the window registers or the sweeps
         else:
             print(f"[INFO] Collecting CPU reports on {where}")
             report_collector = ReportCollector(args.cpu_iface, ssh_host=args.switch_ssh).start()
         t_capture = time.time()
-        if exact:
+        if computed:
             pass
         elif report_collector.wait_ready(REPORT_CAPTURE_READY_S):
             print(f"[INFO] CPU-report capture listening after {time.time() - t_capture:.1f} s")
@@ -2969,12 +3454,16 @@ def main() -> None:
             print(f"[INFO] Starting the in-kernel monitor {args.hostmon} on {cgroup_path} with window_sec={args.window_sec}")
             host_proc = start_hostmon_agg(args.hostmon, args.hostmon_log, args.window_sec, cgroup_path)
             print("[INFO] " + wait_for_line(args.hostmon_log, "HOSTMON_READY", 30.0, host_proc))
-            start_mono = time.monotonic() + (max(1.0, args.window_sec + 0.5) if timer_mode else 1.0)
+            start_mono = time.monotonic() + (max(1.0, args.window_sec + 0.5) if (timer_mode or sweep_gen) else 1.0)
             send_hostmon_start(host_proc, start_mono)
             if timer_mode:
                 started = start_window_timer(window_reader, time.time() + start_mono - time.monotonic(),
                                              args.window_sec)
                 print(f"[INFO] exact build: window timer {json.dumps(started)}")
+            if sweep_gen:
+                started = start_sweep_generator(window_reader, time.time() + start_mono - time.monotonic(),
+                                                args.window_sec, ipg_ns=args.sweep_ipg_ns)
+                print(f"[INFO] sweep build: generator {json.dumps(started)}")
             time.sleep(max(0.0, start_mono - time.monotonic()))
             global_t0 = time.time()
             clock_offset_ns = time.monotonic_ns() - time.time_ns()   # sockowner's clock vs the windows' wall clock
@@ -2989,6 +3478,11 @@ def main() -> None:
                 started = start_window_timer(window_reader, first_tick, args.window_sec)
                 print(f"[INFO] exact build: window timer {json.dumps(started)}")
                 time.sleep(max(0.0, first_tick - time.time()))
+            if sweep_gen:
+                first_sweep = time.time() + args.window_sec + 0.3
+                started = start_sweep_generator(window_reader, first_sweep, args.window_sec, ipg_ns=args.sweep_ipg_ns)
+                print(f"[INFO] sweep build: generator {json.dumps(started)}")
+                time.sleep(max(0.0, first_sweep - time.time()))
             global_t0 = time.time()
             os.environ["HYBRID_T0"] = repr(global_t0)   # the window origin, for the scenario (RUNBOOK 19.6)
             workload_proc = launch()
@@ -3023,6 +3517,22 @@ def main() -> None:
                 duration_unit=args.duration_unit, timing_path=args.reader_timing_file)
             window_reader.stop()
             window_reader = None
+        elif sweep:
+            span = 65536 * args.sweep_ipg_ns / 1e9 + 0.02 if sweep_gen else 0.0
+            print(f"[INFO] sweep build: probes from the {args.sweep_probes}, {args.byte_layer} bytes, durations in "
+                  f"{args.duration_unit}" + (f", a sweep in {span * 1e3:.0f} ms" if sweep_gen else "")
+                  + (f", exactly {args.windows} windows" if args.windows else ""))
+            collect_windows_sweep(
+                export_capture, workload_proc, args.window_sec, global_t0, probes=args.sweep_probes,
+                sweep_span_s=span, on_window=on_window, max_windows=args.windows,
+                stop_fn=stop_fn if args.windows else None,
+                drain_seconds=args.drain_seconds if args.mode == "pcap" else 0.0,
+                sweep_timeout=args.sweep_timeout,
+                header=ETHERNET_HEADER_BYTES if args.byte_layer == "frame" else 0,
+                duration_unit=args.duration_unit, timing_path=args.reader_timing_file)
+            window_reader.stop()
+            window_reader = None
+            export_capture.stop()
         else:
             collect_windows_live(
                 collector=report_collector,
@@ -3057,7 +3567,13 @@ def main() -> None:
             report_collector.stop()
         if batched_reader is not None:
             batched_reader.stop()
-        if exact:
+        if sweep:
+            print(f"[INFO] sweep build: {len(net_windows)} windows; exports captured {export_capture.records}, "
+                  f"dropped by this host's capture ({args.sweep_capture}) {export_capture.kernel_drops}; windows whose totals disagree "
+                  f"with the buckets' sum {sum(1 for x in net_summaries if x['net_sweep_totals_mismatch'] == 1)}; "
+                  f"colliding packets {sum(x['net_sweep_coll_pkts'] for x in net_summaries)} "
+                  f"(windows with merged buckets {sum(1 for x in net_summaries if x['net_sweep_merged_active'])})")
+        elif exact:
             print(f"[INFO] exact build: {len(net_windows)} windows; packets without a slot "
                   f"{sum(x['net_untracked_pkts'] for x in net_summaries)}, windows lost "
                   f"{sum(x['net_window_lost'] for x in net_summaries)}, unclocked packets "
@@ -3166,6 +3682,9 @@ def main() -> None:
 
         if window_reader is not None:
             window_reader.stop()
+
+        if export_capture is not None:
+            export_capture.stop()
 
         if cgroup_path is not None:
             cleanup_cgroup(cgroup_path, cgroup_created)

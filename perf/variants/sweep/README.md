@@ -10,12 +10,20 @@ the state of every bucket at that boundary, so no window depends on how many buc
 one table for both kinds of packet (the "merged" layout, `ingress.p4`'s header comment).
 - **Cost:** 6 ingress stages like `basic_gtot_ba`, 158 against 133 ingress cycles, a median latency of 337 against
   317 ns (the exact build: 421 ns). The line rate is `basic_fix`'s, lossless, the totals exact.
+- **With the collision counter** (`reg_coll`, added after part 9c; `PC1.md` "Results, part 9d"): 7 ingress stages, 164
+  cycles, 342 ns, 23 stateful ALUs. These sources include it; the 6-stage figures above are the build without it
+  (`basic_sweep_final`, the 109 captures of part 9c).
 - **On the switch:** in-band replays equal to the program's model in all 135 non-duration columns (5 captures,
   Chaos included). The generator path: whole sweeps every 0.5 s, every record equal to the model's, at 2 µs, 0.5 µs
   and the generator's full rate (a sweep in 0.64 ms).
 - **The exact build's 109 captures** (`PC1.md` "Results, part 9c"): 103 rows equal to the published row in the 135
   non-duration columns (exact build 102), 107 equal to the model (the other 2: bulk uploads over the replay's MTU).
-- **Not run yet:** line rate with the generator's sweep running beside it (`PC1.md` 9E).
+- **Line rate beside the sweep** (`PC1.md` 9E, "Results, part 9f"): with the generator sweeping pipe 1 every 0.5 s,
+  line-rate traffic looped into that pipe ran at 99.99% (1518 B) and 91.09% (64 B, the generator's maximum), as
+  without it, with no drop. A line-rate app on the same pipe's generator as the sweep loses the sweep's share of the
+  time instead (26% at 2 µs): the generator runs one app at a time.
+- **`hybrid_collector.py --switch-program sweep`** (`PC1.md` "Results, part 9g"): with in-band probes, every window of
+  4 replayed captures (Chaos included) equal to the model's. With the generator, see the limits below.
 - The control build (`-DP4_ENABLE_SWEEP=0 -DP4_FRAME_LEN=0`) has exactly `basic_gtot_ba`'s resources.
 
 ## Why this design
@@ -39,7 +47,7 @@ one table for both kinds of packet (the "merged" layout, `ingress.p4`'s header c
 | | |
 |---|---|
 | Probe | EtherType `0x88B6`, from a port in the parser's value set `sweep_ports`. The bucket is the low 16 bits of the destination MAC, where the packet generator writes its packet id; an in-band probe puts it there itself. After Ethernet: a `sweep_t` (90 bytes, magic `0x5357`). From any other port a `0x88B6` frame is an ordinary frame (forwarded, not counted), so a monitored host cannot read the registers. |
-| What a probe reads | The bucket's 14 registers into `sweep_t`. A probe of bucket 0 also reads the seven totals and increments `reg_sweep_seq`; every probe carries the sweep number. Every probe is counted in `sweep_probes`. |
+| What a probe reads | The bucket's 14 registers and its collision count (`reg_coll`) into `sweep_t`. A probe of bucket 0 also reads the seven totals and increments `reg_sweep_seq`; every probe carries the sweep number. Every probe is counted in `sweep_probes`. |
 | Export | `sweep_export`, a keyless table: its default action `export_to(port)` sends the probe, filled in, to the export port; until the control plane sets it, `export_drop()`. A probe of a bucket that was never used since the reset (`dir_valid` 0) is dropped, except bucket 0's, so every sweep exports at least one record. Exports are counted in `sweep_exported`. |
 | Record | 104-byte frame: the probe's Ethernet header (its destination MAC unchanged, so capture in promiscuous mode), `sweep_t` with the registers as they were when the probe passed, the bucket, the generator's header fields, the probe's `ingress_mac_tstamp[31:0]`. Layout: `headers.p4`; parser: `sweep_features.parse_export`. |
 
@@ -80,6 +88,9 @@ sources as to `gtot`'s).
 | `live_test/run_sweep_replays.py` | PC1 | All captures with traffic; `rows.csv` is the input of the committee's `score_switch_replay.py`. |
 | `live_test/sweep_generator_check.py` | PC1 | The generator path with known traffic: whole sweeps, records equal to the model, counters, sweep period. |
 | `live_test/sweep_offline_check.py` | anywhere | The captures through `SweepModel` with in-band probes, against the published rows. |
+| `hybrid_collector.py --switch-program sweep` | PC1, as root | The live collector on this build: `sweep_reader.py --serve` on the switch (setup, the generator's prepare, enable and stop), the exports taken by tcpdump into `/dev/shm` (`--sweep-capture tcpdump`, the default) and turned into windows by `SweepWindows`. `--sweep-probes generator` (the deployment: the generator's first sweep falls on the collector's window 0) or `inband` (the scenario sends them). Each window adds `net_sweep_totals_mismatch`, `net_sweep_coll_pkts`, `net_sweep_coll_saturated`, `net_sweep_merged_active`, `net_sweep_merged_buckets`, `net_sweep_buckets`, `net_sweep_span_us`. |
+| `live_test/replay_capture.py --sweep inband\|generator` | PC1, as root | One capture through the collector on this build, every window compared with `SweepModel` on the same frames (in-band probes, perfect cuts), and the dataset row with the model's and the published one. |
+| `live_test/run_sweep_collector.py` | PC1 | Captures of `run_sweep_replays.py` through `replay_capture.py --sweep`; `runs.csv`. |
 
 Tests: `thesis-hybrid-ebpf-p4/python/tests/test_sweep.py` (the model against an independent bucket table on random
 traffic with collisions, both directions and short frames; record and probe formats; the reader against a fake
@@ -107,9 +118,18 @@ published rows).
 - **Stop the generator between sweeps.** On the Wedge, disabling the app in the middle of a batch lost probes and
   left that pipe's timer dead until switchd was restarted. `sweep_reader.py --generator stop` waits for the gap
   (the app's packet counter standing still) and reports a stop the timer overtook (`idle.moved_after_idle`).
-- Flows that share a bucket stay merged (the 4 captures above), as on every bucket-table build.
+- Flows that share a bucket stay merged (the 4 captures above), as on every bucket-table build. `reg_coll` counts
+  the packets that match neither direction of a bucket's reference ports (saturating at 255), so the host sees which
+  windows merge flows (`net_sweep_coll_pkts`, `net_sweep_merged_active`). Two flows with the same ports and other
+  addresses are not seen: the bucket keeps no addresses.
 - Generator mode: a sweep takes buckets × ipg, so the cut is not one instant (above). With 65,536 used buckets a
   sweep exports 65,536 records (6.8 MB): the export port and the receiver must take them at the probe rate.
+  - **The receiver** (`PC1.md` "Results, part 9e"): PC1's NIC with its default 1,024-entry receive ring lost
+    exports at every gap tried (251 of 193,009 at 2 µs, 30,000 flows); with 8,192 entries none at 2 µs, 1 µs and
+    0.5 µs. At the generator's full rate (0.64 ms a sweep) it lost about half either way.
+  - **The cut against a replay's windows** (part 9g): a packet up to buckets × ipg after a boundary counts in the
+    window before for buckets probed after it. The dataset's captures start a few ms after their anchor, so their
+    first packets are exactly such packets.
 - Every pipe has its own registers: a pipe's probes read only that pipe's buckets (the testbed's ports 132, 140 and
   192 are all in pipe 1).
 - `first_ts`/`last_ts` are the switch's 32-bit nanosecond clock (wraps every 4.295 s); durations are unwrapped with

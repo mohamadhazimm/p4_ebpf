@@ -38,13 +38,14 @@ TTL = 3
 
 FIELDS = ("magic", "idx", "gen", "batch", "seq", "t",
           "pkts", "bytes", "pkts_ab", "bytes_ab", "first_ts", "last_ts", "syn", "ack", "rst",
-          "ref_sp", "ref_dp", "min_len", "max_len", "dir_valid", "reserved",
+          "ref_sp", "ref_dp", "min_len", "max_len", "dir_valid", "coll",
           "g_pkts_ab", "g_bytes_ab", "g_pkts_ba", "g_bytes_ba", "g_syn", "g_ack", "g_rst")
 RECORD = struct.Struct("!HHHHII" + "I" * 9 + "HHHH" + "BB" + "I" * 7)
 assert RECORD.size == 90, RECORD.size
 FRAME_BYTES = 14 + RECORD.size          # 104 (+ 4 B FCS on the wire)
 BUCKET_REGS = ("pkts", "bytes", "pkts_ab", "bytes_ab", "first_ts", "last_ts", "syn", "ack", "rst",
-               "ref_sp", "ref_dp", "min_len", "max_len", "dir_valid")
+               "ref_sp", "ref_dp", "min_len", "max_len", "dir_valid", "coll")
+COLL_MAX = 255                          # reg_coll saturates
 TOTALS = ("g_pkts_ab", "g_bytes_ab", "g_pkts_ba", "g_bytes_ba", "g_syn", "g_ack", "g_rst")
 
 FEATURES = [
@@ -255,8 +256,12 @@ class SweepWindows:
         h = self.header
         out = dict.fromkeys(FEATURES, 0)
         sums = dict(pkts=0, bytes=0, pkts_ab=0, bytes_ab=0, pkts_ba=0, bytes_ba=0, syn=0, ack=0, rst=0)
+        coll_pkts, coll_saturated = 0, 0
         for idx, rec in buckets.items():
             prev = self.state.get(idx)
+            # reg_coll saturates at 255: a bucket at 255 may hide more (counted in net_sweep_coll_saturated)
+            coll_pkts += max(0, rec.get("coll", 0) - (prev.get("coll", 0) if prev else 0))
+            coll_saturated += int(rec.get("coll", 0) >= COLL_MAX)
             d = {}
             for k in ("pkts", "bytes", "pkts_ab", "bytes_ab", "syn", "ack", "rst"):
                 d[k] = (rec[k] - (prev[k] if prev else 0)) & M32
@@ -304,6 +309,12 @@ class SweepWindows:
         out["net_sweep_totals_pkts"] = -1 if tot_pkts is None else tot_pkts
         if totals is not None:
             self.prev_totals = totals
+        # collisions (reg_coll): packets of a second flow in a bucket, as far as its ports show it. The rows of
+        # windows with merged active buckets are the ones the bucket table cannot make exact.
+        out["net_sweep_coll_pkts"] = coll_pkts
+        out["net_sweep_coll_saturated"] = coll_saturated
+        out["net_sweep_merged_active"] = sum(1 for idx in active if self.state[idx].get("coll", 0) > 0)
+        out["net_sweep_merged_buckets"] = sum(1 for r in self.state.values() if r.get("coll", 0) > 0)
         out["net_sweep_buckets"] = len(buckets)
         out["net_sweep_seq"] = sweep.get("seq", -1)
         out["net_sweep_span_us"] = round(sweep.get("span_ns", 0) / 1e3, 3)
@@ -415,6 +426,8 @@ class SweepModel:
             ab = 0
         else:
             ab = 1          # collision / ambiguity fallback
+            if r["coll"] < COLL_MAX:
+                r["coll"] += 1
         ts = ts_ns & M32
         r["pkts"] = (r["pkts"] + 1) & M32
         r["bytes"] = (r["bytes"] + L) & M32
@@ -521,21 +534,26 @@ def ipv4_frame(sip, dip, proto, sp, dp, flags=0, payload=0, src_mac=b"\x02\x00\x
 def test_traffic(n_flows=200, seed=1, start=0.0, spread_s=1.0):
     """Known-answer traffic: [(seconds, frame)] in time order, `n_flows` flows spread over `spread_s` from `start`.
     TCP flows between 10.0.0.10 and 10.0.0.1:80 (SYN, SYN+ACK back, ACK, data both ways, some RST), UDP flows to
-    10.0.0.53:53 with a reply. Replies toward 10.0.0.10 without payload are under 46 B of IPv4 (frame_len)."""
+    10.0.0.53:53 with a reply. Replies toward 10.0.0.10 without payload are under 46 B of IPv4 (frame_len).
+    Beyond 15,000 flows the ports repeat and each further 15,000 come from guest 10.0.k.10 (k = 1, 2, ...), so the
+    5-tuples stay distinct; the first 15,000 are the same for any n_flows."""
     import random
     rnd = random.Random(seed)
     guest, server, dns = ip_to_int("10.0.0.10"), ip_to_int("10.0.0.1"), ip_to_int("10.0.0.53")
     out = []
+    base_guest = guest
     for i in range(n_flows):
         t = start + rnd.random() * spread_s
         gap = lambda: rnd.uniform(1e-4, 5e-3)       # noqa: E731
+        k, j = divmod(i, 15000)
+        guest = base_guest + (k << 8)               # 10.0.k.10
         if i % 3 == 2:
-            sp = 50000 + i
+            sp = 50000 + j
             out.append((t, ipv4_frame(guest, dns, 17, sp, 53, payload=rnd.randint(20, 60))))
             t += gap()
             out.append((t, ipv4_frame(dns, guest, 17, 53, sp, payload=rnd.randint(40, 300))))
             continue
-        sp = 40000 + i
+        sp = 40000 + j
         pkts = [(guest, server, sp, 80, 0x002, 0), (server, guest, 80, sp, 0x012, 0), (guest, server, sp, 80, 0x010, 0)]
         for _ in range(rnd.randint(1, 4)):
             pkts.append((guest, server, sp, 80, 0x018, rnd.randint(1, 1400)))

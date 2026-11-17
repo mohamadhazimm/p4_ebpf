@@ -230,7 +230,12 @@ def analyse(args, out, frames, summary):
         totals_missing_windows=sum(1 for x in windows if x["net_sweep_totals_mismatch"] == -1),
         pkts=sum(x["net_pkts_total_delta"] for x in windows),
         pkts_model=sum(x["net_pkts_total_delta"] for x in windows_m),
-        sweep_span_us_max=max(x["net_sweep_span_us"] for x in windows))
+        sweep_span_us_max=max(x["net_sweep_span_us"] for x in windows),
+        coll_pkts=sum(x["net_sweep_coll_pkts"] for x in windows),
+        coll_pkts_model=sum(x["net_sweep_coll_pkts"] for x in windows_m),
+        merged_buckets=windows[-1]["net_sweep_merged_buckets"],
+        merged_buckets_model=windows_m[-1]["net_sweep_merged_buckets"] if windows_m else None,
+        merged_windows=sum(1 for x in windows if x["net_sweep_merged_active"]))
     bad_m, bad_m_nodur = sf.compare_row(row, row_m)
     summary.update(equal_model=145 - len(bad_m), equal_model_nodur=135 - len(bad_m_nodur),
                    mismatch_model=sorted({c.split("__")[0] for c in bad_m_nodur}))
@@ -251,6 +256,8 @@ def analyse(args, out, frames, summary):
         "tcpdump_drops": (summary.get("tcpdump") or {}).get("dropped_by_kernel", 0) == 0,
         "frames_failed": summary.get("frames_failed", 0) == 0,
         "model": summary["equal_model_nodur"] == 135,
+        "collisions": [x["net_sweep_coll_pkts"] for x in windows] == [x["net_sweep_coll_pkts"] for x in windows_m]
+                      and summary["merged_buckets"] == summary["merged_buckets_model"],
     }
     summary["checks"] = checks
     summary["checks_ok"] = all(checks.values())

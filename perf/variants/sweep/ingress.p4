@@ -381,6 +381,22 @@ control Ingress(
     RegisterAction<bit<32>, bit<16>, bit<32>>(reg_ack) ack_get = {
         void apply(inout bit<32> v, out bit<32> rv) { rv = v; }
     };
+    /* Collisions: the packets of a bucket that match neither direction of its reference ports (a second flow in
+     * the bucket, the data path's "collision / ambiguity fallback"), saturating at 255. Not part of basic_gtot_ba:
+     * it lets the host see which buckets, and so which windows, merge flows. Flows with the same ports but other
+     * addresses are not seen (the bucket keeps no addresses). */
+    Register<bit<8>, bit<16>>(FLOW_BUCKETS) reg_coll;
+    RegisterAction<bit<8>, bit<16>, bit<8>>(reg_coll) coll_inc = {
+        void apply(inout bit<8> v) {
+            if (v != 8w255) {
+                v = v + 8w1;
+            }
+        }
+    };
+    RegisterAction<bit<8>, bit<16>, bit<8>>(reg_coll) coll_get = {
+        void apply(inout bit<8> v, out bit<8> rv) { rv = v; }
+    };
+
     RegisterAction<bit<32>, bit<16>, bit<32>>(reg_rst) rst_get = {
         void apply(inout bit<32> v, out bit<32> rv) { rv = v; }
     };
@@ -537,6 +553,17 @@ control Ingress(
     SWEEP_FLAG(syn, syn_inc, syn_get, syn, 9w0x002, 2)
     SWEEP_FLAG(rst, rst_inc, rst_get, rst, 9w0x004, 4)
     SWEEP_FLAG(ack, ack_inc, ack_get, ack, 9w0x010, 4)
+
+    /* reg_coll: applied in the direction logic's fallback branch, which a probe reaches too (below). Stage 3: the
+     * first stage with the reference ports in the PHV, and the one with a stateful ALU and 5 map RAMs free. */
+    action d_coll() { coll_inc.execute(DX); }
+    action p_coll() { hdr.sweep.coll = coll_get.execute(PIDX); }
+    SWEEP_STAGE(3) table t_coll {
+        key = { meta.is_probe : exact; }
+        actions = { d_coll; p_coll; }
+        const entries = { 1w0 : d_coll(); 1w1 : p_coll(); }
+        size = 2;
+    }
 
 #if P4_ENABLE_GLOBAL_TOTALS
     /* a one-entry total: every counted data packet; a probe reads it only for bucket 0 */
@@ -704,14 +731,17 @@ control Ingress(
             t_ref_sp.apply();
             t_ref_dp.apply();
 
-            if (meta.is_probe == 1w0 && meta.dir_old != 8w0) {
-                if ((meta.l4_sport == meta.ref_sp) && (meta.l4_dport == meta.ref_dp)) {
+            /* A probe takes the fallback branch (its comparisons start with is_probe == 0), so the collision
+             * table has one application for both kinds of packet; meta.dir_ab means nothing for a probe. */
+            if (meta.is_probe == 1w1 || meta.dir_old != 8w0) {
+                if (meta.is_probe == 1w0 && (meta.l4_sport == meta.ref_sp) && (meta.l4_dport == meta.ref_dp)) {
                     meta.dir_ab = 1w1;
-                } else if ((meta.l4_sport == meta.ref_dp) && (meta.l4_dport == meta.ref_sp)) {
+                } else if (meta.is_probe == 1w0 && (meta.l4_sport == meta.ref_dp) && (meta.l4_dport == meta.ref_sp)) {
                     meta.dir_ab = 1w0;
                 } else {
-                    /* Collision / ambiguity fallback */
+                    /* Collision / ambiguity fallback (a probe: read the bucket's count) */
                     meta.dir_ab = 1w1;
+                    t_coll.apply();
                 }
             }
 

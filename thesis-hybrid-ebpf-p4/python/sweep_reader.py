@@ -55,7 +55,7 @@ RECORD_BYTES = 90
 
 FLOW_REGS = ["reg_pkts", "reg_bytes", "reg_pkts_ab", "reg_bytes_ab", "reg_ref_src_port", "reg_ref_dst_port",
              "reg_dir_valid", "reg_min_len", "reg_max_len", "reg_first_ts", "reg_last_ts", "reg_syn", "reg_ack",
-             "reg_rst"]
+             "reg_rst", "reg_coll"]
 TOTAL_REGS = ["reg_g_pkts_ab", "reg_g_bytes_ab", "reg_g_pkts_ba", "reg_g_bytes_ba", "reg_g_syn", "reg_g_ack",
               "reg_g_rst"]
 SEQ_REG = "reg_sweep_seq"
@@ -331,6 +331,14 @@ class SweepGenerator(object):
         return [128 * p + self.local_port for p in self.pipes]
 
     def start(self, period_ns, buckets=65536, ipg_ns=0):
+        """prepare() and enable() in one go."""
+        out = self.prepare(period_ns, buckets, ipg_ns)
+        out.update(self.enable())
+        return out
+
+    def prepare(self, period_ns, buckets=65536, ipg_ns=0):
+        """Everything but the apps' enable (about 20 ms over gRPC): the collector enables at a chosen instant.
+        The first sweep comes one period after enable()."""
         prog, gc = self.prog, self.prog.gc
         buckets, period_ns, ipg_ns = int(buckets), int(period_ns), int(ipg_ns)
         if not 1 <= buckets <= 65536:
@@ -365,18 +373,27 @@ class SweepGenerator(object):
                     tbl.entry_add(prog.pipe(p), [k], [d], **prog.kw(tbl.entry_add))
                 except Exception:
                     tbl.entry_mod(prog.pipe(p), [k], [d], **prog.kw(tbl.entry_mod))
+        self.prepared = (k_app, period_ns, buckets, ipg_ns)
+        log("generator: %d probes every %d ns, %d ns apart, pipes %s, app %d, local port %d"
+            % (buckets, period_ns, ipg_ns, self.pipes, self.app, self.local_port))
+        return {"generator": "prepared", "period_ns": period_ns, "buckets": buckets, "ipg_ns": ipg_ns,
+                "sweep_ns": buckets * ipg_ns, "pipes": self.pipes, "app": self.app, "local_port": self.local_port,
+                "dev_ports": self.dev_ports(), "buffer_offset": self.buffer_offset, "frame_bytes": len(frame),
+                "sweep_ports": ports}
+
+    def enable(self):
+        prog, gc = self.prog, self.prog.gc
+        if getattr(self, "prepared", None) is None:
+            raise RuntimeError("generator: enable before prepare")
+        _, app_cfg, _ = self.tables()
+        k_app = self.prepared[0]
         d_on = app_cfg.make_data([gc.DataTuple("app_enable", bool_val=True)], self.trigger)
         t0 = time.time()
         after = []
         for p in self.pipes:
             app_cfg.entry_mod(prog.pipe(p), [k_app], [d_on], **prog.kw(app_cfg.entry_mod))
             after.append(round(time.time() - t0, 6))
-        log("generator: %d probes every %d ns, %d ns apart, pipes %s, app %d, local port %d"
-            % (buckets, period_ns, ipg_ns, self.pipes, self.app, self.local_port))
-        return {"generator": "started", "period_ns": period_ns, "buckets": buckets, "ipg_ns": ipg_ns,
-                "sweep_ns": buckets * ipg_ns, "pipes": self.pipes, "app": self.app, "local_port": self.local_port,
-                "dev_ports": self.dev_ports(), "buffer_offset": self.buffer_offset, "frame_bytes": len(frame),
-                "t_enabled": t0, "enabled_after_s": after, "sweep_ports": ports}
+        return {"generator": "started", "t_enabled": t0, "enabled_after_s": after}
 
     def stop(self):
         prog, gc = self.prog, self.prog.gc
@@ -485,6 +502,76 @@ def ports_arg(text):
     return [int(p) for p in text.split(",") if p.strip()]
 
 
+def serve(prog, gen, inp, out):
+    """--serve. The generator is stopped (between sweeps) on quit, at the end of the input and on SIGTERM."""
+    import signal
+
+    def reply(obj):
+        out.write(json.dumps(obj, sort_keys=True) + "\n")
+        out.flush()
+
+    def on_term(signum, frame):
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, on_term)
+    running = [False]
+    reply({"ready": True, "p4_name": prog.p4_name, "bound": getattr(prog, "bound", None), "t": time.time()})
+    try:
+        while True:
+            line = inp.readline()
+            if not line:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                req = json.loads(line)
+                cmd = req.get("cmd")
+                if cmd == "quit":
+                    reply({"quit": True})
+                    break
+                if cmd == "setup":
+                    if running[0]:
+                        gen.stop()
+                        running[0] = False
+                    reply(setup(prog, bool(req.get("reset")), req.get("frame_min"), req.get("sweep_ports"),
+                                req.get("export_port")))
+                elif cmd == "generator":
+                    if req.get("stop"):
+                        r = gen.stop()
+                        running[0] = False
+                    else:
+                        if req.get("pipes") is not None:
+                            gen.pipes = [int(p) for p in req["pipes"]]
+                        if req.get("local_port") is not None:
+                            gen.local_port = int(req["local_port"])
+                        r = {}
+                        if req.get("prepare"):
+                            r.update(gen.prepare(int(req["period_ns"]), int(req.get("buckets", 65536)),
+                                                 int(req.get("ipg_ns", 2000))))
+                        if req.get("enable"):
+                            r.update(gen.enable())
+                            running[0] = True
+                    r["t"] = time.time()
+                    reply(r)
+                elif cmd == "state":
+                    reply(state(prog, gen))
+                else:
+                    reply({"error": "unknown command %r" % cmd})
+            except Exception as error:
+                reply({"error": "%s: %s" % (type(error).__name__, first_line(error))})
+    finally:
+        if running[0]:
+            try:
+                gen.stop()
+            except Exception as error:
+                log("generator stop at exit: %s" % first_line(error))
+        try:
+            prog.iface.tear_down_stream()
+        except Exception:
+            pass
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--grpc-addr", default="127.0.0.1:50052")
@@ -508,10 +595,15 @@ def main():
     ap.add_argument("--app", type=int, default=0)
     ap.add_argument("--buffer-offset", type=int, default=0, help="a multiple of 16")
     ap.add_argument("--state", action="store_true")
+    ap.add_argument("--serve", action="store_true",
+                    help="one JSON command per input line, one JSON reply each (hybrid_collector.py "
+                         "--switch-program sweep): setup, generator (prepare / enable / stop), state, quit")
     args = ap.parse_args()
     gc = import_client(args.sde_install)
     prog = Program(gc, args.grpc_addr, args.client_id, args.device_id, args.p4_name)
     gen = SweepGenerator(prog, ports_arg(args.pipes), args.local_port, args.app, args.buffer_offset)
+    if args.serve:
+        sys.exit(serve(prog, gen, sys.stdin, sys.stdout))
     code = 0
     try:
         if args.setup or args.reset:

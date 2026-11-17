@@ -41,11 +41,13 @@ def reference_bucket_table(frames, pad_dst=None):
         length = 46 if (pad_dst is not None and dip == pad_dst and total <= 45) else total
         idx = compute_flow_index(sip, dip, sp, dp, proto)
         r = b.setdefault(idx, dict(pkts=0, bytes=0, pkts_ab=0, bytes_ab=0, sp=0, dp=0, valid=0, min=0, max=0,
-                                   syn=0, ack=0, rst=0, first=0, last=0))
+                                   syn=0, ack=0, rst=0, first=0, last=0, coll=0))
         if not r["valid"]:
             r["valid"], r["sp"], r["dp"], ab = 1, sp, dp, True
         else:
             ab = not (sp == r["dp"] and dp == r["sp"] and not (sp == r["sp"] and dp == r["dp"]))
+            if (sp, dp) != (r["sp"], r["dp"]) and (sp, dp) != (r["dp"], r["sp"]):
+                r["coll"] = min(255, r["coll"] + 1)     # reg_coll: neither direction, saturating
         r["pkts"] += 1
         r["bytes"] += length
         key = "ab" if ab else "ba"
@@ -99,7 +101,7 @@ class ModelTest(unittest.TestCase):
         self.assertEqual(set(model.b), set(ref))
         names = dict(pkts="pkts", bytes="bytes", pkts_ab="pkts_ab", bytes_ab="bytes_ab", ref_sp="sp", ref_dp="dp",
                      dir_valid="valid", min_len="min", max_len="max", syn="syn", ack="ack", rst="rst",
-                     first_ts="first", last_ts="last")
+                     first_ts="first", last_ts="last", coll="coll")
         for idx, r in ref.items():
             for mine, theirs in names.items():
                 self.assertEqual(model.b[idx][mine], r[theirs], (idx, mine))
@@ -116,6 +118,30 @@ class ModelTest(unittest.TestCase):
         self.check(frames, pad=True)
         short = [fr for _, fr in frames if struct.unpack("!H", fr[16:18])[0] <= 45 and fr[30:34] == bytes([10, 0, 0, 10])]
         self.assertTrue(short, "the test traffic should hold short frames toward 10.0.0.10")
+
+    def test_collisions_are_counted_and_saturate(self):
+        """reg_coll: a second flow's packets in a bucket (ports matching neither direction), at most 255."""
+        model = sf.SweepModel(frame_min=())
+        a = sf.ipv4_frame(sf.ip_to_int("10.0.0.1"), sf.ip_to_int("10.0.0.2"), 17, 1000, 53)
+        idx = model.packet(a, 1)
+        b = None
+        for sp in range(1, 65536):          # a flow with other ports in the same bucket
+            fr = sf.ipv4_frame(sf.ip_to_int("10.0.0.3"), sf.ip_to_int("10.0.0.4"), 17, sp, 53)
+            if model.bucket_of(fr) == idx:
+                b = fr
+                break
+        self.assertIsNotNone(b)
+        model.packet(sf.ipv4_frame(sf.ip_to_int("10.0.0.2"), sf.ip_to_int("10.0.0.1"), 17, 53, 1000), 2)
+        self.assertEqual(model.b[idx]["coll"], 0)                     # the reverse direction is not a collision
+        for k in range(300):
+            model.packet(b, 3 + k)
+        self.assertEqual(model.b[idx]["coll"], 255)
+        rec = model.probe(idx)
+        self.assertEqual(sf.parse_export(export_frame(rec))["coll"], 255)
+        sweeps = sf.group_sweeps([(0.0, model.probe(0)), (0.0, model.probe(idx)), (0.5, model.probe(0)),
+                                  (0.5, model.probe(idx))])
+        win = sf.windows_from_sweeps(sweeps)
+        self.assertEqual((win[0]["net_sweep_merged_buckets"], win[0]["net_sweep_coll_saturated"]), (1, 1))
 
     def test_probe_of_an_empty_bucket_is_dropped_except_bucket_0(self):
         model = sf.SweepModel()
@@ -134,7 +160,7 @@ class WireTest(unittest.TestCase):
     def test_record_round_trip(self):
         vals = dict((f, i + 1) for i, f in enumerate(sf.FIELDS))
         vals["magic"] = sf.SWEEP_MAGIC
-        vals["dir_valid"], vals["reserved"] = 1, 0
+        vals["dir_valid"] = 1
         frame = sf.probe_frame("02:00:00:00:00:01", 0x1234)[:14] + sf.pack_record(**vals)
         rec = sf.parse_export(frame)
         self.assertEqual(rec, vals)
@@ -488,7 +514,7 @@ class ReaderTest(unittest.TestCase):
     def test_setup(self):
         prog = FakeProgram()
         out = sweep_reader.setup(prog, reset=True, frame_min=["10.0.0.10/32"], sweep_ports=[132], export_port=132)
-        self.assertEqual(len(out["reset"]), 22)
+        self.assertEqual(len(out["reset"]), 23)
         self.assertEqual(out["counters_reset"], sweep_reader.COUNTERS)
         self.assertEqual(out["sweep_ports"], [132])
         self.assertEqual(out["export"], {"action": "Ingress.export_to", "port": 132})
@@ -583,6 +609,241 @@ class ReaderTest(unittest.TestCase):
         self.assertEqual(st["export"]["port"], 132)
         self.assertEqual(st["frame_len"][0]["dst"], "10.0.0.10")
         self.assertEqual(sorted(st["totals"]), sorted(sweep_reader.TOTAL_REGS))
+
+
+
+class ServeTest(unittest.TestCase):
+    def test_serve(self):
+        """sweep_reader.py --serve: one JSON reply per command; the generator prepared, enabled, stopped at quit."""
+        import io
+        import json
+        import signal
+        prog = FakeProgram()
+        gen = sweep_reader.SweepGenerator(prog, [1])
+        cmds = [{"cmd": "setup", "reset": True, "frame_min": ["10.0.0.10/32"], "sweep_ports": [], "export_port": 132},
+                {"cmd": "generator", "prepare": True, "period_ns": 500000000, "ipg_ns": 2000},
+                {"cmd": "generator", "enable": True}, {"cmd": "state"}, {"cmd": "bogus"}, {"cmd": "quit"}]
+        out = io.StringIO()
+        old = signal.getsignal(signal.SIGTERM)
+        try:
+            rc = sweep_reader.serve(prog, gen, io.StringIO("".join(json.dumps(c) + "\n" for c in cmds)), out)
+        finally:
+            signal.signal(signal.SIGTERM, old)
+        replies = [json.loads(line) for line in out.getvalue().splitlines()]
+        self.assertEqual(rc, 0)
+        self.assertTrue(replies[0]["ready"])
+        self.assertEqual(replies[1]["export"]["port"], 132)
+        self.assertEqual((replies[2]["generator"], replies[2]["sweep_ns"]), ("prepared", 65536 * 2000))
+        self.assertEqual(replies[3]["generator"], "started")
+        self.assertEqual(replies[4]["sweep_ports"], [196])
+        self.assertIn("error", replies[5])
+        self.assertEqual(replies[6], {"quit": True})
+        names = sweep_reader.PKTGEN_TABLES[0]
+        port_mods = [x[4] for x in prog.log if x[0] == "mod" and x[1] == names[0]]
+        self.assertEqual(port_mods[-1], {"pktgen_enable": False})           # stopped at quit
+
+
+class CollectorSweepTest(unittest.TestCase):
+    """hybrid_collector.py --switch-program sweep on the program's model: the collector's windows are the windows of
+    the sweeps the switch exports (sweep_features.windows_from_sweeps)."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(REPO))
+        import hybrid_collector
+        cls.hc = hybrid_collector
+
+    class Clock:
+        def __init__(self, t0, feed):
+            self.now, self.feed = t0, feed
+
+        def time(self):
+            return self.now
+
+        def sleep(self, d):
+            self.now += d
+            self.feed(self.now)
+
+    class Reader:
+        def __init__(self, clock):
+            self.clock, self.requests, self.enabled_at = clock, [], None
+
+        def request(self, req, timeout=None):
+            self.requests.append(req)
+            if req.get("enable"):
+                self.enabled_at = self.clock.time()
+            return {"generator": "started" if req.get("enable") else "prepared"}
+
+    class Done:
+        def poll(self):
+            return 0
+
+    def check_windows(self, exports, rows, n):
+        ref = sf.windows_from_sweeps(sf.group_sweeps(exports))
+        self.assertGreaterEqual(len(ref), n)
+        self.assertEqual(len(rows), n)
+        for w in range(n):
+            for f in sf.FEATURES:
+                self.assertAlmostEqual(float(ref[w][f]), float(rows[w][f]), places=9, msg=(w, f))
+            for k in ("net_sweep_totals_mismatch", "net_sweep_coll_pkts", "net_sweep_merged_buckets"):
+                self.assertEqual(ref[w][k], rows[w][k], (w, k))
+
+    def test_generator_windows_are_the_sweeps_windows(self):
+        hc = self.hc
+        t0, period, ipg = 1000.0, 0.5, 2000e-9
+        traffic = sf.test_traffic(300, seed=5, start=t0 + 0.05, spread_s=3.0)
+        model = sf.SweepModel()
+        used = sorted({model.bucket_of(fr) for _, fr in traffic} | {0})
+        cap = hc.ExportCapture("lo")
+        exports, pending = [], list(traffic)
+        state = {"sweep": 1, "pos": 0}
+        reader = None
+
+        def feed(now):
+            # packets and the generator's probes up to `now`, in time order
+            while True:
+                t_pkt = pending[0][0] if pending else float("inf")
+                t_probe = float("inf")
+                if reader is not None and reader.enabled_at is not None:
+                    t_probe = reader.enabled_at + state["sweep"] * period + used[state["pos"]] * ipg
+                t = min(t_pkt, t_probe)
+                if t >= now:
+                    return
+                if t_pkt <= t_probe:
+                    model.packet(pending.pop(0)[1], int(t * 1e9))
+                    continue
+                rec = model.probe(used[state["pos"]], int(t * 1e9), gen=0x0b00, batch=state["sweep"])
+                if rec is not None:
+                    exports.append((t + 2e-5, rec))
+                    cap.add(t + 2e-5, export_frame(rec))
+                state["pos"] += 1
+                if state["pos"] == len(used):
+                    state["sweep"], state["pos"] = state["sweep"] + 1, 0
+
+        clock = self.Clock(t0 - 1.0, feed)
+        reader = self.Reader(clock)
+        hc.start_sweep_generator(reader, t0, period, ipg_ns=2000, clock=clock)
+        self.assertEqual(reader.enabled_at, t0 - period)        # the first sweep at window 0's start
+        self.assertEqual(reader.requests[0]["cmd"], "generator")
+        rows = []
+        hc.collect_windows_sweep(cap, self.Done(), period, t0, probes="generator", sweep_span_s=65536 * ipg + 0.02,
+                                 on_window=lambda w: rows.append(w["exact_features"]), max_windows=8, clock=clock)
+        self.check_windows(exports, rows, 8)
+        self.assertGreater(sum(r["net_pkts_total_delta"] for r in rows), 0)
+
+    def test_inband_windows_are_the_sweeps_windows(self):
+        hc = self.hc
+        t0 = 2000.0
+        frames_us = [(int(t * 1e6), fr) for t, fr in sf.test_traffic(200, seed=7, start=t0 + 0.1, spread_s=2.5)]
+        exports_us, _ = sf.simulate_inband(frames_us, int(t0 * 1e6), 500000, 8)
+        cap = hc.ExportCapture("lo")
+        pending = [(us / 1e6 + 1e-4, rec) for us, rec in exports_us]
+
+        def feed(now):
+            while pending and pending[0][0] < now:
+                t, rec = pending.pop(0)
+                cap.add(t, export_frame(rec))
+
+        rows = []
+        hc.collect_windows_sweep(cap, self.Done(), 0.5, t0, probes="inband", on_window=lambda w: rows.append(
+            w["exact_features"]), max_windows=7, clock=self.Clock(t0, feed))
+        self.check_windows([(us / 1e6, rec) for us, rec in exports_us], rows, 7)
+
+    def test_inband_follows_a_late_start(self):
+        """A flood's replay plans its probes first, starts 12 s late and shifts its whole schedule: the collector
+        waits for the first sweep beyond sweep_timeout and follows the shift."""
+        hc = self.hc
+        t0, late = 3000.0, 12.0
+        frames_us = [(int(t * 1e6), fr) for t, fr in sf.test_traffic(200, seed=11, start=t0 + 0.1, spread_s=2.5)]
+        exports_us, _ = sf.simulate_inband(frames_us, int(t0 * 1e6), 500000, 8)
+        cap = hc.ExportCapture("lo")
+        pending = [(us / 1e6 + late + 1e-4, rec) for us, rec in exports_us]
+
+        def feed(now):
+            while pending and pending[0][0] < now:
+                t, rec = pending.pop(0)
+                cap.add(t, export_frame(rec))
+
+        rows = []
+        hc.collect_windows_sweep(cap, self.Done(), 0.5, t0, probes="inband", on_window=lambda w: rows.append(
+            w["exact_features"]), max_windows=7, sweep_timeout=5.0, clock=self.Clock(t0, feed))
+        self.check_windows([(us / 1e6, rec) for us, rec in exports_us], rows, 7)
+        with self.assertRaises(hc.P4ReadError):      # the generator's sweeps get no such allowance
+            cap2 = hc.ExportCapture("lo")
+            hc.collect_windows_sweep(cap2, self.Done(), 0.5, t0, probes="generator", max_windows=3, sweep_timeout=5.0,
+                                     clock=self.Clock(t0, lambda now: None))
+
+    def test_tcpdump_backend_reads_the_file_as_it_grows(self):
+        """The capture's file reader (--sweep-capture tcpdump) without tcpdump: records written in pieces, one split
+        across two writes, are parsed in order; a sweep is complete only once the reader has caught up."""
+        import os
+        import threading
+        import time
+        hc = self.hc
+        model = sf.SweepModel()
+        traffic = sf.test_traffic(30, seed=3)
+        for _t, fr in traffic:
+            model.packet(fr, 1000)
+        used = [0] + sorted({model.bucket_of(fr) for _t, fr in traffic} - {0, None})
+        recs = [model.probe(b, 2000, batch=1) for b in used]
+        recs = [r for r in recs if r is not None]
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "exports.pcap")
+            cap = hc.ExportCapture("lo", backend="tcpdump", pcap_path=path)
+            blob = b"".join(struct.pack("<IIII", 100, i, len(export_frame(r)), len(export_frame(r))) + export_frame(r)
+                            for i, r in enumerate(recs))
+            th = threading.Thread(target=cap._run_pcap, daemon=True)
+            cap._eof = False
+            th.start()
+            with open(path, "wb") as f:
+                f.write(struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 256, 1))
+                half = len(blob) // 2 + 7
+                f.write(blob[:half])
+                f.flush()
+                time.sleep(0.2)
+                self.assertLess(cap.records, len(recs))
+                self.assertFalse(cap.complete(1, time.time() + 1, 0.0, 0.0) and cap.records == len(recs))
+                f.write(blob[half:])
+                f.flush()
+            deadline = time.time() + 5
+            while cap.records < len(recs) and time.time() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(cap.records, len(recs))
+            self.assertFalse(cap.complete(1, time.time(), 0.0, 0.0))     # read, but not yet quiet
+            self.assertTrue(cap.complete(1, time.time() + 1, 0.0, 0.0))
+            got = cap.take(1)
+            self.assertEqual([r["idx"] for _t, r in got], [r["idx"] for r in recs])
+            self.assertAlmostEqual(got[1][0], 100.000001)
+            cap._final.set()
+            th.join(timeout=5)
+            self.assertFalse(th.is_alive())
+
+    def test_a_missing_sweep_stops_the_run(self):
+        hc = self.hc
+        cap = hc.ExportCapture("lo")
+        with self.assertRaises(hc.P4ReadError):
+            hc.collect_windows_sweep(cap, self.Done(), 0.5, 0.0, probes="generator", max_windows=3,
+                                     sweep_timeout=1.0, clock=self.Clock(0.0, lambda now: None))
+
+    def test_sweep_summary_keeps_the_collector_columns(self):
+        hc = self.hc
+        self.assertTrue(set(sf.FEATURES) <= set(hc.NET_ZERO))
+        feats = dict.fromkeys(sf.FEATURES, 1)
+        feats.update(net_flow_duration_mean=0.25, net_flow_duration_max=0.5, net_sweep_coll_pkts=4)
+        out = hc.sweep_summary(feats, duration_unit="ns")
+        self.assertEqual(set(hc.NET_ZERO) | set(hc.SWEEP_EXTRA_KEYS), set(out))
+        self.assertEqual((out["net_flow_duration_max"], out["net_sweep_coll_pkts"]), (0.5e9, 4))
+
+    def test_cli_refuses_what_the_sweep_does_not_do(self):
+        import contextlib
+        import io
+        from unittest import mock
+        for extra in (["--scope-ip", "10.0.0.10"], ["--global-totals", "1"], ["--sweep-pipes", "0,1"]):
+            argv = ["hybrid_collector.py", "--mode", "command", "--command", "true", "--switch-program", "sweep"]
+            with mock.patch.object(sys, "argv", argv + extra), contextlib.redirect_stderr(io.StringIO()) as err:
+                with self.assertRaises(SystemExit):
+                    self.hc.main()
+            self.assertIn("sweep", err.getvalue())
 
 
 if __name__ == "__main__":

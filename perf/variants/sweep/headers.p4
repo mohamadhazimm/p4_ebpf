@@ -101,7 +101,7 @@ header sweep_t {
     bit<16> min_len;
     bit<16> max_len;
     bit<8>  dir_valid;
-    bit<8>  reserved;
+    bit<8>  coll;       /* the bucket's colliding packets (reg_coll), saturating at 255 */
     bit<32> g_pkts_ab;  /* the seven one-entry totals, read by probe 0 only (0 in the others) */
     bit<32> g_bytes_ab;
     bit<32> g_pkts_ba;
