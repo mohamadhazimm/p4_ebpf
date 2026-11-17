@@ -57,17 +57,25 @@ def json_lines(text):
 
 
 def pipe_value(v, pipe):
-    """A per-pipe value from BF Runtime (a list) or one number."""
+    """A per-pipe value from BF Runtime (a list) or one number. The registers come back per pipe; the one-cell
+    counters (sweep_probes, sweep_exported) as a single value over all pipes, [n] (seen on the Wedge, SDE 9.6)."""
     if isinstance(v, list):
+        if len(v) == 1:
+            return v[0]
         return v[pipe] if pipe < len(v) else None
     return v
 
 
 class Capture:
-    """tcpdump as root for the exports; ready() once it listens."""
+    """tcpdump as root for the exports; ready() once it listens.
+
+    stop() sends tcpdump SIGINT as root (ASROOT pkill on its own command line). Signalling the ASROOT process is
+    not enough: a wrapper that pipes a password into sudo does not pass the signal on, and an exec'd sudo runs as
+    root, so this user may not signal it (both seen on PC1)."""
 
     def __init__(self, asroot, iface, path, limit_s, buffer_kib):
         self.path = path
+        self.asroot = asroot
         cmd = [asroot, "timeout", "-s", "INT", str(int(limit_s)), "tcpdump", "-i", iface, "-Q", "in", "-n", "-U",
                "-Z", "root", "-s", "256", "-B", str(int(buffer_kib)), "-w", str(path), "ether proto 0x88b6"]
         self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, bufsize=1)
@@ -83,12 +91,18 @@ class Capture:
 
     def stop(self):
         if self.proc.poll() is None:
-            self.proc.terminate()
+            # only a command line that starts with tcpdump and writes this file (not the wrapper's, not timeout's)
+            subprocess.run([self.asroot, "pkill", "-INT", "-f", "^tcpdump .* -w %s( |$)" % re.escape(str(self.path))],
+                           capture_output=True, timeout=30)
             try:
                 self.proc.wait(15)
             except subprocess.TimeoutExpired:
-                self.proc.kill()
-                self.proc.wait(5)
+                self.proc.terminate()
+                try:
+                    self.proc.wait(15)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+                    self.proc.wait(5)
         time.sleep(0.2)
         stats = {}
         for line in self.lines:

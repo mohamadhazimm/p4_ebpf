@@ -826,7 +826,7 @@ and no flow should go unread under a flood. **Where the remaining errors came fr
     come 19 ms late.
 - The switch runs `basic_fix` again (checked with a replay, 9 of 9 packets).
 
-### 5.8 The bucket table read by the data plane (build `sweep`, 17 November, offline only; does not compile yet)
+### 5.8 The bucket table read by the data plane (build `sweep`, 17 November, tested on the switch)
 
 - **Idea.** Section 5.7's gap analysis (`perf/results/exact_gap_analysis`, perfect reads and cuts) gives the bucket
   table, read in full at each window boundary and with the frame minimum counted, the same parity as the exact
@@ -840,18 +840,40 @@ and no flow should go unread under a flood. **Where the remaining errors came fr
   in-band probes, all 110 captures): 106 of 110 rows equal to the published row in the 135 non-duration columns,
   all 101 calm captures among them; the 4 others are Chaos and the three SYN fan-outs. In every window the totals
   equal the buckets' sum. 475,839 probes in all, one per bucket changed since the previous boundary.
-- **Not measured yet:** compile, resources, latency, line rate, and the replays on the switch. PC1.md part 9 has the
-  steps, together with `basic_gtot_ba`'s missing latency and line-rate runs.
-- **Compile (17 November, PC1.md "Results, part 9"):** bf-p4c 9.6.0 fails table placement on the sweep build ("Table
-  placement cannot make any more progress ... This may be due to shared attachments on partly placed tables; may be
-  able to avoid the problem with @stage on those tables"). `-DSWEEP_SHARED_INDEX=1` fails the same way, with the
-  same 46 tables unplaced, and so do both latency builds. The probe branch reads every register the data path
-  updates, and a register sits in one stage with all tables that use it. The probe's reads of the totals have no
-  dependency and are placed in stages 2-3, while the data path updates them after its direction logic (stage 4 in
-  `basic_gtot_ba`, whose four packet and byte totals fill that stage's four stateful ALUs). So the index source was
-  not the cause. The control build (`-DP4_ENABLE_SWEEP=0 -DP4_FRAME_LEN=0`) has exactly `basic_gtot_ba`'s
-  resources. `frame_len` alone (`-DP4_ENABLE_SWEEP=0`) adds 1 SRAM, 2 TCAM and 1 logical table, and no cycles
-  (133/170).
+- **Compile** (bf-p4c 9.6.0; PC1.md "Results, part 9" and "part 9b"; `perf/results/part9_20261117/builds/`):
+  - **The first version fails table placement**, also with `-DSWEEP_SHARED_INDEX=1`. Its probe branch reads every
+    register from tables of its own. A register sits in one stage with every table that uses it; the probe's reads
+    depend on nothing and are placed early, so the data path's updates cannot follow.
+  - **Fix A, the probe's reads pinned (`@stage`) to the data path's stages: fails too**, with both index
+    variants. The pins hold, but the data path and the probe address one stateful ALU from different sources (the
+    hash, the MAC); with the shared index the probe's write of `meta.ridx` keeps its stage-0 reads out of stage 0.
+  - **Fix B, one table per register for both paths ("merged"): compiles.** Each table's key picks the data path's
+    RegisterAction or the probe's read. It needs the shared index ("Incompatible attached indexing between actions"
+    without it), the probe's values that the data path also reads routed through the same metadata fields (an
+    assembler error otherwise), and the two writes of `meta.ridx` in one if/else. The stage pins then fit it into
+    6 stages. `perf/variants/sweep` is this version.
+
+  | Build | Stages ig/eg | Critical path | SRAM | TCAM | Stateful ALUs | Ingress cycles | Median latency |
+  |---|---|---|---|---|---|---|---|
+  | basic_gtot_ba | 6/1 | 4 | 211 | 3 | 21 | 133 | 317 ns |
+  | sweep, merged, pinned (`perf/variants/sweep`) | 6/1 | 5 | 239 | 20 | 22 | 158 | 337 ns |
+  | sweep, merged, no pins (`-DSWEEP_PIN_STAGES=0`) | 7/1 | 5 | 239 | 20 | 22 | 166 | 344 ns |
+  | exact (Section 5.7, its first build) | 11/1 | – | 120 | – | 23 | 260 | 421 ns |
+
+  - **Latency:** hairpin as in Section 4.1, 3 runs per program, baseline 246 ns the same day. The data path reaches its
+    first register in stage 1 instead of 0 (the shared index): +25 cycles, +20 ns.
+  - **The control build** (`-DP4_ENABLE_SWEEP=0 -DP4_FRAME_LEN=0`) has exactly `basic_gtot_ba`'s resources.
+- **Line rate** (Section 3.2's 27-run matrix, `--global-totals`): the same rates as `basic_fix` within 0.01 points,
+  lossless, the totals and the flow's registers exact for 13.1 billion packets.
+- **In-band replays** (`live_test/sweep_replay.py`, 5 captures): the switch's row equal to the model's in all 135
+  non-duration columns, and probes = exports = the model's in every run. Against the published row: the first cohort
+  capture, `bulk2000` and `slowloris_500` 135 (`slowloris_500` overloads `basic_fix`'s reader), `syn_fan_40k` 120
+  and Chaos 67, as the model predicted. Chaos: 221,733 packets, 106,363 probes and exports, none lost.
+- **Generator** (`live_test/sweep_generator_check.py`): 15 whole sweeps of 65,536 probes every 0.5 s (500,000,001 to
+  500,000,004 ns apart), every record after the traffic equal to the model's, at 2 µs (a sweep in 131 ms), 0.5 µs
+  (33 ms) and the generator's full rate (0.64 ms), no export lost. Stopping the generator in the middle of a batch
+  left the pipe's timer dead until switchd was restarted; `sweep_reader.py` now stops it between sweeps.
+- **Not run yet:** all 107 captures (PC1.md 9F) and the line rate with the sweep's generator running beside it (9E).
 
 ## 6. Switch CPU side
 

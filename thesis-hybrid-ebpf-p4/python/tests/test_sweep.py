@@ -282,6 +282,14 @@ class ReplayAnalysisTest(unittest.TestCase):
                 return sweep_replay.main([str(cap / r["capture"]), "--anchor-us", r["anchor_us"], "--out", d,
                                           "--execution-id", r["execution_id"], "--analyse-only"])
 
+    def test_counter_and_register_values(self):
+        """The Wedge (SDE 9.6) returns a one-cell counter as one value over the pipes, [n]; a register per pipe."""
+        import sweep_replay
+        self.assertEqual(sweep_replay.pipe_value([50], 1), 50)
+        self.assertEqual(sweep_replay.pipe_value([0, 41], 1), 41)
+        self.assertEqual(sweep_replay.pipe_value(7, 1), 7)
+        self.assertIsNone(sweep_replay.pipe_value([0, 1], 3))
+
     def test_the_model_s_exports_pass_every_check(self):
         out = self.run_case()
         self.assertTrue(out["checks_ok"], out["checks"])
@@ -522,6 +530,35 @@ class ReaderTest(unittest.TestCase):
         stop = gen.stop()
         self.assertEqual(stop["errors"], [])
         self.assertEqual([x for x in prog.log if x[0] == "mod" and x[1] == names[0]][-1][4], {"pktgen_enable": False})
+
+    def stop_with_counter_reads(self, reads):
+        prog = FakeProgram()
+        gen = sweep_reader.SweepGenerator(prog, [1], local_port=68, app=0, buffer_offset=0)
+        gen.start(500000000, 65536, 2000)
+        seen, it = [], iter(reads)
+
+        def pkt_counters():
+            seen.append(next(it))
+            return seen[-1]
+        gen.pkt_counters, gen.IDLE_QUIET_S = pkt_counters, 0
+        n = len(prog.log)
+        out = gen.stop()
+        disabled = [x for x in prog.log[n:] if x[0] == "mod" and x[4] == {"app_enable": False}]
+        return out, seen, disabled
+
+    def test_stop_waits_for_the_gap_between_sweeps(self):
+        """The app is disabled only once its packet counter stands still: on the Wedge a stop in the middle of a
+        batch lost probes and left the pipe's timer dead until switchd was restarted (PC1.md Results, part 9)."""
+        out, seen, disabled = self.stop_with_counter_reads([[100], [30000], [65536], [65536], [65536]])
+        self.assertEqual(seen, [[100], [30000], [65536], [65536], [65536]])   # 4 reads to the gap, 1 after
+        self.assertEqual(out["idle"]["counters"], [65536])
+        self.assertNotIn("moved_after_idle", out["idle"])
+        self.assertEqual(len(disabled), 1)
+
+    def test_a_stop_overtaken_by_the_timer_is_reported(self):
+        out, _, disabled = self.stop_with_counter_reads([[65536], [65536], [65600]])
+        self.assertTrue(out["idle"]["moved_after_idle"])
+        self.assertEqual(len(disabled), 1)
 
     def test_generator_sde96(self):
         self.check_generator(False)

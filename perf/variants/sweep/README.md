@@ -5,11 +5,16 @@ with `-DP4_GLOBAL_TOTALS_SPLIT=1`), whose registers the data plane reads itself.
 picks up its 14 registers and leaves the switch as an export record. A sweep of probes at each window boundary gives
 the state of every bucket at that boundary, so no window depends on how many buckets the control plane can read.
 
-**Status (2026-11-17): written and checked offline only.** It has not run on the switch. `PC1.md` part 9 has the
-steps. **On the Wedge's bf-p4c 9.6.0 it does not compile yet**: table placement fails, with and without
-`-DSWEEP_SHARED_INDEX=1`, because the probe's reads and the data path's updates of the same registers want
-different stages (`PC1.md` "Results, part 9"; `p4_perf.md` 5.8). The control build (`-DP4_ENABLE_SWEEP=0
--DP4_FRAME_LEN=0`) compiles to exactly `basic_gtot_ba`'s resources.
+**Status (2026-11-17): compiled and tested on the Wedge** (`PC1.md` "Results, part 9" and "part 9b"; `p4_perf.md`
+5.8). The first version (a probe branch of its own) did not compile with bf-p4c 9.6.0; this one gives every register
+one table for both kinds of packet (the "merged" layout, `ingress.p4`'s header comment).
+- **Cost:** 6 ingress stages like `basic_gtot_ba`, 158 against 133 ingress cycles, a median latency of 337 against
+  317 ns (the exact build: 421 ns). The line rate is `basic_fix`'s, lossless, the totals exact.
+- **On the switch:** in-band replays equal to the program's model in all 135 non-duration columns (5 captures,
+  Chaos included). The generator path: whole sweeps every 0.5 s, every record equal to the model's, at 2 µs, 0.5 µs
+  and the generator's full rate (a sweep in 0.64 ms).
+- **Not run yet:** all 107 captures (`PC1.md` 9F), and line rate with the generator's sweep running beside it (9E).
+- The control build (`-DP4_ENABLE_SWEEP=0 -DP4_FRAME_LEN=0`) has exactly `basic_gtot_ba`'s resources.
 
 ## Why this design
 
@@ -44,9 +49,10 @@ perf/tools/sw_compile.sh perf/variants/sweep basic.p4 OUT_DIR [-D...]
 
 | Option | Default | Meaning |
 |---|---|---|
-| `P4_ENABLE_SWEEP` | 1 | 0 leaves out the probe path (parser states, value set, probe branch). |
-| `P4_FRAME_LEN` | 1 | 0 leaves out `frame_len`. `-DP4_ENABLE_SWEEP=0 -DP4_FRAME_LEN=0` compiles `basic_gtot_ba`'s program (apart from the unused `sweep_t` declarations): a control for the resources. |
-| `SWEEP_SHARED_INDEX` | 0 | By default the data path indexes the registers straight from the hash unit, as `basic_gtot_ba` does, and a probe from its destination MAC: two index sources for one register, in exclusive branches. If bf-p4c rejects that, 1 puts both into `meta.ridx` first (the exact build's addressing); that may cost the data path a stage. |
+| `P4_ENABLE_SWEEP` | 1 | 0 leaves out the probe path (parser states, value set, the merged register tables): `basic_gtot_ba`'s data path, word for word. |
+| `P4_FRAME_LEN` | 1 | 0 leaves out `frame_len`. `-DP4_ENABLE_SWEEP=0 -DP4_FRAME_LEN=0` compiles `basic_gtot_ba`'s program (apart from the unused `sweep_t` declarations): a control for the resources (equal, checked 17 November). |
+| `SWEEP_SHARED_INDEX` | `P4_ENABLE_SWEEP` | Both paths index the registers with `meta.ridx` (the flow hash for a data packet, the destination MAC for a probe). The merged layout needs it: a table's actions must index a register the same way, so 0 with the sweep is a compile error. Without the sweep, 0: `basic_gtot_ba`'s addressing straight from the hash unit. |
+| `SWEEP_PIN_STAGES` | 1 | `@stage` pins on the register tables: 6 ingress stages, 158 cycles. 0 leaves the placement to bf-p4c: 7 stages, 166 cycles. Each register has one table, so a pin moves the data path's access and the probe's read together; a change to the data path may need new pins (or 0). |
 | `P4_ENABLE_GLOBAL_TOTALS`, `P4_GLOBAL_TOTALS_SPLIT` | 1, 1 | As in `gtot`. The probes read the split totals, so the sweep requires `P4_GLOBAL_TOTALS_SPLIT=1`. |
 
 Latency builds: `perf/variants/hwl/make_hwl_sources.sh perf/variants/sweep OUT_DIR` (the patch applies to these
@@ -91,7 +97,14 @@ published rows).
 
 ## Limits
 
-- Not compiled yet: stages, SRAM, stateful ALUs, latency and line rate are unknown (PC1.md part 9).
+- **The shared index costs one dependency stage.** The data path reaches its first register in stage 1, not
+  stage 0: +25 cycles, +20 ns against `basic_gtot_ba`. A table's actions must index a register the same way, and a
+  probe's index (its MAC) and a data packet's (the flow hash) can only meet in a PHV field.
+- **The stage pins follow the data path.** Without them (`-DSWEEP_PIN_STAGES=0`) bf-p4c places the tables in 7
+  stages (166 cycles, 344 ns). A change to the data path may need new pins.
+- **Stop the generator between sweeps.** On the Wedge, disabling the app in the middle of a batch lost probes and
+  left that pipe's timer dead until switchd was restarted. `sweep_reader.py --generator stop` waits for the gap
+  (the app's packet counter standing still) and reports a stop the timer overtook (`idle.moved_after_idle`).
 - Flows that share a bucket stay merged (the 4 captures above), as on every bucket-table build.
 - Generator mode: a sweep takes buckets × ipg, so the cut is not one instant (above). With 65,536 used buckets a
   sweep exports 65,536 records (6.8 MB): the export port and the receiver must take them at the probe rate.

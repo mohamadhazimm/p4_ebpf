@@ -151,6 +151,9 @@ struct my_ingress_metadata_t {
 
     bit<1>  is_probe;   /* a probe from a port in sweep_ports (ingress_parser.p4) */
     bit<16> ridx;       /* -DSWEEP_SHARED_INDEX=1: the register index of both paths, in the PHV */
+    bit<8>  dir_old;    /* merged layout: reg_dir_valid before this packet (data path) */
+    bit<16> ref_sp;     /* merged layout: the bucket's reference ports (data path) */
+    bit<16> ref_dp;
 }
 
 struct my_egress_headers_t {

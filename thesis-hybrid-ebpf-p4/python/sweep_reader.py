@@ -387,6 +387,11 @@ class SweepGenerator(object):
             return {"generator": "stopped", "pipes": []}
         k_app = app_cfg.make_key([gc.KeyTuple("app_id", self.app)])
         errors = []
+        # Stop between sweeps. Disabling the app in the middle of a batch lost 3 probes and left that pipe's
+        # timer dead (trigger_counter stayed 0 after the next start) until switchd was restarted, on the Wedge
+        # (SDE 9.6, PC1.md Results, part 9). The app's pkt_counter grows only while it sends: unchanged over
+        # IDLE_QUIET_S, it is between batches, and the app is disabled right after.
+        idle = self.wait_idle()
         for p, dp in zip(self.pipes, self.dev_ports()):
             try:
                 app_cfg.entry_mod(prog.pipe(p), [k_app], [app_cfg.make_data(
@@ -402,7 +407,37 @@ class SweepGenerator(object):
                 errors.append("port %d: %s" % (dp, first_line(error)))
         for e in errors:
             log("generator stop: %s" % e)
-        return {"generator": "stopped", "pipes": self.pipes, "errors": errors}
+        after = self.pkt_counters()
+        if idle.get("counters") is not None and after != idle["counters"]:
+            # the timer fired between the last idle read and the disable: a batch may have been cut
+            idle["moved_after_idle"] = True
+            log("generator stop: packets generated after the idle read (%r -> %r): a sweep may have been cut"
+                % (idle["counters"], after))
+        return {"generator": "stopped", "pipes": self.pipes, "errors": errors, "idle": idle}
+
+    IDLE_QUIET_S = 0.004
+    IDLE_MAX_S = 3.0
+
+    def pkt_counters(self):
+        c = self.counters()
+        return [c.get(str(p), {}).get("pkt_counter") for p in self.pipes]
+
+    def wait_idle(self):
+        """Wait until no pipe's app generates (between two batches), for at most IDLE_MAX_S."""
+        t0 = time.time()
+        try:
+            prev = self.pkt_counters()
+        except Exception as error:
+            return {"waited_ms": 0.0, "error": first_line(error)}
+        while True:
+            time.sleep(self.IDLE_QUIET_S)
+            cur = self.pkt_counters()
+            if cur == prev:
+                return {"waited_ms": round((time.time() - t0) * 1e3, 1), "counters": cur}
+            if time.time() - t0 > self.IDLE_MAX_S:
+                log("generator stop: still generating after %.1f s, stopping anyway" % self.IDLE_MAX_S)
+                return {"waited_ms": round((time.time() - t0) * 1e3, 1), "counters": cur, "timeout": True}
+            prev = cur
 
     def counters(self):
         """pkt_counter, batch_counter, trigger_counter of the app in each pipe."""

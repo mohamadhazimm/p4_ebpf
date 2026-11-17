@@ -57,6 +57,9 @@ parser IngressParser(
 #if P4_ENABLE_SWEEP
         meta.is_probe   = 1w0;
         meta.ridx       = 16w0;
+        meta.dir_old    = 8w0;
+        meta.ref_sp     = 16w0;
+        meta.ref_dp     = 16w0;
 #endif
 
         transition parse_ethernet;

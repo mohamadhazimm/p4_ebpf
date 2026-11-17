@@ -2027,3 +2027,113 @@ malformed; `latency/`):
   bounds (`restored_check/`, with `enp5s0` up for it); `enp5s0` down.
 - **On the switch:** sources in `/root/hazim_perf/src/{basic_sweep,basic_hwl_gtot_ba,basic_hwl_sweep}`, builds in
   `/root/hazim_perf/build/`, failed ones included.
+
+## Results, part 9b (PC1, 2026-11-17): two fixes for the sweep build; the merged layout compiles and works
+
+The user asked to try both fixes proposed in part 9 and to say which is better. Sources of both in
+`perf/results/part9_20261117/fixes/{pinned,merged}/`. Results there (`builds/`, `latency_fixB/`, `linerate_sweepB/`,
+`sweep_first_fixB/`, `sweep_generator_fixB/`) and in the archive `live_test/committee_replay/pc1_20261117_part9.tar.xz`
+(the `exports.pcap` of Chaos and `syn_fan_40k`, 17 MB, only in `perf/results`). Fix B is now `perf/variants/sweep`.
+
+**Fix A: the probe's reads pinned to the data path's stages (`@stage`). It does not compile.**
+- **What changed:** each probe read is its own keyless table, pinned to the stage where `basic_gtot_ba` keeps
+  the register (the same with `frame_len`). The data path is untouched.
+- **Result:** "Table placement cannot make any more progress", both by default and with `-DSWEEP_SHARED_INDEX=1`.
+- **The pins hold:** the totals' reads went to stages 4 and 1.
+- **Hash and MAC indexes (default):** the probe's `reg_dir_valid` read is tried in stage 0 and never fits there,
+  beside the data path's table for the same register. The data path addresses that stateful ALU by the hash, the
+  probe by its MAC.
+- **Shared index:** the probe's own write of `meta.ridx` (stage 0) keeps its stage-0 reads (`dir_valid`,
+  `first_ts`, `last_ts`) out of stage 0, against their pins.
+- **The data path's stages with `meta.ridx`** (`basic_sweep_noprobe_si`) are unchanged: the compiler uses the
+  hash for it.
+
+**Fix B: one table per register for both paths ("merged"). It compiles after three corrections.**
+- **The layout:** each register has one table, applied once on the path both kinds of packet take. Its key
+  (`is_probe`, plus `dir_old`, the TCP flags or the bucket where the data path had conditions) picks the data
+  path's RegisterAction, unchanged, or the probe's read.
+- **With the sweep off, unchanged:** `-DP4_ENABLE_SWEEP=0` keeps `basic_gtot_ba`'s code word for word, and the
+  control build has exactly its resources.
+- **The three corrections:**
+  1. **Shared index:** with hash and MAC indexes, "Incompatible attached indexing between actions in table
+     t_dir_valid_0". A table's actions must index a register the same way, so both use `meta.ridx`.
+  2. **One metadata field per value:** the assembler failed with "action bus slice (0..31) can't fit in a single
+     slot for 16 bit access". The probe's read of a register the data path also reads (`dir_valid`, the reference
+     ports) went to `hdr.sweep`, a 32-bit container, and the data path's to a 16-bit metadata field. Both now land
+     in the same metadata field; the probe copies them into its record at the end.
+  3. **One if/else:** the two writes of `meta.ridx` sat in two `if`s, which bf-p4c orders and which cost a stage
+     (8 stages, 185 cycles). In one if/else: 7 stages, 166 cycles.
+- **Stage pins** on the merged tables (safe here: each register has one table) pack them into 6 stages: 158
+  cycles.
+
+| Build | Stages ig/eg | Critical path | SRAM | TCAM | Stateful ALUs | Ingress cycles | Median latency |
+|---|---|---|---|---|---|---|---|
+| basic_gtot_ba | 6/1 | 4 | 211 | 3 | 21 | 133 | 317 ns |
+| fix B, pinned (`perf/variants/sweep`) | 6/1 | 5 | 239 | 20 | 22 | 158 | 337 ns |
+| fix B, `-DSWEEP_PIN_STAGES=0` | 7/1 | 5 | 239 | 20 | 22 | 166 | 344 ns |
+
+- **Latency:** hairpin, 3 runs per program, every run 1010 of 1010 reports; baseline 246 ns and `basic_gtot_ba`
+  317 ns in the same session (`latency_fixB/`).
+- **The cost of the shared index:** the data path reaches its first register one stage later (stage 1): +25
+  cycles, +20 ns. The exact build costs 421 ns.
+- **The final sources:** `perf/variants/sweep` compiled with no flags gives the assembly of the measured pinned
+  build, apart from the compiler's generated names.
+
+**Fix B on the switch** (pinned build):
+- **Line rate** (the 27-run matrix of part 9A, `linerate_sweepB/`): the same rates as `basic_fix` within 0.01
+  points, lossless, 0 checks failed. The totals and the flow's registers are exact for 13.1 billion packets.
+- **In-band replays (9C)** (`sweep_replay.py`, `sweep_first_fixB/`): every check passes and the switch's row
+  equals the model's in all 135 non-duration columns.
+
+  | Capture | Packets | Probes = exports (switch = model) | Sweeps | Published row (model's prediction) |
+  |---|---|---|---|---|
+  | first cohort capture | 9 | 50 | 41 | 135 (135) |
+  | bulk2000 | 24,000 | 2,078 | 41 | 135 (135) |
+  | slowloris_500 | 11,087 | 1,919 | 41 | 135 (135) |
+  | syn_fan_40k | 39,847 | 33,662 | 41 | 120 (120) |
+  | Chaos | 221,733 | 106,363 | 41 | 67 (67) |
+
+  `slowloris_500` overloads `basic_fix`'s control-plane reader at 0.5 s; here it equals the published row. tcpdump
+  dropped nothing (106,363 exports for Chaos).
+- **Generator (9D)** (`sweep_generator_check.py`, `sweep_generator_fixB/`): after the stop fix below, 5 runs in a
+  row pass every check.
+  - **The runs:** 15 whole sweeps each, the generator's counter = the switch's probes = 983,040, the sweeps
+    500,000,001 to 500,000,004 ns apart. After the traffic every sweep's 201 records equal the model's.
+  - **Speed:** a sweep takes 130.9 ms at 2 µs, 32.8 ms at 0.5 µs, and 0.64 ms at the generator's full rate
+    (`--ipg-ns 0`); no export lost at any of them.
+
+**Three tool bugs found and fixed on the way** (pulled code, written without a switch):
+- **`sweep_replay.pipe_value`:** the Wedge returns the one-cell counters `sweep_probes` and `sweep_exported` as a
+  single value, `[50]`, not per pipe. The probe and export checks then failed (`None`) although the switch's
+  counts were right. A single value is now taken as is.
+- **`sweep_replay.Capture.stop`:**
+  - **The problem:** our ASROOT (`committee_replay/scripts/asroot.sh`) pipes the password into sudo, so a SIGTERM
+    reaches only the wrapper, and an exec'd sudo runs as root and may not be signalled. tcpdump kept running (it
+    was killed by PID after the first replay) and printed no statistics.
+  - **The fix:** `stop()` now sends SIGINT through ASROOT with `pkill -f '^tcpdump .* -w FILE'`.
+  - **The first replay:** its capture was complete; it is kept as `sweep_first_fixB/cohort1_before_tool_fix/`
+    and was rerun.
+- **`sweep_reader.py --generator stop`:**
+  - **The problem:** disabling the app in the middle of a 65,536-probe batch lost 3 probes (the generator counted
+    976,621, the switch 976,618), and the next start sent nothing (trigger counter 0) until switchd was restarted.
+    It happened both times a stop fell in a batch: the 3 runs after the first such stop and the run after the second
+    were silent. After a stop between batches the next run was normal.
+  - **The fix:** `stop()` waits until the app's packet counter stands still (8-30 ms), then disables it, and
+    reports a stop the timer overtook (`idle.moved_after_idle`).
+- **Tests:** `tests/test_sweep.py` +3 (27); whole suite 241 run, 8 skipped, the known `test_sockjoin` error.
+
+**Which is better: B.**
+- **A does not compile** with bf-p4c 9.6.0, whatever the index. Making it place would mean pinning the data
+  path's tables too, which needs B's restructuring plus hard-coded stages for both paths.
+- **B compiles without pins**, at 7 stages and 344 ns. The pins only buy back a stage (337 ns), and a wrong pin
+  fails at compile time.
+- **B ties each probe read to its register by construction,** so a later change to the data path cannot separate
+  them again.
+- **B's cost** is the shared index: +20 ns over `basic_gtot_ba`, still 84 ns under the exact build.
+
+**Not run yet:** 9E's two line-rate runs with the sweep's generator beside the line-rate app, and 9F (all 107
+captures, about an hour).
+
+**State after:** the switch runs `basic_fix` again (pid 19629). The first cohort capture gave 9 of 9 packets and 40
+of 40 windows inside the bounds (`restored_check_2/`, with `enp5s0` up for it); `enp5s0` down. Builds on the switch:
+`basic_sweep_final`, `basic_hwl_sweep_final`, `basic_sweep_merged_pin` (measured), the failed fix A builds.

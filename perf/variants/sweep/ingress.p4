@@ -37,10 +37,16 @@
  * Data packets are counted exactly as in basic_gtot_ba: -DP4_ENABLE_SWEEP=0 -DP4_FRAME_LEN=0 compiles
  * basic_gtot_ba's program (apart from the unused sweep_t declarations).
  *
- * Register indexes. By default the data path addresses the registers straight from the hash unit, as
- * basic_gtot_ba does, and a probe from its destination MAC: two index sources for one register, in
- * mutually exclusive branches. If bf-p4c rejects that, -DSWEEP_SHARED_INDEX=1 puts both indexes into
- * meta.ridx first (the exact build's way of addressing); that may cost the data path a stage. */
+ * Layout ("merged", PC1.md Results, part 9). bf-p4c 9.6.0 places a register in one MAU stage with every
+ * table that uses it. A probe branch of its own (the first version) read every register from tables that
+ * depend on nothing; they were placed early and the data path's updates could not follow ("Table placement
+ * cannot make any more progress"), also with the probe's reads pinned to the data path's stages (@stage).
+ * So every register has one table (t_*), applied once on the path both kinds of packet take; its key picks
+ * the data path's RegisterAction, with basic_gtot_ba's conditions, or the probe's read. One table needs one
+ * index source for all its actions ("Incompatible attached indexing between actions" otherwise), so both
+ * indexes go into meta.ridx first (SWEEP_SHARED_INDEX, on with the sweep); the data path then reaches its
+ * first register one stage later than basic_gtot_ba. Measured: 6 ingress stages with the stage pins
+ * (SWEEP_PIN_STAGES), 158 cycles against 133, a median latency of 337 ns against 317 ns. */
 
 /* P4_ENABLE_SWEEP: headers.p4 (default 1) */
 
@@ -48,8 +54,13 @@
 #define P4_FRAME_LEN 1
 #endif
 
+/* The shared index is part of the merged layout; without the sweep, basic_gtot_ba's addressing (the hash). */
 #ifndef SWEEP_SHARED_INDEX
-#define SWEEP_SHARED_INDEX 0
+#define SWEEP_SHARED_INDEX P4_ENABLE_SWEEP
+#endif
+
+#if P4_ENABLE_SWEEP && !SWEEP_SHARED_INDEX
+#error the merged layout needs SWEEP_SHARED_INDEX=1: a table's actions must index a register the same way
 #endif
 
 /* -DP4_ENABLE_GLOBAL_TOTALS=0 drops the seven totals (the probes then read none). */
@@ -431,6 +442,143 @@ control Ingress(
         }
         default_action = export_drop();
     }
+
+    /* -------- Merged layout: one table per register, for data packets and probes alike -------- */
+    /* (the file's header comment says why). Each t_* table is applied once, on the path both kinds of packet
+     * take; its key picks the data path's RegisterAction (as in basic_gtot_ba, with the same conditions) or the
+     * probe's read. Both index the register with meta.ridx: the flow hash for a data packet, the destination
+     * MAC's low 16 bits for a probe. A value the data path also reads (dir_valid, the reference ports) lands
+     * in the same metadata field for both (one SALU output, one container size: bf-p4c's assembler rejects
+     * "action bus slice (0..31) can't fit in a single slot for 16 bit access" otherwise); the probe copies
+     * them into its record at the end. */
+/* Optional stage pins (-DSWEEP_PIN_STAGES=0 leaves the placement to bf-p4c: 7 ingress stages). The merged index
+ * is in the PHV from stage 1 on, so only the one-entry flag totals can use stage 0; bf-p4c's greedy placement
+ * then needs a seventh stage. These pins pack the 22 registers into stages 0-5 within the 4 stateful ALUs and
+ * 48 map RAMs of a stage, with the direction (dir_ab) ready for stage 4. Each register has one table, so a pin
+ * moves the data path's access and the probe's read together. */
+#ifndef SWEEP_PIN_STAGES
+#define SWEEP_PIN_STAGES 1
+#endif
+#if SWEEP_PIN_STAGES
+#define SWEEP_STAGE(n) @stage(n)
+#else
+#define SWEEP_STAGE(n)
+#endif
+
+#define DX meta.ridx
+
+    /* a register the data path updates on every counted packet: key is_probe */
+#define SWEEP_PLAIN(name, upd, get, field, st)                                                  \
+    action d_##name() { upd.execute(DX); }                                                  \
+    action p_##name() { hdr.sweep.field = get.execute(PIDX); }                              \
+    SWEEP_STAGE(st) table t_##name {                                                                        \
+        key = { meta.is_probe : exact; }                                                    \
+        actions = { d_##name; p_##name; }                                                   \
+        const entries = { 1w0 : d_##name(); 1w1 : p_##name(); }                             \
+        size = 2;                                                                           \
+    }
+
+    SWEEP_PLAIN(pkts_ab,  pkts_ab_update,    pkts_ab_get,  pkts_ab, 5)
+    SWEEP_PLAIN(bytes_ab, bytes_ab_update,   bytes_ab_get, bytes_ab, 5)
+    SWEEP_PLAIN(pkts,     pkts_rw,           pkts_get,     pkts, 3)
+    SWEEP_PLAIN(bytes,    bytes_rw,          bytes_get,    bytes, 3)
+    SWEEP_PLAIN(min_len,  min_len_update,    min_len_get,  min_len, 3)
+    SWEEP_PLAIN(max_len,  max_len_update,    max_len_get,  max_len, 2)
+    SWEEP_PLAIN(first_ts, first_ts_set_if0,  first_ts_get, first_ts, 1)
+    SWEEP_PLAIN(last_ts,  last_ts_rw,        last_ts_get,  last_ts, 1)
+
+    /* reg_dir_valid: the data path keeps the old value for the direction logic. Here and for the reference
+     * ports the probe's read lands in the same metadata field as the data path's (one SALU output, one
+     * container size: bf-p4c's assembler rejects "action bus slice (0..31) can't fit in a single slot for
+     * 16 bit access" otherwise); the probe copies them into its record at the end. */
+    action d_dir_valid() { meta.dir_old = dir_valid_rw.execute(DX); }
+    action p_dir_valid() { meta.dir_old = dir_valid_get.execute(PIDX); }
+    SWEEP_STAGE(1) table t_dir_valid {
+        key = { meta.is_probe : exact; }
+        actions = { d_dir_valid; p_dir_valid; }
+        const entries = { 1w0 : d_dir_valid(); 1w1 : p_dir_valid(); }
+        size = 2;
+    }
+
+    /* the reference ports: set by a bucket's first packet, read by the later ones */
+#define SWEEP_REF(name, set, read, get, field, st)                                              \
+    action d_##name##_set() { set.execute(DX); }                                            \
+    action d_##name##_read() { meta.field = read.execute(DX); }                             \
+    action p_##name() { meta.field = get.execute(PIDX); }                                   \
+    SWEEP_STAGE(st) table t_##name {                                                                        \
+        key = { meta.is_probe : exact; meta.dir_old : ternary; }                            \
+        actions = { d_##name##_set; d_##name##_read; p_##name; }                            \
+        const entries = {                                                                   \
+            (1w1, _)              : p_##name();                                             \
+            (1w0, 8w0 &&& 8w0xff) : d_##name##_set();                                       \
+            (1w0, _)              : d_##name##_read();                                      \
+        }                                                                                   \
+        size = 4;                                                                           \
+    }
+
+    SWEEP_REF(ref_sp, ref_src_set, ref_src_read, ref_src_get, ref_sp, 2)
+    SWEEP_REF(ref_dp, ref_dst_set, ref_dst_read, ref_dst_get, ref_dp, 2)
+
+    /* a TCP flag counter: a data packet counts only with the flag set */
+#define SWEEP_FLAG(name, inc, get, field, fl, st)                                              \
+    action d_##name() { inc.execute(DX); }                                                  \
+    action p_##name() { hdr.sweep.field = get.execute(PIDX); }                              \
+    SWEEP_STAGE(st) table t_##name {                                                                        \
+        key = { meta.is_probe : exact; hdr.tcp.isValid() : exact; hdr.tcp.flags : ternary; } \
+        actions = { d_##name; p_##name; NoAction; }                                         \
+        const entries = {                                                                   \
+            (1w1, false, _)           : p_##name();                                         \
+            (1w0, true, fl &&& fl)  : d_##name();                                         \
+        }                                                                                   \
+        const default_action = NoAction();                                                  \
+        size = 4;                                                                           \
+    }
+
+    SWEEP_FLAG(syn, syn_inc, syn_get, syn, 9w0x002, 2)
+    SWEEP_FLAG(rst, rst_inc, rst_get, rst, 9w0x004, 4)
+    SWEEP_FLAG(ack, ack_inc, ack_get, ack, 9w0x010, 4)
+
+#if P4_ENABLE_GLOBAL_TOTALS
+    /* a one-entry total: every counted data packet; a probe reads it only for bucket 0 */
+#define SWEEP_TOTAL(name, upd, get, st)                                                         \
+    action d_##name() { upd.execute(1w0); }                                                 \
+    action p_##name() { hdr.sweep.name = get.execute(1w0); }                                \
+    SWEEP_STAGE(st) table t_##name {                                                                        \
+        key = { meta.is_probe : exact; hdr.ethernet.dst[15:0] : ternary @name("probe_bucket"); }                  \
+        actions = { d_##name; p_##name; NoAction; }                                         \
+        const entries = {                                                                   \
+            (1w1, 16w0 &&& 16w0xffff) : p_##name();                                         \
+            (1w0, _)                  : d_##name();                                         \
+        }                                                                                   \
+        const default_action = NoAction();                                                  \
+        size = 4;                                                                           \
+    }
+
+    SWEEP_TOTAL(g_pkts_ba,  g_pkts_inc,        g_pkts_ba_get, 5)
+    SWEEP_TOTAL(g_bytes_ba, g_bytes_add,       g_bytes_ba_get, 5)
+    SWEEP_TOTAL(g_pkts_ab,  g_pkts_ab_update,  g_pkts_ab_get, 4)
+    SWEEP_TOTAL(g_bytes_ab, g_bytes_ab_update, g_bytes_ab_get, 4)
+
+    /* a one-entry flag total: a data packet counts only with the flag set */
+#define SWEEP_GFLAG(name, inc, get, fl, st)                                                    \
+    action d_##name() { inc.execute(1w0); }                                                 \
+    action p_##name() { hdr.sweep.name = get.execute(1w0); }                                \
+    SWEEP_STAGE(st) table t_##name {                                                                        \
+        key = { meta.is_probe : exact; hdr.ethernet.dst[15:0] : ternary @name("probe_bucket"); \
+                hdr.tcp.isValid() : exact; hdr.tcp.flags : ternary; }                       \
+        actions = { d_##name; p_##name; NoAction; }                                         \
+        const entries = {                                                                   \
+            (1w1, 16w0 &&& 16w0xffff, false, _) : p_##name();                               \
+            (1w0, _, true, fl &&& fl)         : d_##name();                               \
+        }                                                                                   \
+        const default_action = NoAction();                                                  \
+        size = 4;                                                                           \
+    }
+
+    SWEEP_GFLAG(g_syn, g_syn_inc, g_syn_get, 9w0x002, 0)
+    SWEEP_GFLAG(g_rst, g_rst_inc, g_rst_get, 9w0x004, 0)
+    SWEEP_GFLAG(g_ack, g_ack_inc, g_ack_get, 9w0x010, 0)
+#endif
 #endif
 
 #if P4_FRAME_LEN
@@ -499,8 +647,8 @@ control Ingress(
 #endif
 
 #if P4_ENABLE_SWEEP
+        /* -------- merged layout: probes and data packets through the same register tables -------- */
         if (meta.is_probe == 1w1) {
-            /* -------- a probe: read one bucket, export it -------- */
 #if SWEEP_SHARED_INDEX
             meta.ridx = hdr.ethernet.dst[15:0];
 #endif
@@ -509,38 +657,95 @@ control Ingress(
             hdr.sweep.batch = hdr.ethernet.dst[31:16];
             hdr.sweep.t     = ig_intr_md.ingress_mac_tstamp[31:0];
             sweep_probes.count(0);
-
             if (hdr.ethernet.dst[15:0] == 16w0) {
                 hdr.sweep.seq = seq_next.execute(1w0);
-#if P4_ENABLE_GLOBAL_TOTALS
-                hdr.sweep.g_pkts_ab  = g_pkts_ab_get.execute(1w0);
-                hdr.sweep.g_bytes_ab = g_bytes_ab_get.execute(1w0);
-                hdr.sweep.g_pkts_ba  = g_pkts_ba_get.execute(1w0);
-                hdr.sweep.g_bytes_ba = g_bytes_ba_get.execute(1w0);
-                hdr.sweep.g_syn      = g_syn_get.execute(1w0);
-                hdr.sweep.g_ack      = g_ack_get.execute(1w0);
-                hdr.sweep.g_rst      = g_rst_get.execute(1w0);
-#endif
             } else {
                 hdr.sweep.seq = seq_get.execute(1w0);
             }
+        } else if (hdr.ipv4.isValid() && (hdr.tcp.isValid() || hdr.udp.isValid())) {
+            /* else-if, not a second if: bf-p4c sees the two writes of meta.ridx as exclusive only in one
+             * if/else (two ifs cost a stage) */
+#if P4_FRAME_LEN
+            frame_len.apply();
+#endif
+            bit<16> idx = crc16_hasher.get({ hdr.ipv4.srcAddr, hdr.ipv4.dstAddr,
+                                             meta.l4_sport, meta.l4_dport,
+                                             hdr.ipv4.protocol });
+            meta.flow_index = idx;
+#if SWEEP_SHARED_INDEX
+            meta.ridx = idx;
+#endif
+        }
 
-            hdr.sweep.dir_valid = dir_valid_get.execute(PIDX);
-            hdr.sweep.ref_sp    = ref_src_get.execute(PIDX);
-            hdr.sweep.ref_dp    = ref_dst_get.execute(PIDX);
-            hdr.sweep.pkts      = pkts_get.execute(PIDX);
-            hdr.sweep.bytes     = bytes_get.execute(PIDX);
-            hdr.sweep.pkts_ab   = pkts_ab_get.execute(PIDX);
-            hdr.sweep.bytes_ab  = bytes_ab_get.execute(PIDX);
-            hdr.sweep.min_len   = min_len_get.execute(PIDX);
-            hdr.sweep.max_len   = max_len_get.execute(PIDX);
-            hdr.sweep.first_ts  = first_ts_get.execute(PIDX);
-            hdr.sweep.last_ts   = last_ts_get.execute(PIDX);
-            hdr.sweep.syn       = syn_get.execute(PIDX);
-            hdr.sweep.ack       = ack_get.execute(PIDX);
-            hdr.sweep.rst       = rst_get.execute(PIDX);
+        if (meta.is_probe == 1w1 || (hdr.ipv4.isValid() && (hdr.tcp.isValid() || hdr.udp.isValid()))) {
+            t_dir_valid.apply();
 
-            if (hdr.sweep.dir_valid == 8w0 && hdr.ethernet.dst[15:0] != 16w0) {
+            if (meta.is_probe == 1w0 && meta.dir_old == 8w0) {
+                meta.dir_ab = 1w1;
+                /* First-seen flow report to CPU */
+#if P4_ENABLE_CPU_REPORTS
+                meta.cpu_report.setValid();
+                meta.cpu_report.magic     = CPU_REPORT_MAGIC;
+                meta.cpu_report.src_ip    = hdr.ipv4.srcAddr;
+                meta.cpu_report.dst_ip    = hdr.ipv4.dstAddr;
+                meta.cpu_report.src_port  = meta.l4_sport;
+                meta.cpu_report.dst_port  = meta.l4_dport;
+                meta.cpu_report.proto     = hdr.ipv4.protocol;
+                meta.cpu_report.reason    = 8w1;
+                meta.cpu_report.flow_index = crc16_report_hasher.get({ hdr.ipv4.srcAddr, hdr.ipv4.dstAddr,
+                                                                       meta.l4_sport, meta.l4_dport,
+                                                                       hdr.ipv4.protocol });
+
+                meta.cpu_mirror_sid       = 1;
+                ig_dprsr_md.mirror_type   = FLOW_REPORT_MIRROR;
+#endif
+            }
+
+            t_ref_sp.apply();
+            t_ref_dp.apply();
+
+            if (meta.is_probe == 1w0 && meta.dir_old != 8w0) {
+                if ((meta.l4_sport == meta.ref_sp) && (meta.l4_dport == meta.ref_dp)) {
+                    meta.dir_ab = 1w1;
+                } else if ((meta.l4_sport == meta.ref_dp) && (meta.l4_dport == meta.ref_sp)) {
+                    meta.dir_ab = 1w0;
+                } else {
+                    /* Collision / ambiguity fallback */
+                    meta.dir_ab = 1w1;
+                }
+            }
+
+            /* Core counters */
+            t_pkts_ab.apply();
+            t_bytes_ab.apply();
+            t_pkts.apply();
+            t_bytes.apply();
+            t_min_len.apply();
+            t_max_len.apply();
+            t_first_ts.apply();
+            t_last_ts.apply();
+#if P4_ENABLE_GLOBAL_TOTALS
+            t_g_pkts_ba.apply();
+            t_g_bytes_ba.apply();
+            t_g_pkts_ab.apply();
+            t_g_bytes_ab.apply();
+#endif
+            /* TCP flags */
+            t_syn.apply();
+            t_rst.apply();
+            t_ack.apply();
+#if P4_ENABLE_GLOBAL_TOTALS
+            t_g_syn.apply();
+            t_g_rst.apply();
+            t_g_ack.apply();
+#endif
+        }
+
+        if (meta.is_probe == 1w1) {
+            hdr.sweep.dir_valid = meta.dir_old;
+            hdr.sweep.ref_sp    = meta.ref_sp;
+            hdr.sweep.ref_dp    = meta.ref_dp;
+            if (meta.dir_old == 8w0 && hdr.ethernet.dst[15:0] != 16w0) {
                 /* a bucket never used since the reset: nothing to export */
                 ig_dprsr_md.drop_ctl   = 3w1;
                 ig_tm_md.bypass_egress = 1w1;
@@ -549,8 +754,9 @@ control Ingress(
                 sweep_export.apply();
             }
         } else {
-#endif
-
+            forwarding.apply();
+        }
+#else
 #if P4_ENABLE_FEATURES
         if (hdr.ipv4.isValid() && (hdr.tcp.isValid() || hdr.udp.isValid())) {
 #if P4_FRAME_LEN
@@ -657,8 +863,6 @@ control Ingress(
 #endif
 
         forwarding.apply();
-#if P4_ENABLE_SWEEP
-        }
 #endif
     }
 }
