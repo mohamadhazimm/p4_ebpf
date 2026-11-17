@@ -873,7 +873,17 @@ and no flow should go unread under a flood. **Where the remaining errors came fr
   500,000,004 ns apart), every record after the traffic equal to the model's, at 2 µs (a sweep in 131 ms), 0.5 µs
   (33 ms) and the generator's full rate (0.64 ms), no export lost. Stopping the generator in the middle of a batch
   left the pipe's timer dead until switchd was restarted; `sweep_reader.py` now stops it between sweeps.
-- **Not run yet:** all 107 captures (PC1.md 9F) and the line rate with the sweep's generator running beside it (9E).
+- **The exact build's 109 captures** (PC1.md "Results, part 9c", `perf/results/part9_20261117/sweep_replays/`):
+  - **Against its model:** the switch's row equals the model's in all 135 non-duration columns in 107 of 109 runs.
+    The other two are `bulkup_200` and `bulkup_400`, whose GSO super-frames eth1's MTU refuses. Probes and exports
+    are 475,080 of each, none lost.
+  - **Against the published rows:** 103 of 109 equal in all 135 columns, against 102 for the exact build, 63 for
+    `basic_gtot_ba` and 61 for `basic_fix`; mean 131.8 against the exact build's 131.9.
+  - **Where they differ:** the sweep build is better on `udp_fan_60k` (135 against 123: the exact build's table
+    overflows) and worse on Chaos (67 against 71) and `syn_fan_150k` (67 against 77), where flows share buckets.
+    The other 106 captures score the same on both.
+  - **The cost:** the same parity as the exact build with 6 ingress stages instead of 11 and 337 instead of 421 ns.
+- **Not run yet:** the line rate with the sweep's generator running beside the line-rate app (PC1.md 9E).
 
 ## 6. Switch CPU side
 

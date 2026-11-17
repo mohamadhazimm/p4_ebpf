@@ -13,7 +13,9 @@ one table for both kinds of packet (the "merged" layout, `ingress.p4`'s header c
 - **On the switch:** in-band replays equal to the program's model in all 135 non-duration columns (5 captures,
   Chaos included). The generator path: whole sweeps every 0.5 s, every record equal to the model's, at 2 µs, 0.5 µs
   and the generator's full rate (a sweep in 0.64 ms).
-- **Not run yet:** all 107 captures (`PC1.md` 9F), and line rate with the generator's sweep running beside it (9E).
+- **The exact build's 109 captures** (`PC1.md` "Results, part 9c"): 103 rows equal to the published row in the 135
+  non-duration columns (exact build 102), 107 equal to the model (the other 2: bulk uploads over the replay's MTU).
+- **Not run yet:** line rate with the generator's sweep running beside it (`PC1.md` 9E).
 - The control build (`-DP4_ENABLE_SWEEP=0 -DP4_FRAME_LEN=0`) has exactly `basic_gtot_ba`'s resources.
 
 ## Why this design

@@ -2137,3 +2137,62 @@ captures, about an hour).
 **State after:** the switch runs `basic_fix` again (pid 19629). The first cohort capture gave 9 of 9 packets and 40
 of 40 windows inside the bounds (`restored_check_2/`, with `enp5s0` up for it); `enp5s0` down. Builds on the switch:
 `basic_sweep_final`, `basic_hwl_sweep_final`, `basic_sweep_merged_pin` (measured), the failed fix A builds.
+
+## Results, part 9c (PC1, 2026-11-17): the sweep build on the exact build's 109 captures (9F)
+
+The user asked to run the sweep build (`perf/variants/sweep`, the merged layout of part 9b, `basic_sweep_final`)
+against the 109 captures of the exact build's part 6, that is all 110 but `bulkup_700`.
+- **How:** `live_test/run_sweep_replays.py --include-oversize --only <the 109 ids>`, 53.5 minutes, in-band probes
+  ("changed").
+- **Results:** `perf/results/part9_20261117/sweep_replays/`: `rows.csv` (the rows, input of `score_switch_replay.py`),
+  `runs.csv`, `compare_exact.csv` and `.json` from `compare_sweep_exact.py`. In the archive without the runs'
+  `exports.pcap` (55 MB).
+
+**The switch against its model (the program's software model on the same frames and probes):**
+- **All 109 runs:** probes sent = the switch's count = the model's, and every export was captured: 475,080 of
+  each, tcpdump dropping none. Each run had 41 consecutive sweeps, and in every window the totals equal the
+  buckets' sum.
+- **107 of 109 runs pass every check, with the row equal to the model's in all 135 non-duration columns.**
+- **The other 2 are `bulkup_200` and `bulkup_400`:** eth1 (MTU 1500) refused their GSO super-frames (4,370 of
+  14,266 and 8,824 of 29,078), as in part 4. The switch counted exactly the frames sent; the model counts all of
+  them.
+- **The offline prediction held:** the switch's row equals the row `sweep_offline_check.py` predicted in all 107
+  replayable captures.
+
+**Against the published rows, the same 109 captures for every build** (columns equal, of the 135 non-duration
+columns; the others from `perf/results/exact_replay/exact_compare.csv`):
+
+| Build | Rows equal in all 135 | Mean of 135 |
+|---|---|---|
+| sweep (`perf/variants/sweep`, part 9b) | 103 | 131.8 |
+| exact (part 6) | 102 | 131.9 |
+| basic_gtot_ba (part 4g) | 63 | 110.4 |
+| basic_fix | 61 | 105.8 |
+
+The captures below 135 on the sweep or the exact build:
+
+| Capture | sweep | exact | basic_gtot_ba | basic_fix | Exact build's untracked packets |
+|---|---|---|---|---|---|
+| bulkup_200 | 71 | 71 | 47 | 47 | 0 |
+| bulkup_400 | 71 | 71 | 44 | 46 | 0 |
+| syn_fan_40k | 120 | 120 | 47 | 8 | 363 |
+| syn_fan_100k | 70 | 70 | 33 | 8 | 35,194 |
+| syn_fan_150k | 67 | 77 | 33 | 5 | 83,936 |
+| udp_fan_60k | 135 | 123 | 84 | 58 | 98 |
+| Chaos (d538053) | 67 | 71 | 42 | 32 | 1,930 |
+
+- **Equal everywhere else:** all 102 other captures, every calm one among them, equal the published row in all
+  135 columns on both builds.
+- **The sweep build is better on `udp_fan_60k`:** 135 against 123. That flood exceeds the exact build's flow
+  table (98 untracked packets), while its flows land in separate buckets of the bucket table.
+- **The exact build is better on Chaos and `syn_fan_150k`:** 71 against 67 and 77 against 67, where many flows
+  share a bucket. The exact build keeps up to 65,536 flows apart and counts the rest as untracked; the bucket table
+  merges flows that collide, without saying so.
+- **The bulk uploads** are limited by the replay, not the program.
+- **Overall a tie:** 103 against 102 rows, 131.8 against 131.9 columns on average. The sweep build takes 6
+  ingress stages against 11 and 337 against 421 ns.
+
+**Not run yet:** 9E's two line-rate runs with the sweep's generator beside the line-rate app.
+
+**State after:** the switch runs `basic_fix` again (pid 29739). The first cohort capture gave 9 of 9 packets and 40
+of 40 windows inside the bounds (`restored_check_3/`, with `enp5s0` up for it); `enp5s0` down.
