@@ -847,6 +847,125 @@ window-level rows (every flow); score all three with `validation/hybrid/score.py
 scoped equals solo up to timing, the window-level rows mix the hosts. The host side stays this machine's monitor
 on the monitored host's cgroup (a per-host monitor on each host is the deployment, not tested here).
 
+## Part 9 (ready, 2026-11-17): basic_gtot_ba measured, and a new build that reads its own registers
+
+*Two things. (A) `basic_gtot_ba`, the build of the thesis replay rows (part 4g), has no latency or line-rate
+measurement yet. (B) A new build, `perf/variants/sweep`: `basic_gtot_ba` whose registers the data plane reads
+itself, one probe packet per bucket, so a window covers every bucket instead of the ~500 the control plane reads in
+0.5 s. Offline it matches the published rows as often as the exact build (106 of 110 captures in the 135
+non-duration columns, the same 4 floods failing), without the exact build's extra 106 ns. Design and limits:
+`perf/variants/sweep/README.md`. Nothing of it has run on a switch yet: report every failure with its message,
+and do not rerun a failed step silently.*
+
+**ASROOT** below is the command prefix used for `exact_replay.py` in part 6 (it runs a command as root). It must
+pass SIGTERM on to the command (sudo does): `sweep_replay.py` stops tcpdump that way, with `timeout` as a
+backstop. `sweep_reader.py` runs on the switch under the SDE environment that `sweep_replay.remote_cmd` sets
+(`SDE_INSTALL=/root/bf-sde-9.6.0/install`, `LD_LIBRARY_PATH=/usr/local/lib:$SDE_INSTALL/lib`, python2.7).
+
+**9A. `basic_gtot_ba`: latency and line rate.** The build is on the switch (`/root/hazim_perf/build/basic_gtot_ba`).
+- **Latency**, as for `gtot` in part 4d (p4_perf section 4.1's method, `hwl_runs.sh` of
+  `perf/results/latency_gtot_20261115/`, 3 runs per program, the baseline and `basic_fix` the same day):
+
+      perf/variants/hwl/make_hwl_sources.sh perf/variants/gtot OUT_DIR
+      perf/tools/sw_compile.sh OUT_DIR/basic_hwl basic.p4 BUILD_DIR -DP4_GLOBAL_TOTALS_SPLIT=1
+
+- **Line rate**, p4_perf section 3.2's 27-run matrix as for `gtot` (`perf/results/linerate_gtot_20261115/`) with
+  `sw_pktgen_run.py --global-totals`. The tool now finds the split build's registers (`reg_g_pkts_ba`,
+  `reg_g_bytes_ba`); `global_delta` then has `pkts_ab`, `pkts_ba`, `bytes_ab`, `bytes_ba` and, as for `gtot`,
+  `pkts` and `bytes` (A→B + B→A). The generator's flow goes one way, so pipe 1's `pkts_ab` must grow by the
+  generated packets and `pkts_ba` by 0; pipe 0 counts the looped-back copies.
+- **Expected:** latency near `gtot`'s 319 ns (the compiler estimates 133 ingress cycles against 135); rates as
+  `basic_fix`.
+
+**9B. The sweep build: compile.** Copy `perf/variants/sweep` to the switch as the other variants, then:
+
+      perf/tools/sw_compile.sh SRC/sweep basic.p4 BUILD/basic_sweep
+      perf/tools/sw_compile.sh SRC/sweep basic.p4 BUILD/basic_sweep_ctrl -DP4_ENABLE_SWEEP=0 -DP4_FRAME_LEN=0
+
+- The second is `basic_gtot_ba`'s program from these sources: its resources must equal `basic_gtot_ba`'s. It checks
+  that the sweep's sources leave the data path alone.
+- For both, record ingress/egress stages, SRAM, map RAM, TCAM, stateful ALUs, the critical path and the latency
+  cycles, as in p4_perf section 5.6's table. If time allows, also `-DP4_ENABLE_SWEEP=0` alone (what `frame_len`
+  costs).
+- If the first fails because a register has two index sources (the data path's hash and the probe's MAC), compile
+  with `-DSWEEP_SHARED_INDEX=1` and say so. Any other failure: stop and report the message.
+
+**9C. A first replay.** Start the sweep build as `gtot` in part 4d (its switchd in `hz_sw`, then `run_bfrt.sh ...
+setup --ports 132,140 --fwd 132:140,140:132 --mirror-sid 1`). From the repo on PC1, with the first cohort capture's
+`anchor_us` and `execution_id` from its manifest:
+
+      python3 live_test/sweep_replay.py live_test/captures/cohort/CAPTURE --anchor-us A --execution-id ID \
+          --out perf/results/sweep_first --asroot ASROOT
+
+- `sweep_replay.py` copies `sweep_reader.py` to the switch and runs `--setup --reset --frame-min 10.0.0.10/32
+  --sweep-ports 132 --export-port 132`.
+  - The replay host's port 132 becomes the only probe port, and the exports come back out of it to `eth1`.
+  - tcpdump runs there as root and promiscuous, since the exports keep the probe's destination MAC.
+  - The replay carries the probes of the 41 window boundaries among the capture's frames.
+- `summary.json` lists `checks`:
+  - probes sent = the switch's probe count = the model's;
+  - exports captured = the switch's export count = the model's;
+  - 41 sweeps with consecutive numbers;
+  - in every window, the totals equal to the buckets' sum;
+  - no tcpdump drop, and no frame refused;
+  - the row equal to the model's in the 135 non-duration columns.
+- Then the same with `bulk2000` (`cohort-extra/manifest.csv` has its anchor). If a check fails, stop there and
+  report it.
+
+**9D. The generator (the deployment path).**
+
+      python3 live_test/sweep_generator_check.py --out perf/results/sweep_generator --asroot ASROOT
+
+- It starts the generator of pipe 1 (local port 68, app 0): 65,536 probes every 0.5 s, 2 µs apart, so a sweep takes
+  131 ms. Its port joins `sweep_ports`.
+- Midway it sends 200 known flows from `eth1` and checks the sweeps against the program's model (`summary.json`
+  `checks`):
+  - one record per sweep before the traffic;
+  - after it, every used bucket, with the model's registers and totals;
+  - probes = buckets × sweeps (the stop can cut the last sweep short; that sweep is then left out);
+  - the generator's packet counter = the switch's probe count;
+  - exports captured = the switch's export count;
+  - the sweeps one period apart on the switch's clock;
+  - the packets over all windows = the flows' packets.
+- Then, as information only: `--ipg-ns 0` (the generator's own rate: how long a sweep takes, and whether exports are
+  lost at port 132 or in tcpdump) and `--ipg-ns 500`.
+
+**9E. The sweep build's latency and line rate.**
+- As 9A: `make_hwl_sources.sh perf/variants/sweep OUT_DIR` for the latency, and the line-rate matrix with
+  `--global-totals` (the sweep build has the split totals).
+- Then two line-rate runs (1518 B and 64 B, paced at 100%) with the sweep's generator running beside the line-rate
+  app. Port 69 sends only while 68 is a generator port; here the sweep holds 68.
+
+      sweep_reader.py --setup --sweep-ports 132 --export-port 132
+      sweep_reader.py --generator start --pipes 1 --local-port 68 --app 0
+      sw_pktgen_run.py OUT_JSON --size 1518 --rate-pct 100 --first-local-port 69 --buffer-offset 4096 --global-totals
+      sweep_reader.py --state --pipes 1        # exports and probes so far
+      sweep_reader.py --generator stop --pipes 1
+
+- Expected: the same rates and losses as without the sweep. The totals count only the line-rate flow (probes are not
+  counted), and the sweep exports 2 records (bucket 0 and the flow's).
+
+**9F. Every capture.**
+
+      python3 live_test/run_sweep_replays.py perf/results/sweep_replays --asroot ASROOT
+
+- 107 captures, about an hour: the 77 cohort captures and 30 of `cohort-extra`. The bulk uploads are left out, as in
+  part 4. Calm captures first, then the floods, Chaos last.
+- A run with a `summary.json` is not repeated, so the batch can be restarted.
+- Expected from the model:
+  - the switch's row equal to the model's in all 135 non-duration columns in every run;
+  - the row equal to the published row in 103 of the 107. The 4 that differ are Chaos and the three SYN fan-outs,
+    whose flows share buckets.
+- `rows.csv` is the input of the VM's `score_switch_replay.py`; `runs.csv` has one line per run with its checks.
+
+**What comes back.**
+- The compile reports of every build, 9A's and 9E's latency builds included.
+- The latency runs (`packet_latencies.csv` and `summary.json` per run, as in parts 4d and 6) and the line-rate JSONs.
+- The run directories of 9C and 9D, without `exports.pcap` where it is large.
+- 9F's `rows.csv`, `runs.csv` and the runs' `summary.json`.
+- A "Results, part 9" section here.
+- State after: `basic_fix` running again, checked as in the earlier parts.
+
 ## Results, part 4 (PC1, 2026-11-15): 109 of the 110 captures through the Wedge
 
 **What ran.** p4_ebpf `eadb2ca`; release `live-validation` `3e7cb5f` (its `features/` is identical to `main`

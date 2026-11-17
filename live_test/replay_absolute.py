@@ -21,6 +21,13 @@ of sending the markers due by then at once. Inside hybrid_collector (--window-ma
 marker k at the start of collector window k: the anchor (--anchor-offset after the first frame) minus
 --align-window windows of --window-sec. Frames keep their times relative to the first capture frame.
 
+--probes changed|all (perf/variants/sweep): at each window boundary (--probe-anchor-us + k x --probe-window-us,
+k = 0..--probe-windows) the sweep's probes (EtherType 0x88B6, the bucket in the low 16 bits of the destination MAC,
+sweep_features.probe_frame), bucket 0 first, in order with the frames as the markers are: "changed" probes the
+buckets of the frames since the previous boundary (at boundary 0 those before it), "all" every bucket used so far.
+The program exports one record per probe of a used bucket (and every bucket-0 probe); a bucket left out by
+"changed" had no packet, so its registers are those of its last record (sweep_features.SweepWindows).
+
 Needs root (a raw packet socket). Frames the interface refuses (larger than its MTU) are counted
 as failed and skipped, as tcpreplay does. Prints one line of statistics at the end.
 """
@@ -35,6 +42,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from replay_capture import read_pcap  # noqa: E402
+
+PYDIR = Path(__file__).resolve().parents[1] / "thesis-hybrid-ebpf-p4" / "python"
 
 
 WINDOW_ETHERTYPE = 0x88B5
@@ -78,6 +87,29 @@ def with_markers(path, src_mac, anchor_us, window_us, windows, first_epoch):
     return events
 
 
+def with_probes(path, src_mac, anchor_us, window_us, windows, mode="changed"):
+    """[(seconds, frame, is_probe)] in sending order: the capture's frames and, at each window boundary, the sweep's
+    probes (perf/variants/sweep) before every frame at or after the boundary."""
+    if str(PYDIR) not in sys.path:
+        sys.path.insert(0, str(PYDIR))
+    import sweep_features as sf
+    frames = read_pcap_us(path)
+    plan = sf.probe_plan(frames, anchor_us, window_us, windows, mode)
+    probe = {}          # one frame object per bucket (a flood's plan holds over a million probes)
+    events, i = [], 0
+    for boundary, buckets in plan:
+        while i < len(frames) and frames[i][0] < boundary:
+            events.append((frames[i][0] / 1e6, frames[i][1], False))
+            i += 1
+        t = boundary / 1e6
+        for b in buckets:
+            if b not in probe:
+                probe[b] = sf.probe_frame(src_mac, b)
+            events.append((t, probe[b], True))
+    events.extend((t / 1e6, f, False) for t, f in frames[i:])
+    return events
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("capture")
@@ -94,19 +126,36 @@ def main():
     ap.add_argument("--marker-window-us", type=int, help="default: --window-sec")
     ap.add_argument("--marker-windows", type=int, default=40, help="windows: markers 0..N, the last one ends window N-1")
     ap.add_argument("--marker-first-epoch", type=int, default=1)
+    ap.add_argument("--probes", choices=("changed", "all"), help="send the sweep's probes at the window boundaries "
+                    "(perf/variants/sweep)")
+    ap.add_argument("--probe-anchor-us", type=int, help="the capture time of the first window's start (us; default: "
+                    "the anchor minus --align-window windows)")
+    ap.add_argument("--probe-window-us", type=int, help="default: --window-sec")
+    ap.add_argument("--probe-windows", type=int, default=40, help="windows: probes at boundaries 0..N")
     ap.add_argument("--send-log", help="write this host's clock just after each capture frame was sent, one line per "
                     "capture frame in order (\"-\" for a frame the interface refused); markers are not listed")
     args = ap.parse_args()
-    if args.markers:
-        window_us = args.marker_window_us or int(round(args.window_sec * 1e6))
-        anchor_us = args.marker_anchor_us
+    if args.markers and args.probes:
+        sys.exit("--markers (perf/variants/exact) or --probes (perf/variants/sweep), not both")
+    inband = bool(args.markers or args.probes)
+    if inband:
+        if args.markers:
+            window_us = args.marker_window_us or int(round(args.window_sec * 1e6))
+            anchor_us = args.marker_anchor_us
+        else:
+            window_us = args.probe_window_us or int(round(args.window_sec * 1e6))
+            anchor_us = args.probe_anchor_us
         if anchor_us is None:
             first = read_pcap_us(args.capture)[:1]
             if not first:
                 sys.exit("%s holds no frames" % args.capture)
             anchor_us = first[0][0] + int(round(args.anchor_offset * 1e6)) - args.align_window * window_us
         mac = bytes.fromhex(Path("/sys/class/net/%s/address" % args.iface).read_text().strip().replace(":", ""))
-        events = with_markers(args.capture, mac, anchor_us, window_us, args.marker_windows, args.marker_first_epoch)
+        if args.markers:
+            events = with_markers(args.capture, mac, anchor_us, window_us, args.marker_windows,
+                                  args.marker_first_epoch)
+        else:
+            events = with_probes(args.capture, mac, anchor_us, window_us, args.probe_windows, args.probes)
         frames = [(t, f) for t, f, _ in events]
         is_marker = [m for _, _, m in events]
     else:
@@ -125,12 +174,12 @@ def main():
     # times relative to the first capture frame (markers before it go out at once, in order)
     c0 = next((t for (t, _f), m in zip(frames, is_marker) if not m), frames[0][0])
     late_start = time.time() - start
-    if args.markers:
-        # late against the first event (the first marker comes before the first frame)
+    if inband:
+        # late against the first event (the first marker or probe comes before the first frame)
         late_start = time.time() - (start + (frames[0][0] - c0))
-    if late_start > 0 and args.markers:
-        # the windows are the markers' (perf/variants/exact): shift the whole schedule rather than send the markers
-        # due by now in one burst (a burst ends windows faster than the reader can read them)
+    if late_start > 0 and inband:
+        # the windows are the markers' (perf/variants/exact) or the probes' (sweep): shift the whole schedule rather
+        # than send the markers due by now in one burst (a burst ends windows faster than the reader can read them)
         start += late_start + 0.05
         print("[replay_absolute] started %.3f s after the requested start (loading the capture): the schedule, "
               "markers included, is shifted by %.3f s" % (late_start, late_start + 0.05), flush=True)
@@ -150,7 +199,7 @@ def main():
             sock.send(frame)
         except OSError:
             if marker:
-                sys.exit("[replay_absolute] the window marker could not be sent")
+                sys.exit("[replay_absolute] the window %s could not be sent" % ("probe" if args.probes else "marker"))
             failed += 1
             if sent_at is not None:
                 sent_at.append(None)
@@ -167,9 +216,10 @@ def main():
         with open(args.send_log, "w") as fh:
             fh.write("".join("-\n" if x is None else "%.6f\n" % x for x in sent_at))
     late.sort()
-    print("[replay_absolute] %d frames sent, %d failed, %d window markers, in %.2f s; lateness median %.3f ms, "
+    print("[replay_absolute] %d frames sent, %d failed, %d %s, in %.2f s; lateness median %.3f ms, "
           "p99 %.3f ms, max %.3f ms"
-          % (len(late), failed, markers_sent, frames[-1][0] - c0, statistics.median(late) * 1e3 if late else 0.0,
+          % (len(late), failed, markers_sent, "sweep probes" if args.probes else "window markers", frames[-1][0] - c0,
+             statistics.median(late) * 1e3 if late else 0.0,
              late[int(0.99 * (len(late) - 1))] * 1e3 if late else 0.0, late[-1] * 1e3 if late else 0.0), flush=True)
 
 

@@ -61,6 +61,10 @@ TIMER_NS = 1000
 MASK32 = (1 << 32) - 1
 # the one-entry global totals of the test build perf/variants/gtot (--global-totals)
 GLOBAL_TOTALS = ["reg_g_pkts", "reg_g_bytes", "reg_g_pkts_ab", "reg_g_bytes_ab", "reg_g_syn", "reg_g_ack", "reg_g_rst"]
+# its -DP4_GLOBAL_TOTALS_SPLIT=1 build (basic_gtot_ba, and perf/variants/sweep): B->A in place of the packet and
+# byte totals; "pkts" and "bytes" are then reported as A->B + B->A, as gtot's own registers count them
+GLOBAL_TOTALS_SPLIT = ["reg_g_pkts_ba", "reg_g_bytes_ba", "reg_g_pkts_ab", "reg_g_bytes_ab", "reg_g_syn", "reg_g_ack",
+                       "reg_g_rst"]
 # the window totals of perf/variants/exact (--window-totals): index {bank, found, dir_ab}, lo packets, hi bytes
 WINDOW_TOTALS = "reg_w_tot"
 
@@ -104,7 +108,9 @@ def main():
     ap.add_argument("--global-totals", action="store_true",
                     help="also count the seven one-entry totals of the test build perf/variants/gtot (reg_g_*, "
                          "cell 0, every pipe): pipe PIPE must grow by the generated packets, pipe 0 by the "
-                         "looped-back ones, the byte totals as the flow's reg_bytes (mod 2^32)")
+                         "looped-back ones, the byte totals as the flow's reg_bytes (mod 2^32). The split build "
+                         "(basic_gtot_ba, perf/variants/sweep: reg_g_pkts_ba and reg_g_bytes_ba) is found by its "
+                         "register names; its pkts and bytes are reported as A->B + B->A")
     ap.add_argument("--window-totals", action="store_true",
                     help="also count perf/variants/exact's window totals (reg_w_tot, all 8 cells, every pipe; no "
                          "markers, so all in window 0): pipe PIPE must grow by the generated packets, pipe 0 by "
@@ -126,6 +132,19 @@ def main():
         if "already owns" not in str(e) and "ALREADY_EXISTS" not in str(e):
             raise
         KW = {"p4_name": a.prog}
+    totals = []
+    if a.global_totals:
+        for names in (GLOBAL_TOTALS, GLOBAL_TOTALS_SPLIT):
+            try:
+                for name in names:
+                    info.table_get("pipe.Ingress." + name)
+            except Exception:
+                continue
+            totals = names
+            break
+        if not totals:
+            out["errors"].append("--global-totals: %s has neither gtot's nor basic_gtot_ba's totals" % a.prog)
+        out["global_totals"] = totals
     t_all = gc.Target(device_id=0, pipe_id=0xffff)
     t_pipe = gc.Target(device_id=0, pipe_id=a.pipe)
     port_cfg = info.table_get("$PKTGEN_PORT_CFG")
@@ -264,8 +283,8 @@ def main():
                 tbl = info.table_get("pipe.Ingress." + name)
                 d = get_dict(tbl, t_all, tbl.make_key([gc.KeyTuple("$REGISTER_INDEX", a.flow_index)]))
                 s[name] = [int(x) for x in d.get("Ingress.%s.f1" % name, [])]
-        if a.global_totals:
-            for name in GLOBAL_TOTALS:
+        if totals:
+            for name in totals:
                 tbl = info.table_get("pipe.Ingress." + name)
                 d = get_dict(tbl, t_all, tbl.make_key([gc.KeyTuple("$REGISTER_INDEX", 0)]))
                 s[name] = [int(x) for x in d.get("Ingress.%s.f1" % name, [])]
@@ -315,9 +334,13 @@ def main():
     if a.flow_index >= 0:
         out["reg_pkts_delta"] = [(x - y) & MASK32 for x, y in zip(after["reg_pkts"], before["reg_pkts"])]
         out["reg_bytes_delta"] = [(x - y) & MASK32 for x, y in zip(after["reg_bytes"], before["reg_bytes"])]
-    if a.global_totals:
+    if totals:
         out["global_delta"] = dict((name[len("reg_g_"):], [(x - y) & MASK32 for x, y in zip(after[name], before[name])])
-                                   for name in GLOBAL_TOTALS)
+                                   for name in totals)
+        if totals is GLOBAL_TOTALS_SPLIT:
+            g = out["global_delta"]
+            for k in ("pkts", "bytes"):
+                g[k] = [(x + y) & MASK32 for x, y in zip(g[k + "_ab"], g[k + "_ba"])]
     if a.window_totals:
         out["window_delta"] = dict((k, [(x - y) & MASK32 for x, y in zip(after[k], before[k])])
                                    for k in ("w_pkts", "w_bytes", "w_tracked"))

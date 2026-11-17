@@ -61,9 +61,11 @@ def run_reset_inner(bfrt):
     return out.getvalue().splitlines()
 
 
-# The registers of the two global-totals builds (perf/variants/gtot and its -DP4_GLOBAL_TOTALS_SPLIT=1 build)
-GTOT_BUILD = [n for n in reset_registers.REGISTERS if n not in ("reg_g_pkts_ba", "reg_g_bytes_ba")]
-GTOT_BA_BUILD = [n for n in reset_registers.REGISTERS if n not in ("reg_g_pkts", "reg_g_bytes")]
+# The registers of the two global-totals builds (perf/variants/gtot and its -DP4_GLOBAL_TOTALS_SPLIT=1 build), and of
+# perf/variants/sweep (basic_gtot_ba's registers without reg_newconn_dst, plus reg_sweep_seq)
+GTOT_BUILD = [n for n in reset_registers.REGISTERS if n not in ("reg_g_pkts_ba", "reg_g_bytes_ba", "reg_sweep_seq")]
+GTOT_BA_BUILD = [n for n in reset_registers.REGISTERS if n not in ("reg_g_pkts", "reg_g_bytes", "reg_sweep_seq")]
+SWEEP_BUILD = [n for n in reset_registers.REGISTERS if n not in ("reg_g_pkts", "reg_g_bytes", "reg_newconn_dst")]
 
 
 class ResetScriptTests(unittest.TestCase):
@@ -72,7 +74,7 @@ class ResetScriptTests(unittest.TestCase):
         self.assertFalse([n for n in ast.walk(tree) if isinstance(n, ast.JoinedStr)])
 
     def test_clears_and_checks_every_register(self):
-        for build in (GTOT_BUILD, GTOT_BA_BUILD):
+        for build in (GTOT_BUILD, GTOT_BA_BUILD, SWEEP_BUILD):
             bfrt, regs = fake_bfrt(build)
             lines = run_reset_inner(bfrt)
             self.assertTrue(all(r.cleared for r in regs.values()))
@@ -80,27 +82,30 @@ class ResetScriptTests(unittest.TestCase):
             self.assertTrue(lines[-1].startswith("[RESET-OK] 22 registers cleared"))
         self.assertIn("[RESET-SKIP] reg_g_pkts is not in this build", lines)
         self.assertIn("[RESET] reg_g_pkts_ba", "\n".join(lines))
+        self.assertIn("[RESET] reg_sweep_seq", "\n".join(lines))
 
     def test_a_build_without_a_register_skips_it(self):
-        # the deployed basic_fix: no reg_newconn_dst, no global totals
+        # the deployed basic_fix: no reg_newconn_dst, no global totals, no sweep
         bfrt, regs = fake_bfrt([n for n in reset_registers.REGISTERS
-                                if n != "reg_newconn_dst" and not n.startswith("reg_g_")])
+                                if n not in ("reg_newconn_dst", "reg_sweep_seq") and not n.startswith("reg_g_")])
         lines = run_reset_inner(bfrt)
         self.assertIn("[RESET-SKIP] reg_newconn_dst is not in this build", lines)
         self.assertIn("[RESET-SKIP] reg_g_pkts is not in this build", lines)
         self.assertTrue(lines[-1].startswith("[RESET-OK] 14 registers cleared"))
 
     def test_the_one_entry_global_totals_are_checked_at_cell_0_only(self):
-        # perf/variants/gtot: reading cell 1 of a one-entry register fails on the switch
-        bfrt, regs = fake_bfrt(GTOT_BUILD)
-        for name, reg in regs.items():
-            if name.startswith("reg_g_"):
+        # perf/variants/gtot: reading cell 1 of a one-entry register fails on the switch; reg_sweep_seq likewise
+        for build in (GTOT_BUILD, SWEEP_BUILD):
+            bfrt, regs = fake_bfrt(build)
+            one = [n for n in regs if n.startswith("reg_g_") or n == "reg_sweep_seq"]
+            for name in one:
+                reg = regs[name]
                 reg.cells = {0: [5, 9]}
                 reg.get = (lambda r: lambda REGISTER_INDEX, from_hw, print_ents: (
                     [Entry(r.name, list(r.cells.get(0, [0, 0])))] if REGISTER_INDEX == 0 else 1 / 0))(reg)
-        lines = run_reset_inner(bfrt)
-        self.assertTrue(lines[-1].startswith("[RESET-OK] 22 registers cleared"), lines[-3:])
-        self.assertTrue(all(regs[n].cleared for n in regs if n.startswith("reg_g_")))
+            lines = run_reset_inner(bfrt)
+            self.assertTrue(lines[-1].startswith("[RESET-OK] 22 registers cleared"), lines[-3:])
+            self.assertTrue(all(regs[n].cleared for n in one))
 
     def test_a_register_that_is_not_zero_after_clear_fails(self):
         bfrt, _ = fake_bfrt(reset_registers.REGISTERS, broken={"reg_dir_valid"})

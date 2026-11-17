@@ -30,9 +30,11 @@ REGISTERS = ["reg_pkts", "reg_bytes", "reg_pkts_ab", "reg_bytes_ab", "reg_ref_sr
              # the one-entry global totals of the test build perf/variants/gtot (skipped where absent)
              "reg_g_pkts", "reg_g_bytes", "reg_g_pkts_ab", "reg_g_bytes_ab", "reg_g_syn", "reg_g_ack", "reg_g_rst",
              # its -DP4_GLOBAL_TOTALS_SPLIT=1 build (basic_gtot_ba): B->A in place of reg_g_pkts and reg_g_bytes
-             "reg_g_pkts_ba", "reg_g_bytes_ba"]
+             "reg_g_pkts_ba", "reg_g_bytes_ba",
+             # the sweep number of perf/variants/sweep (one entry)
+             "reg_sweep_seq"]
 # Cells read back after each clear (the flow and destination registers have 65,536 buckets; the one-entry
-# reg_g_* only cell 0).
+# reg_g_* and reg_sweep_seq only cell 0).
 CHECK_INDEXES = [0, 1, 32767, 65535]
 
 # Runs inside bfrt_python: SDE 9.6 embeds Python 3.4 (no f-strings) and runs a
@@ -70,7 +72,7 @@ def _reset_registers_main():
         t = time.time()
         reg.clear()
         bfrt.complete_operations()
-        idxs = [0] if name.startswith("reg_g_") else check
+        idxs = [0] if (name.startswith("reg_g_") or name == "reg_sweep_seq") else check
         left = [idx for idx in idxs if any(cell(reg, idx))]
         if left:
             print("[RESET-FAIL] %s is not zero at %s after clear()" % (name, left))

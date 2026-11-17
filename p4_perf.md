@@ -807,6 +807,23 @@ and no flow should go unread under a flood. **Where the remaining errors came fr
     come 19 ms late.
 - The switch runs `basic_fix` again (checked with a replay, 9 of 9 packets).
 
+### 5.8 The bucket table read by the data plane (build `sweep`, 17 November, offline only)
+
+- **Idea.** Section 5.7's gap analysis (`perf/results/exact_gap_analysis`, perfect reads and cuts) gives the bucket
+  table, read in full at each window boundary and with the frame minimum counted, the same parity as the exact
+  build: 106 of the 110 captures equal to the published row in the 135 non-duration columns, the same 4 floods
+  failing. The exact build's gain comes from reading every flow at the boundary, not from its 4-way table. So
+  `perf/variants/sweep` keeps `basic_gtot_ba`'s bucket table and adds a probe path: a probe names one bucket and
+  leaves as a 104-byte record of its 14 registers (bucket 0 also the seven totals and a sweep number). A sweep of
+  probes at each boundary, from the packet generator or in band from a replay host, replaces the control plane's
+  ~500 reads per 0.5 s window. Design: `perf/variants/sweep/README.md` and `ingress.p4`'s header comment.
+- **Offline** (`live_test/sweep_offline_check.py`, the program's software model `sweep_features.SweepModel` with
+  in-band probes, all 110 captures): 106 of 110 rows equal to the published row in the 135 non-duration columns,
+  all 101 calm captures among them; the 4 others are Chaos and the three SYN fan-outs. In every window the totals
+  equal the buckets' sum. 475,839 probes in all, one per bucket changed since the previous boundary.
+- **Not measured yet:** compile, resources, latency, line rate, and the replays on the switch. PC1.md part 9 has the
+  steps, together with `basic_gtot_ba`'s missing latency and line-rate runs.
+
 ## 6. Switch CPU side
 
 These two measurements cover the switch CPU and its driver, not the P4 program. The P4
