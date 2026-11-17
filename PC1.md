@@ -1932,3 +1932,98 @@ with `--send-log`):
 - **Check:** the first cohort capture gave 9 of 9 packets and 40 of 40 windows inside the bounds
   (`exact_timer_collector_20261116/restored_check/`, with `enp5s0` up for it); `enp5s0` down.
 - **Archive:** `live_test/committee_replay/pc1_20261116_exact_timer_collector.tar.xz` (runs, checks, scripts).
+
+## Results, part 9 (PC1, 2026-11-17): basic_gtot_ba measured; the sweep build does not compile
+
+The user pulled `0476a0a` and asked to run part 9. Results in `perf/results/part9_20261117/` (git-ignored); archive
+`live_test/committee_replay/pc1_20261117_part9.tar.xz` (compile reports, latency runs, line-rate JSONs, scripts).
+- **Done:** 9A (latency and line rate of `basic_gtot_ba`) and 9B's control builds.
+- **Stopped at 9B:** the sweep build fails table placement, with and without `-DSWEEP_SHARED_INDEX=1`. 9C-9F need
+  that build, so they did not run. Nothing was rerun silently: every compile is listed below.
+
+**9A, latency** (part 4d's `hwl_runs.sh` with `basic_hwl_gtot_ba` in place of `basic_hwl_gtot`: hairpin, 1010 probes,
+10 warm-up probes excluded, 3 runs per program, all on the same day; every run 1010 of 1010 reports, none missing or
+malformed; `latency/`):
+
+| Program | min | median | mean | p99 | max (ns) |
+|---|---|---|---|---|---|
+| Baseline | 244 | 246 | 245.62–245.64 | 247 | 247–248 |
+| basic_fix | 314 | 315 | 315.36–315.41 | 318–319 | 319–320 |
+| basic_gtot_ba | 316 | 317 | 317.02–317.06 | 320–321 | 322 |
+
+- **As expected:** 2 ns over `basic_fix` and 2 ns under `gtot`'s 319 ns (part 4d), the compiler's 133 against 135
+  ingress cycles.
+- **Same-day controls:** the baseline and `basic_fix` give part 4d's values to the nanosecond.
+- **The latency build** (`make_hwl_sources.sh perf/variants/gtot`, compiled with `-DP4_GLOBAL_TOTALS_SPLIT=1`) has
+  6/2 stages and 133/172 cycles. The current `perf/variants/gtot` sources are byte for byte those of the switch's
+  `basic_gtot_ba` build.
+
+**9A, line rate** (part 4d's 27-run matrix, 10 s each, `--flow-index 44993 --global-totals`; `linerate_gtot_ba/`,
+`summarize.py` with one check added: B→A stays 0):
+
+| Frame (B) | Paced, basic_gtot_ba (3 runs) | Paced, basic_fix (31 Oct) | Saturating: offered / sent |
+|---|---|---|---|
+| 64 | 91.09% / 91.09% / 91.09% (generator maximum) | 91.09% | – |
+| 128 | 99.88% / 99.88% / 99.88% | 99.88% | 111% / 100.00% |
+| 256 | 99.89% / 99.89% / 99.89% | 99.89% | 128% / 100.00% |
+| 512 | 99.87% / 99.87% / 99.87% | 99.87% | 140% / 100.00% |
+| 1024 | 99.90% / 99.89% / 99.89% | 99.90% / 99.90% / 99.89% | 148% / 100.00% |
+| 1280 | 99.88% / 99.88% / 99.88% | 99.88% / 99.88% / 99.89% | 149% / 100.00% |
+| 1518 | 99.88% / 99.89% / 99.88% | 99.88% | 150% / 100.00% |
+
+- **Rates:** the same as `basic_fix` within 0.01 points. Lossless when paced and at 64 B. When saturating, the TM
+  dropped exactly the excess.
+- **Totals, 0 checks failed in 27 runs (13.1 billion packets):** pipe 1's `pkts_ab` = generated, pipe 0's = looped
+  back, `pkts_ba` = `bytes_ba` = 0, the byte totals as the flow's `reg_bytes` (mod 2³²), no TCP flags.
+- **The switch's tool:** `sw_pktgen_run.py` there was replaced by `0476a0a`'s, which finds the split registers.
+  The old copy is kept as `sw_pktgen_run.py.8ed5ffa`.
+
+**9B, compile** (bf-p4c 9.6.0 on the switch, `sw_compile.sh`; `builds/`, table `builds/resources.md`):
+
+| Build | Flags | Result | Stages ig/eg | SRAM | TCAM | Stateful ALUs | Latency ig/eg (cycles) |
+|---|---|---|---|---|---|---|---|
+| basic_gtot_ba (16 Nov, reference) | `-DP4_GLOBAL_TOTALS_SPLIT=1` (gtot) | ok | 6/1 | 211 | 3 | 21 | 133/170 |
+| basic_sweep_ctrl | `-DP4_ENABLE_SWEEP=0 -DP4_FRAME_LEN=0` | ok | 6/1 | 211 | 3 | 21 | 133/170 |
+| basic_sweep_noprobe | `-DP4_ENABLE_SWEEP=0` (`frame_len` only) | ok | 6/1 | 212 | 5 | 21 | 133/170 |
+| basic_sweep | – | **failed** (exit 3, 71 s) | | | | | |
+| basic_sweep_si | `-DSWEEP_SHARED_INDEX=1` | **failed** (exit 3, 71 s) | | | | | |
+| basic_hwl_sweep, basic_hwl_sweep_si | latency builds (9E), with and without the flag | **failed** (exit 3) | | | | | |
+
+- **The control check passes:** `basic_sweep_ctrl` equals `basic_gtot_ba` in every resource of the table, PHV
+  included. So the sweep's sources leave the data path alone.
+- **`frame_len`** costs 1 SRAM, 2 TCAM and 1 logical table, and no cycles.
+- **The error**, the same in all four failed builds:
+
+      error: Table placement cannot make any more progress.  Though some tables have not yet been placed,
+      dependency analysis has found that no more tables are placeable.  This may be due to shared attachments on
+      partly placed tables; may be able to avoid the problem with @stage on those tables
+
+- **Why** (from `pipe/logs/table_placement_7.log`): 46 tables stay unplaced, the same 46 with and without
+  `-DSWEEP_SHARED_INDEX=1`. So the two index sources were not the cause.
+  - A register sits in one stage, with every table that uses it. In the probe branch every register gets a second
+    table.
+  - The partly placed tables are the probe's reads of `reg_g_pkts_ab`, `reg_g_bytes_ab`, `reg_g_pkts_ba`,
+    `reg_g_bytes_ba`, `reg_g_syn` and `reg_g_rst`, plus the data path's `reg_pkts` and `reg_ack`.
+  - The probe's reads of the totals depend on nothing, so they were placed in stages 2-3. The data path updates
+    the packet and byte totals after its direction logic: stage 4 in `basic_gtot_ba`, where those four registers
+    take all four stateful ALUs.
+  - Placement then cannot go on.
+- **Possible fixes (not tried, a P4 change):**
+  - Pin each probe read to its register's data-path stage with `@stage`. `basic_gtot_ba`'s placement is in
+    `builds/resources.md`.
+  - Or give each register one RegisterAction for both paths (update, or read on a probe) on a shared index, so
+    no register has a second table.
+
+**Also run:**
+- **Unit tests** (`python3 -m unittest discover -s tests`, Python 3.8.10): 238 run, 8 skipped, the one known
+  error (`test_sockjoin`: the release's `dict | dict` needs Python 3.9). The new `test_sweep.py` (24) and
+  `test_window_timer.py` pass.
+- **A slip of mine, no effect on the results:** the first compile batch gave `sw_compile.sh` relative paths, and
+  nothing was built. Its empty output directories were removed, and the batch was rerun with absolute paths.
+
+**State after:**
+- **Switch:** `basic_fix` running again (pid 9715), ports and forwarding from `setup_basic_fix_restored/`.
+- **Check:** the first cohort capture gave 9 of 9 packets (666 of 666 bytes) and 40 of 40 windows inside the
+  bounds (`restored_check/`, with `enp5s0` up for it); `enp5s0` down.
+- **On the switch:** sources in `/root/hazim_perf/src/{basic_sweep,basic_hwl_gtot_ba,basic_hwl_sweep}`, builds in
+  `/root/hazim_perf/build/`, failed ones included.

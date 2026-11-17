@@ -586,8 +586,8 @@ counts in the 40 dataset windows in all 109 runs. The calm captures match the pu
 columns. The seven registers are read one after another, ~0.4 ms apart, so in a flood B→A = total − A→B
 picked up packets that were never sent (6–26 in six floods). `-DP4_GLOBAL_TOTALS_SPLIT=1` (build
 `basic_gtot_ba`, PC1.md part 4f) counts B→A in place of the packet and byte totals. It uses the same seven registers,
-6 stages and 21 stateful ALUs; the compiler estimates 133 ingress cycles against 135; latency and line rate were not
-measured. On it the six floods have no such packets, and they match 29–83 of the 95 columns instead of 16–37.
+6 stages and 21 stateful ALUs; the compiler estimates 133 ingress cycles against 135. Latency and line rate were
+measured on 17 November (at the end of this section): median 317 ns, the same rates as `basic_fix`. On it the six floods have no such packets, and they match 29–83 of the 95 columns instead of 16–37.
 PC1.md part 4g reran all 109 captures on `basic_gtot_ba`. Every packet counts, and no window has more A→B
 packets than packets in all. The calm captures' B→A sum equals the published rows' (78,400). The mean over the
 109 is 77.8 of the 95 columns, against 76.3 on `gtot` and 73.1 on `basic_fix`. The thesis replay rows come from
@@ -644,6 +644,25 @@ this build. Between runs the switch runs `basic_fix`.
   - **Wrap:** at 99.9 Gbps a 32-bit byte total wraps every 0.34 s; the collector's 0.5 s windows would see an
     ambiguous difference above ~69 Gbps per pipe (Section 5.6 is a test build for the dataset's traffic).
 - The switch runs `basic_fix` again (checked with a replay, 9 of 9 packets).
+- **`basic_gtot_ba`, measured 17 November** (PC1.md part 9A; `perf/results/part9_20261117/`, archive
+  `live_test/committee_replay/pc1_20261117_part9.tar.xz`). The same method, with the baseline and `basic_fix` of
+  the same day:
+
+  | Program | Stages ig/eg | Latency ig/eg (cycles) | min | median | mean | p99 | max (ns) |
+  |---|---|---|---|---|---|---|---|
+  | Baseline | 1/2 | 56/172 | 244 | 246 | 245.62–245.64 | 247 | 247–248 |
+  | basic_fix (detector without the counter) | 5/2 | 131/172 | 314 | 315 | 315.36–315.41 | 318–319 | 319–320 |
+  | basic_gtot_ba (`gtot -DP4_GLOBAL_TOTALS_SPLIT=1`) | 6/2 | 133/172 | 316 | 317 | 317.02–317.06 | 320–321 | 322 |
+
+  - **The split totals cost 2 ns over `basic_fix`** (median 317 vs 315 ns), 2 ns less than `gtot`'s 319: the
+    compiler's 133 against 135 ingress cycles. Every run had 1010 of 1010 reports; the baseline and `basic_fix`
+    reproduce the values above to the nanosecond.
+  - **Line rate:** the same 27-run matrix with `sw_pktgen_run.py --global-totals` (which now reads the split
+    registers): the same rates as `basic_fix` within 0.01 points, lossless, the totals exact for 13.1 billion
+    packets (pipe 1's `pkts_ab` = generated, pipe 0's = looped back, `pkts_ba` and `bytes_ba` 0: one flow, one
+    direction).
+  - **Uninstrumented build** (`perf/results/part9_20261117/builds/`): 6/1 stages, 211 SRAM, 210 map RAM,
+    21 stateful ALUs, 133/170 cycles, the same RAMs and ALUs as `gtot`.
 
 ### 5.7 Window features in the data plane (build `exact`, 16 November, tested on the switch)
 
@@ -807,7 +826,7 @@ and no flow should go unread under a flood. **Where the remaining errors came fr
     come 19 ms late.
 - The switch runs `basic_fix` again (checked with a replay, 9 of 9 packets).
 
-### 5.8 The bucket table read by the data plane (build `sweep`, 17 November, offline only)
+### 5.8 The bucket table read by the data plane (build `sweep`, 17 November, offline only; does not compile yet)
 
 - **Idea.** Section 5.7's gap analysis (`perf/results/exact_gap_analysis`, perfect reads and cuts) gives the bucket
   table, read in full at each window boundary and with the frame minimum counted, the same parity as the exact
@@ -823,6 +842,16 @@ and no flow should go unread under a flood. **Where the remaining errors came fr
   equal the buckets' sum. 475,839 probes in all, one per bucket changed since the previous boundary.
 - **Not measured yet:** compile, resources, latency, line rate, and the replays on the switch. PC1.md part 9 has the
   steps, together with `basic_gtot_ba`'s missing latency and line-rate runs.
+- **Compile (17 November, PC1.md "Results, part 9"):** bf-p4c 9.6.0 fails table placement on the sweep build ("Table
+  placement cannot make any more progress ... This may be due to shared attachments on partly placed tables; may be
+  able to avoid the problem with @stage on those tables"). `-DSWEEP_SHARED_INDEX=1` fails the same way, with the
+  same 46 tables unplaced, and so do both latency builds. The probe branch reads every register the data path
+  updates, and a register sits in one stage with all tables that use it. The probe's reads of the totals have no
+  dependency and are placed in stages 2-3, while the data path updates them after its direction logic (stage 4 in
+  `basic_gtot_ba`, whose four packet and byte totals fill that stage's four stateful ALUs). So the index source was
+  not the cause. The control build (`-DP4_ENABLE_SWEEP=0 -DP4_FRAME_LEN=0`) has exactly `basic_gtot_ba`'s
+  resources. `frame_len` alone (`-DP4_ENABLE_SWEEP=0`) adds 1 SRAM, 2 TCAM and 1 logical table, and no cycles
+  (133/170).
 
 ## 6. Switch CPU side
 

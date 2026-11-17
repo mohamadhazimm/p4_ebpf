@@ -5,8 +5,11 @@ with `-DP4_GLOBAL_TOTALS_SPLIT=1`), whose registers the data plane reads itself.
 picks up its 14 registers and leaves the switch as an export record. A sweep of probes at each window boundary gives
 the state of every bucket at that boundary, so no window depends on how many buckets the control plane can read.
 
-**Status (2026-11-17): written and checked offline only.** It has not been compiled (no bf-p4c here) or run on the
-switch. `PC1.md` part 9 has the steps.
+**Status (2026-11-17): written and checked offline only.** It has not run on the switch. `PC1.md` part 9 has the
+steps. **On the Wedge's bf-p4c 9.6.0 it does not compile yet**: table placement fails, with and without
+`-DSWEEP_SHARED_INDEX=1`, because the probe's reads and the data path's updates of the same registers want
+different stages (`PC1.md` "Results, part 9"; `p4_perf.md` 5.8). The control build (`-DP4_ENABLE_SWEEP=0
+-DP4_FRAME_LEN=0`) compiles to exactly `basic_gtot_ba`'s resources.
 
 ## Why this design
 
