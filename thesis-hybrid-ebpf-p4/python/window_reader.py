@@ -204,7 +204,9 @@ class Program(object):
 
 TIMER_ETHERTYPE = 0x88B6
 TIMER_APP = 0
-TRIGGER = "$PKTGEN_TRIGGER_TIMER_PERIODIC"
+# the generator's tables and periodic-timer action: SDE 9.6 names, then SDE 9.13 (open-p4studio)
+PKTGEN_TABLES = [("$PKTGEN_PORT_CFG", "$PKTGEN_APPLICATION_CFG", "$PKTGEN_PKT_BUFFER", "$PKTGEN_TRIGGER_TIMER_PERIODIC"),
+                 ("tf1.pktgen.port_cfg", "tf1.pktgen.app_cfg", "tf1.pktgen.pkt_buffer", "trigger_timer_periodic")]
 
 
 class WindowTimer(object):
@@ -220,9 +222,16 @@ class WindowTimer(object):
         self.pipes, self.period_ns, self.enabled = [], None, False
 
     def _tables(self):
+        """port_cfg, app_cfg, pkt_buffer under this SDE's names; sets self.trigger (the periodic-timer action)."""
         t = self.prog.table
-        return t("$PKTGEN_PORT_CFG", prefix=""), t("$PKTGEN_APPLICATION_CFG", prefix=""), \
-            t("$PKTGEN_PKT_BUFFER", prefix="")
+        for port, app, buf, trigger in PKTGEN_TABLES:
+            try:
+                tables = t(port, prefix=""), t(app, prefix=""), t(buf, prefix="")
+            except Exception:
+                continue
+            self.trigger = trigger
+            return tables
+        raise RuntimeError("no packet generator tables (%s)" % " or ".join(n[0] for n in PKTGEN_TABLES))
 
     def _pipe(self, p):
         return self.prog.gc.Target(device_id=self.prog.device_id, pipe_id=p)
@@ -250,7 +259,7 @@ class WindowTimer(object):
             gc.DataTuple("batch_count_cfg", 0), gc.DataTuple("packets_per_batch_cfg", 0),
             gc.DataTuple("ibg", 0), gc.DataTuple("ibg_jitter", 0), gc.DataTuple("ipg", 0), gc.DataTuple("ipg_jitter", 0),
             gc.DataTuple("batch_counter", 0), gc.DataTuple("pkt_counter", 0), gc.DataTuple("trigger_counter", 0)],
-            TRIGGER)
+            self.trigger)
         for p in pipes:
             k_port = port_cfg.make_key([gc.KeyTuple("dev_port", 128 * p + self.local_port)])
             port_cfg.entry_mod(prog.target, [k_port], [port_cfg.make_data([gc.DataTuple("pktgen_enable", bool_val=True)])],
@@ -272,7 +281,7 @@ class WindowTimer(object):
             raise RuntimeError("the window timer is not prepared")
         _, app_cfg, _ = self._tables()
         k_app = app_cfg.make_key([gc.KeyTuple("app_id", TIMER_APP)])
-        d_on = app_cfg.make_data([gc.DataTuple("app_enable", bool_val=True)], TRIGGER)
+        d_on = app_cfg.make_data([gc.DataTuple("app_enable", bool_val=True)], self.trigger)
         t0 = time.time()
         after = []
         for p in self.pipes:
@@ -290,12 +299,16 @@ class WindowTimer(object):
         pipes = self.pipes if pipes is None else pipes
         if not pipes:
             return {"timer_stopped": []}
-        port_cfg, app_cfg, _ = self._tables()
+        try:
+            port_cfg, app_cfg, _ = self._tables()
+        except RuntimeError as error:
+            log("window timer: %s: nothing to stop" % error)
+            return {"timer_stopped": []}
         k_app = app_cfg.make_key([gc.KeyTuple("app_id", TIMER_APP)])
         for p in pipes:
             try:
                 app_cfg.entry_mod(self._pipe(p), [k_app], [app_cfg.make_data(
-                    [gc.DataTuple("app_enable", bool_val=False)], TRIGGER)], **prog.kw(app_cfg.entry_mod))
+                    [gc.DataTuple("app_enable", bool_val=False)], self.trigger)], **prog.kw(app_cfg.entry_mod))
             except Exception as error:
                 if "not found" not in str(error).lower() and "not_found" not in str(error).lower():
                     log("window timer: disabling the app of pipe %d: %s" % (p, str(error).splitlines()[0][:200]))
