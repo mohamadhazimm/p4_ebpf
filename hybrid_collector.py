@@ -2412,6 +2412,7 @@ def collect_windows_sweep(
     timing_path: Optional[str] = None,
     clock: Any = None,
     start_timeout: float = 120.0,
+    keep_records: bool = False,
 ) -> List[Dict[str, object]]:
     """The windows of perf/variants/sweep (--switch-program sweep). Sweep k is the switch's k-th sweep since the
     reset (its reg_sweep_seq): sweep 1 is the state at the start of window 0, sweep w + 2 the state at its end,
@@ -2428,9 +2429,13 @@ def collect_windows_sweep(
     of the first (inband_shift_s in the timing file); the windows are the probes' either way.
 
     max_windows: exactly that many windows, then stop_fn() (as collect_windows_live). Otherwise windows continue
-    until the scenario has ended and drain_seconds have passed. timing_path: one JSON line per window."""
+    until the scenario has ended and drain_seconds have passed. timing_path: one JSON line per window.
+    keep_records (--sockowner): each window keeps the records of the buckets that changed in its sweep
+    ("sweep_records", sweep_features.compact tuples) and the sweep's clock ("sweep_clock": the first record's
+    arrival on this host and its switch time); window 0 also the first sweep's records ("sweep_base",
+    "sweep_base_clock"). sweep_socket_join() computes the socket-level join from them after the run."""
     sys.path.insert(0, SWEEP_PYDIR)
-    from sweep_features import SweepWindows, group_sweeps
+    from sweep_features import SweepWindows, compact, group_sweeps
     clk = clock if clock is not None else time
     sw = SweepWindows(window_sec=window_sec, header=header)
     timing = open(timing_path, "a") if timing_path else None
@@ -2461,6 +2466,8 @@ def collect_windows_sweep(
     base = wait_sweep(1, global_t0, max(sweep_timeout, start_timeout) if inband else None)
     shift = max(0.0, base["host_first"] - global_t0) if inband else 0.0
     sw.add(base)
+    base_kept = ([compact(rec) for rec in base["buckets"].values()], [base["host_first"], base["t_first"]]) \
+        if keep_records else None
     w = 0
     ended_at: Optional[float] = None
     try:
@@ -2474,6 +2481,11 @@ def collect_windows_sweep(
                 "indexes": [], "report_count": 0, "index_mismatches": 0, "cleared_indexes": [],
                 "report_aggregates": dict(REPORT_ZERO), "exact_features": sweep_summary(feats, duration_unit),
             }
+            if keep_records:
+                win["sweep_records"] = [compact(sweep["buckets"][i]) for i in sw.last_changed]
+                win["sweep_clock"] = [sweep["host_first"], sweep["t_first"]]
+                if w == 0:
+                    win["sweep_base"], win["sweep_base_clock"] = base_kept
             windows.append(win)
             if timing is not None:
                 rec = {"window": w, "t_window_end": boundary, "seq": sweep["seq"], "records": sweep["records"],
@@ -2975,13 +2987,113 @@ def socket_join_rows(args, run_id: str, cgroup_path: Optional[Path], global_t0: 
               "join may miss flows")
     cgroup_id = os.stat(cgroup_path).st_ino if cgroup_path is not None else 0
     table = sockjoin.OwnerTable(log)
-    joined = sockjoin.socket_join_windows(net_windows, table, sockjoin.Selector(cgroup_ids={cgroup_id}),
-                                          global_t0, monotonic_minus_wall_ns)
+    selector = sockjoin.Selector(cgroup_ids={cgroup_id})
+    if net_windows and "sweep_records" in net_windows[0]:
+        summaries = sweep_socket_join(net_windows, table, selector, monotonic_minus_wall_ns, args.window_sec,
+                                      header=ETHERNET_HEADER_BYTES if args.byte_layer == "frame" else 0,
+                                      duration_unit=args.duration_unit)
+        print(f"[INFO] socket-level join (sweep build): cgroup {cgroup_id}, "
+              f"{summaries[-1]['net_sock_owned_buckets'] if summaries else 0} owned buckets, "
+              f"{sum(1 for x in summaries if x['net_sock_shared_active'])} windows with a bucket shared with another "
+              f"execution, {summaries[-1]['net_sock_hidden_flows'] if summaries else 0} of its flows in another "
+              f"flow's bucket")
+        return [dict(row, join="socket") for row in build_rows(args, run_id, host_windows, net_windows, summaries)]
+    joined = sockjoin.socket_join_windows(net_windows, table, selector, global_t0, monotonic_minus_wall_ns)
     owned = sum(len(w["owned_indexes"]) for w in joined)
     print(f"[INFO] socket-level join: cgroup {cgroup_id}, {owned} owned bucket-windows over {len(joined)} windows")
     summaries = build_net_summaries(joined, args.window_sec, byte_layer=args.byte_layer,
                                     duration_unit=args.duration_unit)
     return [dict(row, join="socket") for row in build_rows(args, run_id, host_windows, joined, summaries)]
+
+
+# --switch-program sweep with --sockowner: the socket-level join's own columns (sweep_socket_join)
+SWEEP_SOCK_KEYS = ["net_sock_owned_buckets", "net_sock_shared_active", "net_sock_hidden_flows"]
+# the sweep's own checks, taken from the window-level row (they describe the sweep, not a selection of it)
+SWEEP_WINDOW_KEYS = ["net_sweep_totals_mismatch", "net_sweep_buckets", "net_sweep_span_us"]
+
+
+def sweep_socket_join(net_windows: List[Dict[str, object]], table: Any, selector: Any, monotonic_minus_wall_ns: int,
+                      window_sec: float, header: int = ETHERNET_HEADER_BYTES, duration_unit: str = "s",
+                      slack_ns: int = 50_000_000, bucket_of: Optional[Callable[..., int]] = None,
+                      ) -> List[Dict[str, object]]:
+    """The socket-level join on perf/variants/sweep: each window's network columns from the buckets whose flow
+    belongs to the selected execution only.
+
+    The sweep build sends no CPU report, so the 5-tuple of a bucket comes from this host's sockets
+    (sockjoin.BucketOwners): the local 5-tuple that the switch hashes to the bucket and that has the bucket's
+    reference ports. Its owner is looked up as of the bucket's cut in that window, on sockowner's clock: the
+    first record's arrival on this host (sweep_clock) plus the bucket's probe time after it (its switch time),
+    plus monotonic_minus_wall_ns. Owners are decided again whenever a bucket changes (a new sighting comes with a
+    packet). The features are sweep_features.SweepWindows(select=...) over the records the collector kept
+    (collect_windows_sweep keep_records): the same as over whole sweeps, because a bucket without a packet adds
+    nothing. With a selector that owns every bucket the rows are the window-level rows.
+
+    Besides NET_ZERO and SWEEP_EXTRA_KEYS (the collision columns of the owned buckets only; the totals check, the
+    records and the span of the whole sweep, as in the window-level row), each window has:
+      net_sock_owned_buckets   buckets that belong to the execution so far
+      net_sock_shared_active   active buckets whose local 5-tuples belong to the execution and to another (its
+                               own flows mixed with another execution's in one bucket)
+      net_sock_hidden_flows    the execution's 5-tuples seen so far whose bucket holds another flow (ports that
+                               are not the bucket's): their packets count for that flow's owner, not for it
+    Loopback 5-tuples are left out of the last two (they never cross the switch)."""
+    sys.path.insert(0, SWEEP_PYDIR)
+    import sockjoin
+    from sweep_features import M32, SweepWindows, expand
+    if bucket_of is None:
+        from flow_index import compute_flow_index as bucket_of
+    owners = sockjoin.BucketOwners(table, bucket_of)
+    owns = lambda s: selector.owns(table, s)                                    # noqa: E731
+    own_keys = [k for k in owners.bucket_by_key
+                if not (k[1][0].startswith(sockjoin.LOOPBACK_PREFIX) or k[2][0].startswith(sockjoin.LOOPBACK_PREFIX))]
+    own_keys = [(owners.first_seen_ns(k), k) for k in own_keys if owns(table.owner(k))]
+    own_keys.sort()
+    sw = SweepWindows(window_sec=window_sec, header=header)
+    owned: Dict[int, bool] = {}
+
+    def decide(records: List[Dict[str, Any]], clock: List[float]) -> None:
+        host_first, t_first = float(clock[0]), int(clock[1])
+        for rec in records:
+            cut_wall = host_first + ((int(rec["t"]) - t_first) & M32) / 1e9
+            at_ns = int(round(cut_wall * 1e9)) + monotonic_minus_wall_ns
+            owned[rec["idx"]] = owns(owners.owner(rec["idx"], rec["ref_sp"], rec["ref_dp"], at_ns, slack_ns))
+
+    if not net_windows:
+        return []
+    base = [expand(v) for v in net_windows[0].get("sweep_base", [])]
+    decide(base, net_windows[0].get("sweep_base_clock", [0.0, 0]))
+    sw.add({"buckets": {rec["idx"]: rec for rec in base}, "totals": None}, select=set())
+    out: List[Dict[str, object]] = []
+    for w, win in enumerate(net_windows):
+        records = [expand(v) for v in win.get("sweep_records", [])]
+        decide(records, win.get("sweep_clock", [0.0, 0]))
+        select = {idx for idx, own in owned.items() if own}
+        feats = sw.add({"buckets": {rec["idx"]: rec for rec in records}, "totals": None}, select=select)
+        summary = sweep_summary(feats, duration_unit)
+        whole = win.get("exact_features") or {}
+        for k in SWEEP_WINDOW_KEYS:
+            summary[k] = whole.get(k, summary[k])
+        end_ns = int(round((float(win["sweep_clock"][0]) if win.get("sweep_clock") else 0.0) * 1e9)) \
+            + monotonic_minus_wall_ns + slack_ns
+        active = [i for i, seen in sw.seen.items() if 0 <= w - seen <= sw.ttl]
+        shared = 0
+        for idx in active:
+            kinds = {owns(table.owner(k, end_ns)) for k in owners.keys.get(idx, ())
+                     if owners.first_seen_ns(k) <= end_ns and not k[1][0].startswith(sockjoin.LOOPBACK_PREFIX)
+                     and not k[2][0].startswith(sockjoin.LOOPBACK_PREFIX)}
+            shared += int(len(kinds) == 2)
+        hidden = 0
+        for first_ns, key in own_keys:
+            if first_ns > end_ns:
+                break
+            idx = owners.bucket_by_key[key]
+            rec = sw.state.get(idx)
+            if rec is not None and not owned.get(idx, False) and \
+                    owners.ports(key) != tuple(sorted((rec["ref_sp"], rec["ref_dp"]))):
+                hidden += 1
+        summary.update(net_sock_owned_buckets=len(select), net_sock_shared_active=shared,
+                       net_sock_hidden_flows=hidden)
+        out.append(summary)
+    return out
 
 
 def ip_scope_rows(args, run_id: str, host_windows: List[Dict[str, object]],
@@ -2996,6 +3108,20 @@ def ip_scope_rows(args, run_id: str, host_windows: List[Dict[str, object]],
     summaries = build_net_summaries(scoped, args.window_sec, byte_layer=args.byte_layer,
                                     duration_unit=args.duration_unit)
     return [dict(row, join="ip:" + address) for row in build_rows(args, run_id, host_windows, scoped, summaries)]
+
+
+def socket_csv_path(args) -> Path:
+    """--socket-join-csv, or --out-csv with .socket before the suffix."""
+    if args.socket_join_csv:
+        return Path(args.socket_join_csv)
+    out = Path(args.out_csv)
+    return out.with_name(out.stem + ".socket" + out.suffix)
+
+
+def extra_socket_csv_path(socket_csv: Path, name: str) -> Path:
+    """The CSV of --socket-join-also's cgroup NAME: the socket-join CSV with .NAME before the suffix."""
+    tag = re.sub(r"[^A-Za-z0-9_.-]", "_", name)
+    return socket_csv.with_name(f"{socket_csv.stem}.{tag}{socket_csv.suffix}")
 
 
 def scoped_csv_path(out_csv: str, address: str) -> Path:
@@ -3170,7 +3296,8 @@ def build_arg_parser(profile: Optional[str] = None) -> argparse.ArgumentParser:
                     help="socket-level join: run ebpf_perf/sockowner (path to its binary) during the run. It records "
                          "which socket, process and cgroup each 5-tuple belongs to; the flows whose socket is in the "
                          "--hostmon-cgroup give a second set of network features, written to --socket-join-csv. "
-                         "Needs --hostmon-cgroup")
+                         "Needs --hostmon-cgroup. With --switch-program sweep (no CPU reports) a bucket's 5-tuple is "
+                         "the local one the switch hashes to it with the bucket's reference ports (sweep_socket_join)")
     ap.add_argument("--sockowner-log", default="sockowner.log")
     ap.add_argument("--scope-ip", action="append", default=[],
                     help="host-level join (several hosts behind the switch): also write, for this address, rows "
@@ -3180,6 +3307,12 @@ def build_arg_parser(profile: Optional[str] = None) -> argparse.ArgumentParser:
                     help="cgroup-v2 directory sockowner attaches to (default: the root, so every process is seen)")
     ap.add_argument("--socket-join-csv",
                     help="output CSV of the socket-level join (default: --out-csv with .socket before the suffix)")
+    ap.add_argument("--socket-join-also", action="append", default=[], metavar="CGROUP_DIR",
+                    help="with --sockowner: also write the socket-level join of this existing cgroup-v2 directory "
+                         "(e.g. a background program's), from the same windows, to the socket-join CSV's name with "
+                         ".<directory name> before the suffix; network columns only (its host columns are zero). "
+                         "Repeatable. With the monitored cgroup's rows it lets a run check that the socket joins "
+                         "partition the window-level rows")
 
     ap.add_argument("--dormant-reads", type=int, default=0, choices=[0, 1],
                     help="1: a bucket that leaves the active set is not cleared but read again, round robin, with the "
@@ -3247,8 +3380,8 @@ def main() -> None:
 
     exact = args.switch_program == "exact"
     if exact and args.sockowner:
-        ap.error("--sockowner needs the per-bucket registers of --switch-program buckets: perf/variants/exact keeps "
-                 "no per-flow counters for the socket-level join")
+        ap.error("--sockowner needs the per-bucket registers of --switch-program buckets or sweep: perf/variants/exact "
+                 "keeps no per-flow counters for the socket-level join")
     if exact and args.global_totals:
         ap.error("--global-totals is for the gtot test build; --switch-program exact computes the windows itself")
     if exact and args.scope_ip:
@@ -3256,15 +3389,20 @@ def main() -> None:
                  "perf/variants/exact keeps no per-flow rows to split by host")
     timer_mode = exact and args.window_markers == "timer"
     sweep = args.switch_program == "sweep"
-    if sweep and (args.sockowner or args.global_totals or args.scope_ip):
-        ap.error("--sockowner, --global-totals and --scope-ip are not implemented for --switch-program sweep (its "
-                 "windows come from the export records, not from register reads or CPU reports)")
+    if sweep and args.global_totals:
+        ap.error("--global-totals is for the gtot test build: --switch-program sweep reads the totals with every sweep")
+    if sweep and args.scope_ip:
+        ap.error("--scope-ip needs the CPU reports of --switch-program buckets (the 5-tuple that owns each bucket): "
+                 "the sweep build exports its buckets without addresses, and this host's sockets (--sockowner) name "
+                 "only its own flows")
     sweep_gen = sweep and args.sweep_probes == "generator"
     if sweep and len([p for p in args.sweep_pipes.split(",") if p.strip()]) != 1:
         ap.error("--sweep-pipes: one pipe (the windows are built from one generator's sweeps)")
     computed = exact or sweep       # the switch program gives the windows: no CPU reports, no register reads
     if args.sockowner and not args.hostmon_cgroup:
         ap.error("--sockowner needs --hostmon-cgroup: the socket-level join selects the flows of that cgroup")
+    if args.socket_join_also and not args.sockowner:
+        ap.error("--socket-join-also needs --sockowner")
     if args.mode == "pcap" and not args.pcap:
         ap.error("--pcap is required when --mode pcap")
     if args.launcher == "dataset" and args.mode != "command":
@@ -3529,7 +3667,8 @@ def main() -> None:
                 drain_seconds=args.drain_seconds if args.mode == "pcap" else 0.0,
                 sweep_timeout=args.sweep_timeout,
                 header=ETHERNET_HEADER_BYTES if args.byte_layer == "frame" else 0,
-                duration_unit=args.duration_unit, timing_path=args.reader_timing_file)
+                duration_unit=args.duration_unit, timing_path=args.reader_timing_file,
+                keep_records=bool(args.sockowner))
             window_reader.stop()
             window_reader = None
             export_capture.stop()
@@ -3606,12 +3745,20 @@ def main() -> None:
         host_windows = read_host_windows(args.hostmon_log)
 
         socket_rows: Optional[List[Dict[str, object]]] = None
+        extra_socket_rows: List[Any] = []
         if sock_proc is not None:
             print("[INFO] Stopping sockowner")
             stop_hostmon(sock_proc)
             sock_proc = None
             socket_rows = socket_join_rows(args, run_id, cgroup_path, global_t0, host_windows, net_windows,
                                            clock_offset_ns)
+            for extra in args.socket_join_also:
+                extra_path = Path(extra)
+                if not (extra_path / "cgroup.procs").exists():
+                    print(f"[WARN] --socket-join-also {extra}: not a cgroup-v2 directory, skipped")
+                    continue
+                rows = socket_join_rows(args, run_id, extra_path, global_t0, [], net_windows, clock_offset_ns)
+                extra_socket_rows.append((extra_path, [dict(r, join="socket:" + extra_path.name) for r in rows]))
 
         if host_windows:
             print(
@@ -3643,10 +3790,13 @@ def main() -> None:
         writer.commit()
         committed = True
         if socket_rows is not None:
-            out = Path(args.socket_join_csv) if args.socket_join_csv else \
-                Path(args.out_csv).with_name(Path(args.out_csv).stem + ".socket" + Path(args.out_csv).suffix)
+            out = socket_csv_path(args)
             append_csv_rows(str(out), socket_rows)
             print(f"[OK] Added {len(socket_rows)} socket-join rows to {out}")
+        for extra_path, rows in extra_socket_rows:
+            out = extra_socket_csv_path(socket_csv_path(args), extra_path.name)
+            append_csv_rows(str(out), rows)
+            print(f"[OK] Added {len(rows)} socket-join rows of {extra_path} to {out}")
         for address in args.scope_ip:
             scoped_rows = ip_scope_rows(args, run_id, host_windows, net_windows, address)
             out = scoped_csv_path(args.out_csv, address)

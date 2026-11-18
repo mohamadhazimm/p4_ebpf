@@ -10,8 +10,10 @@ every bucket instead of the ~500 a 0.5 s window's reads cover.
 
 This module has:
     RECORD, parse_export(), probe_frame(), generator_template()   the wire formats
+    compact(), expand()                                            a record as the socket-level join keeps it
     read_exports(), group_sweeps()                                 exports (a pcap) -> sweeps
-    SweepWindows                                                   sweeps -> the 29 features per window
+    SweepWindows                                                   sweeps -> the 29 features per window (of all
+                                                                   buckets, or of a selection)
     SweepModel                                                     a software model of the program (tests, offline checks)
     probe_plan()                                                   the probes an in-band replay sends at each boundary
     summarize()                                                    a run's 40 windows -> the release's row
@@ -25,6 +27,7 @@ minimum toward the dataset's guest (frame_len), and 14 B per packet are added he
 
 Python 3 (PC1 and the lab); the switch side is sweep_reader.py.
 """
+import operator
 import struct
 import sys
 from pathlib import Path
@@ -47,6 +50,7 @@ BUCKET_REGS = ("pkts", "bytes", "pkts_ab", "bytes_ab", "first_ts", "last_ts", "s
                "ref_sp", "ref_dp", "min_len", "max_len", "dir_valid", "coll")
 COLL_MAX = 255                          # reg_coll saturates
 TOTALS = ("g_pkts_ab", "g_bytes_ab", "g_pkts_ba", "g_bytes_ba", "g_syn", "g_ack", "g_rst")
+COMPACT = ("idx", "t") + BUCKET_REGS    # what the socket-level join keeps of a record (compact(), expand())
 
 FEATURES = [
     "net_flow_count_seen", "net_pkts_total_delta", "net_bytes_total_delta", "net_pkts_ab_delta",
@@ -101,6 +105,25 @@ def parse_export(frame):
 def pipe_of(rec):
     """The generator's pipe (destination MAC bits 44:43, gen bits 12:11); an in-band probe's gen is its sender's."""
     return (rec["gen"] >> 11) & 0x3
+
+
+_COMPACT_GET = operator.itemgetter(*COMPACT)
+
+
+def compact(rec):
+    """A record as a tuple of COMPACT: the bucket, its probe's switch time and its registers. The collector keeps
+    the records that changed in each sweep this way for the socket-level join (hybrid_collector.py). An export's
+    record has every field (itemgetter: about 0.15 us a record, against 1.1 us field by field); a record written
+    by hand may leave some out (0)."""
+    try:
+        return _COMPACT_GET(rec)
+    except KeyError:
+        return tuple(int(rec.get(k, 0)) for k in COMPACT)
+
+
+def expand(values):
+    """compact()'s tuple as a record (the fields SweepWindows reads)."""
+    return dict(zip(COMPACT, values))
 
 
 # ---------------------------------------------------------------------------------------------- pcaps
@@ -227,7 +250,12 @@ class SweepWindows:
 
     A bucket a sweep does not carry keeps its last record: with the generator every used bucket is in every sweep; an
     in-band replay may probe only the buckets that changed (probe_plan "changed"). The totals' differences (bucket 0's
-    record) are a check: they count every packet, so a bucket the sweep missed shows as totals_mismatch."""
+    record) are a check: they count every packet, so a bucket the sweep missed shows as totals_mismatch.
+
+    add(sweep, select): the features of the buckets in `select` only (a set of bucket indexes; the socket-level join,
+    hybrid_collector.sweep_socket_join). Every bucket of the sweep still updates the state, so a bucket that joins the
+    selection later has its earlier record. A sweep that carries only the buckets that changed gives the same features
+    as the whole sweep (a bucket without a packet adds nothing); last_changed names them after each add()."""
 
     def __init__(self, window_sec=0.5, header=ETHERNET_HEADER_BYTES, ttl=TTL):
         self.window_sec, self.header, self.ttl = window_sec, header, ttl
@@ -236,6 +264,7 @@ class SweepWindows:
         self.first_window = {}      # idx -> the window of its first packet
         self.prev_totals = None
         self.n_sweeps = 0
+        self.last_changed = []      # the buckets whose registers changed in the last add() (all, for the first)
 
     def duration_s(self, idx, rec):
         d_mod = ((rec["last_ts"] - rec["first_ts"]) & M32) / 1e9
@@ -243,12 +272,13 @@ class SweepWindows:
         k = max(0, int(round((est - d_mod) / TS_WRAP_S)))
         return d_mod + k * TS_WRAP_S
 
-    def add(self, sweep):
+    def add(self, sweep, select=None):
         buckets = sweep["buckets"]
         if self.n_sweeps == 0:
             self.n_sweeps = 1
             for idx, rec in buckets.items():
                 self.state[idx] = rec
+            self.last_changed = list(buckets)
             self.prev_totals = sweep.get("totals")
             return None
         w = self.n_sweeps - 1
@@ -257,23 +287,35 @@ class SweepWindows:
         out = dict.fromkeys(FEATURES, 0)
         sums = dict(pkts=0, bytes=0, pkts_ab=0, bytes_ab=0, pkts_ba=0, bytes_ba=0, syn=0, ack=0, rst=0)
         coll_pkts, coll_saturated = 0, 0
+        changed = []
         for idx, rec in buckets.items():
             prev = self.state.get(idx)
-            # reg_coll saturates at 255: a bucket at 255 may hide more (counted in net_sweep_coll_saturated)
-            coll_pkts += max(0, rec.get("coll", 0) - (prev.get("coll", 0) if prev else 0))
-            coll_saturated += int(rec.get("coll", 0) >= COLL_MAX)
-            d = {}
-            for k in ("pkts", "bytes", "pkts_ab", "bytes_ab", "syn", "ack", "rst"):
-                d[k] = (rec[k] - (prev[k] if prev else 0)) & M32
-            if d["pkts"] > 0:
+            # every data packet increments pkts (a bucket's other registers change only with it)
+            d_pkts = (rec["pkts"] - (prev["pkts"] if prev else 0)) & M32
+            if prev is None or d_pkts:
+                changed.append(idx)
+            if d_pkts > 0:
                 self.seen[idx] = w
                 self.first_window.setdefault(idx, w)
-            for k in ("pkts", "bytes", "pkts_ab", "bytes_ab", "syn", "ack", "rst"):
-                sums[k] += d[k]
-            sums["pkts_ba"] += (d["pkts"] - d["pkts_ab"]) & M32
-            sums["bytes_ba"] += (d["bytes"] - d["bytes_ab"]) & M32
+            if select is None or idx in select:
+                # reg_coll saturates at 255: a bucket at 255 may hide more (counted in net_sweep_coll_saturated)
+                coll_pkts += max(0, rec.get("coll", 0) - (prev.get("coll", 0) if prev else 0))
+                if select is None:
+                    coll_saturated += int(rec.get("coll", 0) >= COLL_MAX)
+                d = {}
+                for k in ("pkts", "bytes", "pkts_ab", "bytes_ab", "syn", "ack", "rst"):
+                    d[k] = (rec[k] - (prev[k] if prev else 0)) & M32
+                for k in ("pkts", "bytes", "pkts_ab", "bytes_ab", "syn", "ack", "rst"):
+                    sums[k] += d[k]
+                sums["pkts_ba"] += (d["pkts"] - d["pkts_ab"]) & M32
+                sums["bytes_ba"] += (d["bytes"] - d["bytes_ab"]) & M32
             self.state[idx] = rec
+        self.last_changed = changed
         active = [i for i, seen in self.seen.items() if 0 <= w - seen <= self.ttl]
+        if select is not None:
+            active = [i for i in active if i in select]
+            # the selected buckets known so far (a sweep of the changed buckets does not carry the others)
+            coll_saturated = sum(1 for i in select if self.state.get(i, {}).get("coll", 0) >= COLL_MAX)
         mins, maxs, durs = [], [], []
         for idx in active:
             rec = self.state[idx]
@@ -294,10 +336,11 @@ class SweepWindows:
         out["net_syn_delta"], out["net_ack_delta"], out["net_rst_delta"] = sums["syn"], sums["ack"], sums["rst"]
         derived(out, (sum(mins), min(mins, default=0)), (sum(maxs), max(maxs, default=0)),
                 (sum(durs), max(durs, default=0.0)), len(active), self.window_sec)
-        # check against the totals (gtot_ba's seven registers, read by bucket 0's probe)
+        # check against the totals (gtot_ba's seven registers, read by bucket 0's probe); a selection of the buckets
+        # has no totals to check against (-1)
         totals = sweep.get("totals")
         tot_pkts = None
-        if totals is not None and self.prev_totals is not None:
+        if select is None and totals is not None and self.prev_totals is not None:
             dt = dict((k, (totals[k] - self.prev_totals[k]) & M32) for k in TOTALS)
             tot_pkts = dt["g_pkts_ab"] + dt["g_pkts_ba"]
             out["net_sweep_totals_mismatch"] = int(
@@ -314,8 +357,12 @@ class SweepWindows:
         out["net_sweep_coll_pkts"] = coll_pkts
         out["net_sweep_coll_saturated"] = coll_saturated
         out["net_sweep_merged_active"] = sum(1 for idx in active if self.state[idx].get("coll", 0) > 0)
-        out["net_sweep_merged_buckets"] = sum(1 for r in self.state.values() if r.get("coll", 0) > 0)
-        out["net_sweep_buckets"] = len(buckets)
+        if select is None:
+            out["net_sweep_merged_buckets"] = sum(1 for r in self.state.values() if r.get("coll", 0) > 0)
+            out["net_sweep_buckets"] = len(buckets)
+        else:
+            out["net_sweep_merged_buckets"] = sum(1 for i in select if self.state.get(i, {}).get("coll", 0) > 0)
+            out["net_sweep_buckets"] = sum(1 for i in buckets if i in select)
         out["net_sweep_seq"] = sweep.get("seq", -1)
         out["net_sweep_span_us"] = round(sweep.get("span_ns", 0) / 1e3, 3)
         return out

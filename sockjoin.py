@@ -241,6 +241,67 @@ def socket_join_windows(net_windows: Sequence[Dict[str, object]], table: OwnerTa
     return out
 
 
+LOOPBACK_PREFIX = "127."
+
+
+class BucketOwners:
+    """Owners of switch buckets when no CPU report names a bucket's flow (perf/variants/sweep, whose probes export
+    the bucket table without addresses).
+
+    A bucket's flow is the local 5-tuple that the switch hashes to it (bucket_of: the switch's symmetric flow hash,
+    flow_index.compute_flow_index(address_a, address_b, port_a, port_b, protocol)) and that has the bucket's
+    reference ports, the source and destination ports of the bucket's first packet since the reset (read with the
+    bucket). That is the flow whose state the bucket holds, as a CPU report names it in the bucket program. Another
+    local 5-tuple in the same bucket is a second flow merged into it (a hash collision: the switch counts its packets
+    in the bucket and in reg_coll), and the bucket stays with the first. A 5-tuple that never crossed the switch
+    (loopback, another interface) almost never has a used bucket's ports, so it owns nothing. Among the matching
+    5-tuples (normally one) the owner at a time is OwnerTable.owner()'s sighting: a 5-tuple reused by another socket
+    changes owner; a flow counted before its first sighting (the two clocks) keeps its first sighting's owner."""
+
+    def __init__(self, table: OwnerTable, bucket_of):
+        self.table = table
+        self.keys: Dict[int, List[FlowKey]] = {}
+        self.bucket_by_key: Dict[FlowKey, int] = {}
+        for key in table.by_key:
+            protocol, (address_a, port_a), (address_b, port_b) = key
+            idx = int(bucket_of(address_a, address_b, port_a, port_b, protocol))
+            self.bucket_by_key[key] = idx
+            self.keys.setdefault(idx, []).append(key)
+
+    @staticmethod
+    def ports(key: FlowKey) -> Tuple[int, int]:
+        return tuple(sorted((key[1][1], key[2][1])))  # type: ignore[return-value]
+
+    def matching(self, idx: int, ref_sp: int, ref_dp: int) -> List[FlowKey]:
+        """The local 5-tuples of bucket idx with its reference ports."""
+        want = tuple(sorted((int(ref_sp), int(ref_dp))))
+        return [k for k in self.keys.get(int(idx), ()) if self.ports(k) == want]
+
+    def others(self, idx: int, ref_sp: int, ref_dp: int) -> List[FlowKey]:
+        """The local 5-tuples hashed to bucket idx without its reference ports (merged into its flow if they crossed
+        the switch)."""
+        want = tuple(sorted((int(ref_sp), int(ref_dp))))
+        return [k for k in self.keys.get(int(idx), ()) if self.ports(k) != want]
+
+    def owner(self, idx: int, ref_sp: int, ref_dp: int, at_ns: Optional[int] = None,
+              slack_ns: int = 0) -> Optional[FlowSighting]:
+        """The sighting that owns bucket idx at at_ns (on sockowner's clock): of the matching 5-tuples' owners at
+        that time, the one seen last up to at_ns + slack_ns, else the earliest; None if no local 5-tuple has the
+        bucket's ports."""
+        found = [self.table.owner(k, at_ns, slack_ns) for k in self.matching(idx, ref_sp, ref_dp)]
+        found = [s for s in found if s is not None]
+        if not found:
+            return None
+        if at_ns is not None:
+            before = [s for s in found if s.ts_ns <= at_ns + slack_ns]
+            if before:
+                return max(before, key=lambda s: s.ts_ns)
+        return min(found, key=lambda s: s.ts_ns)
+
+    def first_seen_ns(self, key: FlowKey) -> int:
+        return self.table.times[key][0]
+
+
 def ip_scope_windows(net_windows: Sequence[Dict[str, object]], addresses: Iterable[str]) -> List[Dict[str, object]]:
     """Copies of the collector's windows with "owned_indexes": the buckets whose flow (the 5-tuple of the
     bucket's latest CPU report, "report_keys") has one of `addresses` as its source or destination. This is

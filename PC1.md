@@ -2408,3 +2408,73 @@ one test fails as before: `test_sockjoin` runs the release's `switch_model.py`, 
 `live_test/committee_replay/pc1_20261117_part9d.tar.xz`.
 
 **State after:** the switch runs `basic_sweep_coll` with the generator stopped; eth1's ring is at 1,024.
+
+## Part 10 (proposed, 2026-11-17): the socket join on the sweep build, live
+
+*Why. The sweep build exports its buckets without addresses, and its collector takes no CPU report, so part 9g
+refused `--sockowner` with `--switch-program sweep`. The collector now names a bucket's flow from this host's own
+sockets: the local 5-tuple that the switch hashes to the bucket (`flow_index.py`) and that has the bucket's
+reference ports. A 5-tuple with other ports in the same bucket is a second flow merged into it (the collision
+counter counts its packets), so the bucket stays with its first flow; a loopback 5-tuple that happens to hash onto
+a used bucket almost never has its ports, so it owns nothing. The owner is taken at the bucket's own cut (the
+record's switch time after the sweep's first record), which matters only when a 5-tuple is reused by another
+socket. Code: `hybrid_collector.sweep_socket_join`, `sockjoin.BucketOwners`; `SweepWindows.add(select=...)`
+computes the features of the owned buckets from the records the collector keeps (only those that changed). Tests
+on the program's model (`tests/test_sweep_sockjoin.py`, 11): two programs through one switch each get exactly the
+windows of their own traffic; a selector that owns everything gives the window rows; a merged flow, a loopback
+5-tuple on a used bucket, a reused 5-tuple and the generator's per-bucket cut. Not yet run on the switch.*
+
+**New:** `--socket-join-also CGROUP_DIR` (repeatable) writes the socket join of another existing cgroup from the same
+windows (network columns only) to `OUT.socket.NAME.csv`; `live_test/check_sweep_sockjoin.py` checks, per window,
+that the joins add up to the window rows (packets, bytes, flags, flow counts), and with no `--also` that the socket
+rows equal the window rows in all 29 features.
+
+**Set-up:** the switch on `basic_sweep_coll` (state after 9g), `servers.py` on PC2 as in section 2b, `sockowner`
+built as in part 5, eth1's receive ring raised for the exports and the 0.5 µs gap of 9g's collector runs (part 9e):
+
+```sh
+REL=$(realpath ../p4-ebpf-malware-detection); OUT=perf/results/sweep_sockjoin; mkdir -p $OUT
+sudo ethtool -G eth1 rx 8192                       # back to 1024 at the end
+S="$C --switch-program sweep --sweep-probes generator --sweep-ipg-ns 500 \
+    --sweep-export-port 132 --sweep-export-iface eth1 --frame-min 192.168.0.1/32 \
+    --hostmon ebpf_perf/build/hostmon_agg --hostmon-cgroup /sys/fs/cgroup/unified/hazim_collect \
+    --sockowner ebpf_perf/sockowner/build/sockowner --sockowner-attach /sys/fs/cgroup/unified"
+```
+
+**10A, the program alone** (expected: the socket rows equal the window rows in all 40 windows, the owned buckets are
+the program's connections, no shared bucket and no hidden flow):
+
+```sh
+$S --scenario-name sj_alone --label benign --sockowner-log $OUT/alone.sockowner.log \
+   --command "python3 $REL/validation/hybrid/workloads.py http_poll --server 192.168.0.2" \
+   --out-csv $OUT/alone.csv --reader-timing-file $OUT/alone.timing.jsonl
+python3 live_test/check_sweep_sockjoin.py --window $OUT/alone.csv --socket $OUT/alone.socket.csv \
+   --json $OUT/alone.check.json
+```
+
+A remainder here is TCP or UDP of another process on eth1 during the run: its 5-tuples are the `FLOW` lines of
+`alone.sockowner.log` whose cgroup id is not the collector's.
+
+**10B, beside a background program in its own cgroup** (expected: in every window the two joins add up to the
+window rows, remainder 0):
+
+```sh
+sudo mkdir -p /sys/fs/cgroup/unified/hazim_bg
+sudo sh -c "echo \$\$ > /sys/fs/cgroup/unified/hazim_bg/cgroup.procs; exec runuser -u $USER -- sh -c \
+  'while true; do python3 $REL/validation/hybrid/workloads.py tcp_beacon --server 192.168.0.2; done'" &
+sleep 3
+$S --scenario-name sj_beside --label benign --sockowner-log $OUT/beside.sockowner.log \
+   --command "python3 $REL/validation/hybrid/workloads.py http_bulk --server 192.168.0.2" \
+   --socket-join-also /sys/fs/cgroup/unified/hazim_bg \
+   --out-csv $OUT/beside.csv --reader-timing-file $OUT/beside.timing.jsonl
+sudo sh -c 'echo 1 > /sys/fs/cgroup/unified/hazim_bg/cgroup.kill'; sleep 1; sudo rmdir /sys/fs/cgroup/unified/hazim_bg
+python3 live_test/check_sweep_sockjoin.py --window $OUT/beside.csv --socket $OUT/beside.socket.csv \
+   --also $OUT/beside.socket.hazim_bg.csv --json $OUT/beside.check.json
+sudo ethtool -G eth1 rx 1024
+```
+
+**What comes back:** the CSVs, the two `*.check.json`, both `*.sockowner.log` (with their `SOCKOWNER_HEALTH` line,
+which must be `0,0,0`), the timing logs and the collector's console, including its line `socket-level join (sweep
+build): cgroup ..., N owned buckets, ...`. Also note the generator's sweep timing (`lag_s` in the timing log). The
+join attributes a name lookup sent through the host's local resolver to the resolver, as before; `workloads.py`
+connects to the server's address directly.
