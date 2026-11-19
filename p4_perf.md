@@ -995,6 +995,30 @@ and no flow should go unread under a flood. **Where the remaining errors came fr
     dropped. A long session (`interactive`) was cut.
   - **Verdict timing:** the stacked detector's verdict came a median 270-275 ms after its window on PC1, about 160 ms
     of it scoring.
+- **The final build on all 109 captures** (PC1.md part 12A):
+  - **Replays:** every replay exact.
+  - **Rows:** 102 of 109 equal the published rows in all 135 non-duration columns (mean 131.86); all 109 equal the
+    exact build's.
+  - **Detection** (the network detector without each capture's group): all 67 attacks alarmed, 53 at the first
+    window, a median 213 ms after the window's end.
+  - **Containment:** the host block caught on average 82% of a malware run's frames and 48% of a flood's (2-87%).
+  - **False alarms:** 11 of 42 benign runs (ftp, telnet, DNS).
+- **Shorter windows** (part 12B):
+  - **The data plane takes any window length:** the markers or the timer set it.
+  - **The reader on the switch does not:** its cycle is about 100 ms per window (a read of 37-40 ms, a clear of 4 ms).
+    At 0.25 s every window is exact (80 of 80, none lost); at 0.1 s it falls a window behind (47-200 of 200 windows
+    exact).
+  - **For 0.1 s:** a faster reader, or more than two banks, would give the reads more slack.
+  - **What shorter windows buy, offline** (the network detector retrained on the 110 captures at each length):
+    accuracy does not change (balanced accuracy 0.83-0.84), and the first alarm comes one window in. The host block
+    would catch on average 55% (0.5 s), 71% (0.25 s) and 83% (0.1 s) of a flood's packets, with the block 50 ms after
+    the alarm.
+- **Live attacks through the whole loop** (part 12D/E): `hping3` floods from the monitored host.
+  - **Detection:** a SYN flood, a UDP flood and a port scan were each alarmed at window 0, with the original and with
+    the recalibrated detector. The alarm came 274-381 ms after the window's end and the block 2.9-3.7 ms later.
+  - **Drops:** the switch dropped 71-85% of the attack packets, and the rest reached the target exactly as counted.
+  - **Recalibration:** with the detectors also trained on 74 live benign runs, live benign false alarms fell from
+    56.8% to 2.7% (stacked, cross-validated), and the 7 live workloads alarmed none.
 
 ## 6. Switch CPU side
 

@@ -67,16 +67,29 @@ def summarize(W, k):
     return np.stack([W.mean(1), W.max(1), W.sum(1), W.std(1), (W != 0).sum(1).astype(float)], axis=2).reshape(len(W), -1)
 
 
-def train(release, windows_path, detector, hold_out=()):
+def train(release, windows_path, detector, hold_out=(), extra_paths=()):
+    """extra_paths: more window tables of the same format (e.g. live runs collected through the deployed pipeline,
+    PC1.md part 12), added to the training runs; hold_out applies to them too."""
     sys.path.insert(0, str(Path(release) / "evaluation"))
     import common  # noqa: E402  the release's forest
     signals, W, y, g = load_windows(windows_path)
+    for path in extra_paths:
+        s2, W2, y2, g2 = load_windows(path)
+        if s2 != signals:
+            sys.exit("%s: its signals differ from the training table's" % path)
+        W, y, g = np.concatenate([W, W2]), np.concatenate([y, y2]), np.concatenate([g, g2])
     keep = ~np.isin(g, list(hold_out))
     if hold_out:
         missing = set(hold_out) - set(g)
         if missing:
             sys.exit("no dataset runs in group(s) %s" % ", ".join(sorted(missing)))
         W, y, g = W[keep], y[keep], g[keep]
+    return train_arrays(common, signals, W, y, g, detector)
+
+
+def train_arrays(common, signals, W, y, g, detector):
+    """train() on arrays: runs W (n, 40, signals), labels y, groups g; common is the release's evaluation/common.py.
+    Returns the host and network signal names and score(wh, wn) -> probability."""
     host = [i for i, s in enumerate(signals) if s.startswith("host_")]
     net = [i for i, s in enumerate(signals) if s.startswith("net_")]
     Xh = np.vstack([summarize(W[:, :, host], k) for k in PREFIXES])
@@ -106,6 +119,18 @@ def train(release, windows_path, detector, hold_out=()):
             return float(fitted["concat"].predict_proba(np.hstack([h, n]))[0, 1])
         ph, pn = fitted["host"].predict_proba(h)[0, 1], fitted["network"].predict_proba(n)[0, 1]
         return float(fitted["stacker"].predict_proba([[ph, pn]])[0, 1])
+
+    def score_batch(Xh, Xn):
+        """Probabilities for many prefixes at once: Xh, Xn are rows of summarize() (host and network)."""
+        if detector == "host":
+            return fitted["host"].predict_proba(Xh)[:, 1]
+        if detector == "network":
+            return fitted["network"].predict_proba(Xn)[:, 1]
+        if detector == "concat":
+            return fitted["concat"].predict_proba(np.hstack([Xh, Xn]))[:, 1]
+        ph, pn = fitted["host"].predict_proba(Xh)[:, 1], fitted["network"].predict_proba(Xn)[:, 1]
+        return fitted["stacker"].predict_proba(np.column_stack([ph, pn]))[:, 1]
+    score.batch = score_batch
     return [signals[i] for i in host], [signals[i] for i in net], score
 
 
@@ -141,10 +166,12 @@ def main():
     ap.add_argument("--idle", type=float, default=30.0)
     ap.add_argument("--on-alarm")
     ap.add_argument("--hold-out-group", action="append", default=[])
+    ap.add_argument("--train-extra", action="append", default=[], metavar="WINDOWS_CSV_GZ",
+                    help="another window table to train on as well (e.g. live runs; PC1.md part 12)")
     ap.add_argument("--log")
     args = ap.parse_args()
     t_train = time.monotonic()
-    host_sig, net_sig, score = train(args.release, args.train, args.detector, args.hold_out_group)
+    host_sig, net_sig, score = train(args.release, args.train, args.detector, args.hold_out_group, args.train_extra)
     print("[stream] %s detector trained on %d prefixes of the dataset runs%s in %.1f s" % (
         args.detector, len(PREFIXES), (" without " + ", ".join(args.hold_out_group)) if args.hold_out_group else "",
         time.monotonic() - t_train), flush=True)

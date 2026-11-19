@@ -362,8 +362,10 @@ def row_scorer(host_signals: Sequence[str], net_signals: Sequence[str],
 
 
 def load_scorer(detector: str, hold_out: Sequence[str] = (), release: Optional[str] = None,
-                windows_path: Optional[str] = None) -> Callable[[List[Dict[str, Any]]], float]:
-    """The detector of stream_verdicts.py, trained now (about 1 s for network, 15 s for stacked)."""
+                windows_path: Optional[str] = None,
+                extra_windows: Sequence[str] = ()) -> Callable[[List[Dict[str, Any]]], float]:
+    """The detector of stream_verdicts.py, trained now (about 1 s for network, 15 s for stacked; 6 and 45 s on
+    PC1), on the dataset's window table and any extra_windows tables (live runs, PC1.md part 12)."""
     import sys
     from pathlib import Path
     here = Path(__file__).resolve().parent / "live_test" / "streaming"
@@ -375,5 +377,6 @@ def load_scorer(detector: str, hold_out: Sequence[str] = (), release: Optional[s
     if not os.path.isdir(os.path.join(release, "evaluation")):
         raise FileNotFoundError(f"the release's evaluation/ (for the detectors' forests) not found under {release}: "
                                 "give --block-release")
-    host_sig, net_sig, score = stream_verdicts.train(release, windows_path, detector, list(hold_out))
+    host_sig, net_sig, score = stream_verdicts.train(release, windows_path, detector, list(hold_out),
+                                                     list(extra_windows))
     return row_scorer(host_sig, net_sig, score)

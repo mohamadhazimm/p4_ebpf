@@ -71,7 +71,9 @@ trained before the run, scores the run after every window; at the first window w
 `--block-threshold` (0.5) the collector asks the reader for the entries above. `--block-force-alarm-window W` raises the
 alarm at window W, to test the blocking with benign programs. The scores, the alarm and every request go to
 `--block-log` (JSONL); at the end the entries are listed with their drops and deleted (`--block-keep` leaves them).
-Needs NumPy and scikit-learn older than 1.8.
+Needs NumPy and scikit-learn older than 1.8. `--block-train-extra live_test/streaming/live_benign_windows.csv.gz` also
+trains the detector on 74 live benign runs collected through this pipeline: live false alarms then fall from 56.8% to
+2.7% (stacked, cross-validated), with the dataset's detection unchanged (`PC1.md` part 12C).
 
 ## Limits
 
@@ -86,6 +88,8 @@ Needs NumPy and scikit-learn older than 1.8.
   also drops the host's other programs (`PC1.md` part 11c: the background program's connections stopped too).
   Without `--block-host-port`, a program that spoofs its source addresses is not stopped by it. Traffic toward the
   host still passes (the block is on what it sends).
+- **Window length.** The data plane takes any length (the markers or the timer set it), but the reader on the switch
+  needs about 100 ms per window: 0.25-s windows are exact, 0.1-s windows fall behind with two banks (`PC1.md` 12B).
 - **The live detectors are the dataset's.** They were trained on the dataset's rows, with its launcher and its C
   library; live benign programs started differently score higher (`PC1.md` parts 2-3), so live false blocks are
   likely until the detectors are trained on rows collected the same way.

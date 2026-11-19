@@ -3428,6 +3428,10 @@ def build_arg_parser(profile: Optional[str] = None) -> argparse.ArgumentParser:
     ap.add_argument("--block-log",
                     help="JSONL of the scores, the alarm and every block request (default: --out-csv with "
                          ".block.jsonl instead of the suffix)")
+    ap.add_argument("--block-train-extra", action="append", default=[], metavar="WINDOWS_CSV_GZ",
+                    help="--block-on-alarm: train the detector on this window table too (the format of "
+                         "live_test/streaming/dataset_windows.csv.gz; e.g. live runs collected through this "
+                         "pipeline, PC1.md part 12); repeatable; --block-hold-out-group applies to it")
     ap.add_argument("--block-release",
                     help="the release checkout whose evaluation/ has the detectors' forest (default: "
                          "p4-ebpf-malware-detection next to this repository)")
@@ -3656,9 +3660,11 @@ def main() -> None:
                 detector = (args.block_detector if args.block_detector != "auto"
                             else "stacked" if args.hostmon_cgroup else "network")
                 t_train = time.monotonic()
-                block_score = block_policy.load_scorer(detector, args.block_hold_out_group, args.block_release)
+                block_score = block_policy.load_scorer(detector, args.block_hold_out_group, args.block_release,
+                                                       extra_windows=args.block_train_extra)
                 print(f"[INFO] block rules: {detector} detector trained in {time.monotonic() - t_train:.1f} s"
                       + (f" without {', '.join(args.block_hold_out_group)}" if args.block_hold_out_group else "")
+                      + (f", plus {', '.join(args.block_train_extra)}" if args.block_train_extra else "")
                       + f"; alarm at p >= {args.block_threshold}")
         elif sweep:
             # perf/variants/sweep: its reader clears the registers, installs frame_len, the probe and export ports

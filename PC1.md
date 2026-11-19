@@ -2934,3 +2934,132 @@ with its accepts the same minutes, -1.7 ms):
 
 **State after:** switch on `basic_exact_block_v2`, block table empty and `blocked_pkts` reset, `enp5s0` down; PC2 as
 found.
+
+## Results, part 12 (PC1, 2026-11-19): every capture on the final build, shorter windows, recalibrated detectors, live attacks
+
+The user asked for the four next steps of the evaluation:
+1. recalibrate the detectors with live benign runs and measure live false alarms on a larger set;
+2. shorter windows;
+3. all 109 captures on the final build;
+4. a live attack through the whole loop.
+
+Switch: `basic_exact_block_v2` throughout. Files: `perf/results/part12_20261119/` (git-ignored; scripts in `src/`) and
+the archive `live_test/committee_replay/pc1_20261119_part12.tar.xz` (everything but the captures).
+
+**12A. The 109 captures on the final build** (`replays_109/`, `src/run_replays_109.py`):
+- **How:** part 6b's collector path, plus a streaming verdict per capture. The network detector was trained without
+  the capture's own group, and the alarm blocked the host, 10.0.0.10.
+- **Measurement:** every replay is exact (44 of 44 windows, every packet counted).
+- **Rows:** 102 of 109 equal the published rows in all 135 non-duration columns (mean 131.86), and all 109 equal
+  `basic_exact_v3`'s (part 6b). The 7 others are part 6b's: Chaos 71, `bulkup_200`/`400` 71 (the MTU), `syn_fan_40k`
+  120, `syn_fan_100k` 70, `syn_fan_150k` 77, `udp_fan_60k` 123.
+- **Detection:** all 67 attacks alarmed (52 malware, 15 floods), 53 of them at the first window. The other 14 are
+  malware that starts slowly (windows 1-10).
+- **False alarms:** 11 of 42 benign runs: ftp x4, telnet x4, `dns_2k`/`5k`/`10k`.
+- **Timing:** the alarm came a median 213 ms after its window ended (p90 252, max 378 ms).
+- **Containment:** the share of the host's frames sent after the block, on the capture's own timeline. Malware mean
+  82%; floods mean 48%, from 2% (`syn_fan_40k`) to 87% (`syn_fan_150k`).
+- **The false alarms' cost:** the ftp and telnet runs had sent everything before their block; `dns_10k` lost 42% of
+  its traffic.
+- **One replay was spoiled by my own ssh to PC2 during it** (366 packets counted against 15) and was rerun exact. Any
+  traffic from PC1 through port 132 during a replay counts in its windows.
+
+**12B. Shorter windows.**
+- **Offline** (`windows/`, `src/compute_windows.py`, `study_windows.py`):
+  - The 29 network features of the 110 captures at 0.1, 0.25 and 0.5 s, from the release's switch model. At 0.5 s
+    they equal the detectors' training table in every window of all 110 runs.
+  - The network detector was retrained at each length, leaving one group out (42 groups), with the block assumed
+    50 ms after the alarm (a decent control-plane host).
+
+| Window | Run-level balanced accuracy (AUC) | Attacks alarmed | Benign alarmed | First alarm (median) | Floods: packets blocked (mean) | Malware: host frames blocked (mean) |
+|---|---|---|---|---|---|---|
+| 0.5 s | 0.837 (0.973) | 67/67 | 14/43 | 0.50 s | 55% | 89% |
+| 0.25 s | 0.830 (0.967) | 67/67 | 14/43 | 0.25 s | 71% | 89% |
+| 0.1 s | 0.837 (0.969) | 67/67 | 14/43 | 0.10 s | 83% | 89% |
+
+  - **Per flood, at 0.5 / 0.25 / 0.1 s:** `syn_fan_40k` 24 / 58 / 79%, `goldeneye_p10` 36 / 79 / 100%, `udp_sink_60k`
+    58 / 78 / 90%, `syn_sink_40k` 72 / 91 / 95%.
+  - **Accuracy does not change with the window.** The same 14 benign runs alarm at every length: the bulk uploads,
+    the DNS runs, and ftp/telnet, which look like attacks to a network-only detector.
+- **On the switch** (`short_windows/`, `exact_replay.py --window-us`):
+  - **0.25 s works:** `bulk2000` gives 80 of 80 windows equal to the model's, none lost.
+  - **0.1 s does not keep up:** `udp_sink_60k` gives 200 of 200, but `bulk2000` only 47 of 200 (199 marked lost),
+    the cohort capture 192 of 200 (155 lost), and `syn_fan_40k` 192 of 200 (137 lost, plus its 363 untracked
+    packets).
+  - **The cause is the reader on the switch.** Its read of a window takes 37-40 ms and the clear 4 ms, but its whole
+    cycle is about 100 ms. At 0.1 s it falls a window behind, and its clear of the extremes lands after the bank's
+    next window has started.
+  - **To run 0.1 s:** a faster reader (batched reads, or C++), or more banks (four would give three windows of
+    slack).
+
+**12C. Live benign runs and recalibration.**
+- **74 live benign executions through the pipeline** (`live_benign/`):
+  - part 2's 47 programs of the dataset's kind: null x2, 30 GNU tools at three sizes, 7 network clients against
+    `servers_log.py`, `banners.py` and `openssl s_server` on PC2, and 8 busybox;
+  - the release's 9 workloads x3.
+  - All have 40 rows and `HOSTMON_HEALTH` zeros. `git-heavy` failed early (its repository fixture is missing) and is
+    kept as a benign run; `telnet` ended with 1, as in part 2.
+  - They are converted to the training table's format in `live_test/streaming/live_benign_windows.csv.gz`.
+- **The study** (`recalibration/`, `src/recalibrate.py`):
+  - 5 group folds over the 240 dataset runs and the 74 live runs.
+  - Model A is trained on the dataset runs of the training folds; model B on those plus the live benign runs of the
+    training folds.
+  - Every run is scored after each of its windows. "stream" means an alarm in any window, as the block rule acts.
+
+| Detector | Training | Live benign alarmed (stream) | Dataset TPR (stream) | Dataset FPR (stream) | Dataset balanced accuracy (run level) | Live attacks alarmed |
+|---|---|---|---|---|---|---|
+| network | A, dataset only | 9.5% | 0.588 | 0.111 | 0.738 | 3/3 |
+| network | B, + live benign | 5.4% | 0.588 | 0.048 | 0.774 | 3/3 |
+| host | A | 83.8% | 0.816 | 0.230 | 0.813 | 3/3 |
+| host | B | 6.8% | 0.798 | 0.191 | 0.831 | 2/3 |
+| stacked | A | 56.8% | 0.798 | 0.175 | 0.807 | 3/3 |
+| stacked | B | **2.7%** | 0.816 | 0.206 | 0.833 | 3/3 |
+
+- **As deployed** (trained on all 240 runs, no fold), the share of the 74 live benign runs alarmed: stacked 70.3%,
+  host 85.1%, network 8.1%.
+- **The live false alarms come from the host side**, from PC1's environment. Stacked B leaves only `rsync` (its 2
+  runs).
+- **Recalibrating the host side alone has a cost:** host B finds the SYN flood only at window 3 and misses the port
+  scan (max p 0.482). The stacked detector covers it through the network side.
+- **Caveat:** every live training row is benign. The live attacks were never trained on and are still flagged, but
+  they are network floods; live malware with mostly host-side behaviour is untested (no malware on PC1).
+
+**12D. Live attacks, the original detector** (`live_attack/`):
+- `hping3` from PC1 in the monitored cgroup to PC2.
+- The stacked detector trained on the dataset only, and a host block on 192.168.0.1.
+- PC2's eth1 receive counter read around each run.
+
+| Attack | Alarm | After the window's end | Block written | Sent | Dropped by the switch | Reached PC2 |
+|---|---|---|---|---|---|---|
+| SYN flood, 20 kpps, 60,000 | window 0, p 0.795 | 356 ms | 3.4 ms | 60,000 | 49,755 (82.9%) | 10,245 |
+| UDP flood, about 40 kpps, 60,000 | window 0, p 0.896 | 328 ms | 3.1 ms | 60,000 | 42,571 (71.0%) | 17,429 |
+| port scan, 10 kpps, 30,000 | window 0, p 0.740 | 381 ms | 3.7 ms | 30,000 | 24,365 (81.2%) | 5,635 |
+
+- `hping3`'s replies (10,245 and 5,635) equal the packets that got through, and PC2's counter agrees (plus 2-3 other
+  frames).
+
+**12E. The recalibrated detector, live** (`live_recal/`):
+- **How:** `--block-train-extra live_test/streaming/live_benign_windows.csv.gz`, each benign workload with its own
+  live group held out.
+- **The 7 workloads of 11F: no alarm in any of them.** In 11F the original detector alarmed on all 7.
+- **The 3 attacks** were alarmed at window 0 (p 0.862, 0.914, 0.786), 274-343 ms after the window ended. The blocks
+  took 2.9-3.2 ms and dropped 50,757 (84.6%), 42,723 (71.2%) and 24,844 (82.8%) packets.
+
+**Changed here:**
+- **`live_test/streaming/stream_verdicts.py`:**
+  - `train(..., extra_paths)` and `--train-extra`: further window tables trained on, with the hold-out applying to
+    them;
+  - `train_arrays()`, training on arrays;
+  - `score.batch`, many prefixes in one call.
+- **`block_policy.load_scorer(extra_windows=...)` and `hybrid_collector.py --block-train-extra`** (repeatable). The
+  default stays the dataset only.
+- **`live_test/streaming/live_benign_windows.csv.gz`:** the 74 live benign runs.
+- **Tests:** `test_stream_extra.py` (3; they need scikit-learn); the suite under the `.venv` is 307 OK, 8 skipped.
+
+**Notes for later runs:**
+- The dataset launcher runs programs from `tempfile.mkdtemp()`; on PC1 set `TMPDIR` to `/dev/shm` when they write
+  big outputs.
+- Loops that read a case list must keep `ssh` and the collector off their standard input (`ssh -n`, `< /dev/null`).
+
+**State after:** switch on `basic_exact_block_v2` (pid 31757), the block table empty and reset, `enp5s0` down; PC2 as
+found (its services stopped and files removed); `/dev/shm` cleaned.
