@@ -129,7 +129,10 @@ class Blocker:
     The collector calls on_net_window(w, features) when the switch's window w has been read (its network
     columns; flood check and new flows, without waiting for the host window), on_row(w, row) when the row of
     window w is written (host and network columns; the verdict), and finish() at the end, while the reader
-    is still running. force_window: raise the alarm at that window whatever the probability (to test the
+    is still running. skip_windows: the collector windows before this one are not the run's (a replay anchored
+    on collector window K, replay_capture.py --align-window K: the detectors were trained on prefixes that start
+    at the run's first window), so they are neither scored nor checked for a flood. force_window: raise the
+    alarm at that window whatever the probability (to test the
     mechanism with benign programs)."""
 
     def __init__(self, request: Callable[[Dict[str, Any]], Dict[str, Any]],
@@ -138,8 +141,9 @@ class Blocker:
                  host_addresses: Sequence[str] = (), host_port: Optional[int] = None,
                  flood_flows: float = FLOOD_FLOWS_PER_HALF_SECOND, log_path: Optional[str] = None,
                  force_window: Optional[int] = None, keep: bool = False, echo: bool = True,
-                 clock: Any = time, max_entries: int = BLOCK_ENTRIES):
+                 clock: Any = time, max_entries: int = BLOCK_ENTRIES, skip_windows: int = 0):
         self.request_fn, self.score, self.threshold = request, score, threshold
+        self.skip_windows = int(skip_windows)
         self.cgroup_ids = set(int(c) for c in cgroup_ids)
         self.tail, self.host_addresses, self.host_port = tail, list(host_addresses), host_port
         self.flood_flows, self.force_window, self.keep, self.echo = flood_flows, force_window, keep, echo
@@ -236,7 +240,7 @@ class Blocker:
     def on_net_window(self, window: int, features: Dict[str, Any]) -> None:
         """The switch's window `window` has been read: after the alarm, block the flows that appeared and, on a
         flood window, the host; before it, remember a flood window for the alarm."""
-        if self.finished:
+        if self.finished or window < self.skip_windows:
             return
         flood = self._is_flood(features)
         if self.alarm is None:
@@ -250,6 +254,9 @@ class Blocker:
 
     def on_row(self, window: int, row: Dict[str, Any]) -> None:
         """The row of window `window` (host and network columns) is written: score the run so far."""
+        if window < self.skip_windows:
+            self._record({"event": "skipped", "window": window, "why": "before the run's first window"})
+            return
         self.rows.append(row)
         rows = self.rows[-SCORE_WINDOWS:]
         t0 = self.clock.time()

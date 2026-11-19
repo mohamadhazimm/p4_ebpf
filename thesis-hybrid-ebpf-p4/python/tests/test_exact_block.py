@@ -365,6 +365,27 @@ class PolicyTest(unittest.TestCase):
         b2.on_row(0, {})
         self.assertEqual(b2.events[-1]["event"], "block_skipped")
 
+    def test_the_windows_before_the_run_are_not_scored(self):
+        # a replay anchored on collector window 2: windows 0 and 1 hold the capture's frames before the run
+        scored = []
+        reader = FakeReader()
+        blk = block_policy.Blocker(reader.request, lambda rows: scored.append(list(rows)) or 0.9, echo=False,
+                                   tail=None, host_addresses=["10.0.0.10"], skip_windows=2,
+                                   log_path=os.path.join(self.dir.name, "block.jsonl"))
+        self.addCleanup(blk.close)
+        for w in range(2):
+            blk.on_net_window(w, {"net_flow_count_seen": 5000})            # no flood check there either
+            blk.on_row(w, {"net_window_id": w})
+        self.assertEqual(scored, [])
+        self.assertIsNone(blk.alarm)
+        self.assertIsNone(blk.pending_flood)
+        blk.on_net_window(2, {"net_flow_count_seen": 1})
+        blk.on_row(2, {"net_window_id": 2})
+        self.assertEqual(scored, [[{"net_window_id": 2}]])                  # the run's first window alone
+        self.assertEqual(blk.alarm["window"], 2)
+        self.assertEqual([e["event"] for e in blk.events][:2], ["skipped", "skipped"])
+        self.assertEqual(reader.adds()[0]["entries"], [{"src": "10.0.0.10"}])
+
     def test_a_forced_alarm_and_a_failing_reader(self):
         reader = FakeReader(fail=True)
         self.append(flow_line(PROGRAM, "egress", "tcp", "10.0.0.10", 40000, "203.0.113.5", 443))
@@ -537,6 +558,9 @@ class CollectorOptionsTest(unittest.TestCase):
         self.assertEqual((args.switch_program, args.window_sec, args.window_markers, args.byte_layer, args.launcher),
                          ("exact", 0.5, "cpu", "frame", "dataset"))
         self.assertFalse(args.block_on_alarm)                               # blocking stays a choice
+        self.assertEqual(args.block_skip_windows, 0)                         # live: every window is the run's
+        self.assertEqual(hc.build_arg_parser("exact").parse_args(BASE + ["--block-skip-windows", "2"])
+                         .block_skip_windows, 2)
 
 
 if __name__ == "__main__":

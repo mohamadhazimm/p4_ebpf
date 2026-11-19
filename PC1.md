@@ -2599,3 +2599,214 @@ depend on them.
 - 11B's comparison.
 - 11C's latencies and rates.
 - For 11D-11F, per run: `OUT.block.jsonl`, the rows, PC2's capture counts and the summary.
+
+## Results, part 11 (PC1, 2026-11-19): the exact build with a block rule
+
+The user asked to run part 11 (28fde45), and during the run pulled 50ef77e (host rows as soon as the monitor prints
+a window; 11F's updated steps), which is included below. The switch ran `basic_exact_block` from 11A on. Files:
+`perf/results/part11_20261119/` (git-ignored) and the archive `live_test/committee_replay/pc1_20261119_part11.tar.xz`
+(everything but the captures and send logs; the scripts in `src/`).
+
+**Set-up:**
+- **Disk:** PC1 had 37 MB free at the start. Part 9's captures were compressed with xz in place (310 to 122 MB),
+  and this run's captures after each step.
+- **Detectors:** the collector ran under the dataset construction's `.venv` (Python 3.11, NumPy 2.4.6, scikit-learn
+  1.9.1), as 50ef77e's 11F now says; `/usr/bin/python3` has no scikit-learn. The workloads still ran on
+  `/usr/bin/python3`. scikit-learn 1.9.1 shuffles `StratifiedGroupKFold` differently (part 3), so the stacked
+  detector of 11F is a little different from the published one; the network detector (11D, 11E) has no inner folds.
+- **Unit tests:** under the `.venv` 297 OK, 8 skipped (296 of 50ef77e and one added here). Under `/usr/bin/python3`
+  the one known error of part 4 (the release's `switch_model.py` needs Python 3.9).
+- **PC2 cannot capture:** its `dumpcap` is `root:wireshark` 0754 and sudo asks for a password, so there is no
+  capture on PC2.
+  - **Replays (11D, 11E):** the switch forwarded 132 -> 132, and `tcpdump -Q in` on eth1 recorded what the switch
+    let through. The block acts at ingress, so the egress port does not change what it drops.
+  - **Live (11F):** a copy of `servers.py` on PC2 that logs every accepted connection, HTTP request and echo
+    session with PC2's clock (`src/servers_log.py`; same files, ports and replies). Measured through it, PC2's clock
+    was 10.0 ms ahead of PC1's before the runs and 12.2 ms after.
+
+**11A. Compile.**
+- **The direct counter is refused.** The build as written fails, as do the timer and latency builds:
+  `table Ingress.block_rules: There are issues with the following indirect externs: The action block_drop uses Counter
+  Ingress.blocked_pkts but does not use DirectCounter Ingress.block_hits. The Tofino architecture requires all
+  indirect externs to be addressed with the same expression across all actions they are used in.`
+- **The plan's fallback `-DBLOCK_DIRECT_COUNTER=0` compiles** (`basic_exact_block`, `_timer`, `basic_hwl_exact_block`),
+  so `--block-list` gives no per-entry drops, and `blocked_pkts` still counts them all.
+- **It takes all 12 ingress stages, not 11.** `forwarding` and `block_drop` both write `drop_ctl` (an output
+  dependency), so `block_rules` goes to stage 1. The `is_flow` gateway that follows it in control order
+  (`ANTI_NEXT_TABLE_DATA`) then moves `prep`, `set_sig`, `frame_len` and the whole flow-table chain down one stage.
+- **Two placements as a side check** (compiled only, not run on traffic; sources in `src/alt/`):
+  - **alt1:** `blocked_pkts` counted on `block_rules.apply().hit` outside the action. bf-p4c accepts the direct
+    counter.
+  - **alt2:** alt1, with the lookup also moved to the end of the data path. It gives the exact build's 11 stages and
+    260 cycles back.
+
+| Build | Stages ig/eg | Critical path | SRAM | Map RAM | TCAM | Stateful ALUs | Ingress cycles | Power ig (bf-p4c) |
+|---|---|---|---|---|---|---|---|---|
+| basic_exact_v3 | 11/1 | 9 | 122 (12.7%) | 119 (20.7%) | 7 (2.4%) | 23 | 260 | 0.56 W |
+| basic_exact_block (`-DBLOCK_DIRECT_COUNTER=0`) | 12/1 | 10 | 125 (13.0%) | 121 (21.0%) | 13 (4.5%) | 23 | 279 | 0.52 W |
+| basic_exact_block_timer (`-DTIMER_LOCAL_PORT=68`) | 12/1 | 10 | 125 | 121 | 13 | 23 | 279 | 0.52 W |
+| alt1 (direct counter kept) | 12/1 | 10 | 127 (13.2%) | 123 (21.4%) | 13 | 23 | 279 | 0.52 W |
+| alt2 (alt1, lookup last) | 11/1 | 9 | 127 | 123 | 13 | 23 | 260 | 2.11 W |
+
+- **As expected:** +6 TCAM blocks, no new stateful ALU.
+- **Not as expected:** the extra stage. 12 is the most Tofino 1 has, so this build has no room left.
+
+**11B. The windows are unchanged** (`exact_replays_5/`, `exact_replay.py` through `run_exact.py`, the 5 captures of
+part 9C, `compare_11b.py`):
+- **Rows:** all 5 equal to `basic_exact_v3`'s (part 6b's collector rows) and to part 6's in all 135 non-duration
+  columns.
+- **Windows:** every window equal to part 6's in all non-duration features (40 of 40 each).
+- **Durations:** 137-145 of the 145 columns are equal. The durations are the switch clock's and follow the replay's
+  timing (`syn_fan_40k` equal in all 145).
+- **Against the published rows:** 135 (cohort), 71 (Chaos, 1,930 untracked packets), 135 (`slowloris_500`), 135
+  (`bulk2000`), 120 (`syn_fan_40k`, 363 untracked), as in part 6.
+- **Reset:** the reader's reset also cleared the block table each time (`block_cleared`).
+- **All 109:** not run.
+
+**11C. Latency and line rate** (`latency/`, `linerate/`):
+- **Latency:** hairpin, 3 runs of 1,010 probes per build, none missing. Baseline 246 ns, `basic_hwl_exact_v3` 421
+  ns, `basic_hwl_exact_block` **437 ns** (p99 439-440), alt2's latency build 421 ns. The 12th stage costs 19 cycles
+  and 16 ns.
+- **Line rate, table empty:** the 27-run matrix gives the same rates as `basic_exact_v3` at every size (64 B 91.09%,
+  paced 99.87-99.89%, maximum 100.00%), lossless, the window totals exact.
+- **Line rate, 1,024 entries that match nothing** (`src=203.0.0.0-203.0.3.255, dport=9`, written in one request in
+  174 ms):
+  - 1518 B paced 99.88 / 99.88 / 99.89% and maximum 100.00%, 64 B 91.09% x 3;
+  - `blocked_pkts` 0 before and after; the entries were cleared afterwards.
+  - 34 runs, 18.0 billion packets, 0 checks failed.
+
+**11D. The block by hand, on replays** (`11d/`, `src/run_block_replay.sh`, `src/block_check.py`):
+- **The command:** `replay_capture.py --exact --profile dataset --align-window 4 --send-log`, the collector with
+  `--skip-p4-forwarding --block-on-alarm --block-detector network --block-host 10.0.0.10 --block-skip-windows 4` and
+  the alarm forced at window 10 (dataset window 6).
+- **The first cohort capture has frames in one direction only:** nine SYN retries from 10.0.0.10. So `bulk2000`
+  (12,000 frames each way) was run as well.
+
+| Run | Entries | Alarm | Alarm to reply | From 10.0.0.10: sent before the request / during the write / after the reply | Through | `blocked_pkts` | Toward 10.0.0.10 through | Windows = 11B |
+|---|---|---|---|---|---|---|---|---|
+| cohort, the plan's command | src | window 4, real (in-sample p 1.000) | 4.3 ms | 1 / 0 / 8 | 1 | 8 | - | 40/40 |
+| cohort, `--block-threshold 2` | src | window 10, forced | 3.6 ms | 4 / 0 / 5 | 4 | 5 | - | 40/40 |
+| bulk2000 | src | window 10, forced | 3.1 ms | 2,133 / 2 / 9,865 | 2,134 | 9,866 | 12,000 of 12,000 | 40/40 |
+| bulk2000 `--block-host-port 132` | src, port 132 | window 10, forced | 5.1 ms | 2,129 / 4 / 9,867 | 2,129 | 19,743 | 2,128 of 12,000 | 40/40 |
+
+- **Every expected value holds.** No frame sent after the reply passes, and the frames toward the host keep arriving
+  (until the port entry). `blocked_pkts` equals exactly the frames that did not come back. In `bulk2000` that is
+  9,866 = 9,865 + 1 of the 2 frames sent during the write; with the port entry, 19,743 = 19,735 + all 8 sent during
+  the write.
+- **The blocked packets are still counted:** every window equals 11B's, and `replay_capture.py`'s exact self-check
+  is 44 of 44 in every run.
+- **The plan's command alarmed at once.** Without a held-out group the cohort run is in the detector's own training
+  data, so it raised a real alarm at the first scored window. `--block-threshold 2` isolates the forced alarm.
+- **Timing:** the switch writes an entry in 1.5-2.4 ms (`write_ms`), 3-5 ms from the collector's request to its
+  reply.
+- **By hand, while a replay ran** (`src/run_11d_manual.sh`):
+  - `window_reader.py --block-add src=10.0.0.10` failed with `Failed to subscribe to server`. The collector's reader
+    already uses the default client id 9.
+  - With `--client-id 10` it ran unbound ("another client is bound to basic: continuing unbound"), and BF Runtime
+    accepted the write (1.2 ms).
+  - The first frame was dropped 0.53 s into the 0.56 s call (Python start-up, connect, write). The 9,003 frames sent
+    after the call returned were all dropped, and `blocked_pkts` 9,021 = the frames that did not come back.
+  - The collector's own block at window 30 found the entry already there ("0 added, 1 there").
+
+**11E. Time to containment, real verdicts on replays** (`11e/`, `src/run_11e.sh`, `src/summarize_11e.py`):
+- **The detector:** each capture's group held out, the network detector, a host block on 10.0.0.10, no port block.
+- **Times:** seconds from the run's anchor, taken from the window markers in `tx.pcap`. The replayer starts 0.2-1.0
+  s late while it loads a capture and shifts its whole schedule, markers included.
+
+| Capture | First frame from 10.0.0.10 | Alarm (dataset window, p) | Alarm after that window's end | Block request / reply | Last frame from 10.0.0.10 through | From 10.0.0.10: sent / through / dropped | Dropped |
+|---|---|---|---|---|---|---|---|
+| udp_sink_60k | 0.003 s | 0, 0.982 | 282 ms | 0.782 / 0.786 s | 0.784 s | 60,000 / 36,657 / 23,343 | 38.9% |
+| syn_sink_40k | 0.004 s | 0, 0.871 | 299 ms | 0.839 / 0.842 s (flood) | 0.841 s | 82,332 / 37,153 / 45,179 | 54.9% |
+| syn_fan_40k | 0.004 s | 0, 0.983 | 261 ms | 0.761 / 0.764 s (flood) | 0.727 s | 39,846 / 39,846 / 0 | 0% |
+| goldeneye_p10 | 0.184 s | 0, 0.911 | 212 ms | 0.712 / 0.718 s (flood) | 0.711 s | 19,674 / 12,615 / 7,059 | 35.9% |
+| bulk2000 (benign) | 0.004 s | no alarm (max p 0.132) | | | | 12,000 / 12,000 / 0 | 0% |
+| session_1000 (benign) | 0.004 s | no alarm (max p 0.044) | | | | 6,000 / 6,000 / 0 | 0% |
+| dns_10k (benign) | 0.003 s | 0, 0.700 | 305 ms | 0.805 / 0.809 s | 0.807 s | 10,000 / 6,354 / 3,646 | 36.5% |
+
+- **Every attack alarms on its first 0.5-s window.** Its host is blocked 0.71-0.84 s into the run.
+- **Where the 212-305 ms after the window's end go:** the reader reads the window (40-46 ms, plus a 4 ms clear), then
+  ssh, then the forest's 80-145 ms of scoring on PC1, then the write (3-5 ms).
+- **`syn_fan_40k`'s flood had ended at 0.727 s**, before the block, so nothing was dropped.
+- **The frames toward 10.0.0.10 all passed** (a host block is by source).
+- **One false alarm:** `dns_10k`, benign, alarms on window 0, so the block drops 36.5% of its frames.
+- **The windows:** every run's windows equal part 6's replays of the same captures (40 of 40), and the self-checks
+  are 44 of 44: the dropped packets are counted.
+- **`--block-skip-windows 4` (added here, below)** makes the detector score the dataset's windows and not the replay's
+  4 windows before the anchor.
+  - Offline, `stream_verdicts.py` on the same CSVs (`11e/offline_skip/`) reproduces the collector's probabilities
+    exactly with the skip.
+  - Without it the alarms fall in the same windows with lower probabilities (e.g. 0.899 instead of 0.982), so these
+    7 decisions do not depend on it.
+
+**11F. Live, with the host monitor and the socket tracer** (`11f/`, `src/run_11f*.sh`, `src/check_11f.py`):
+- **The monitor was rebuilt first** (50ef77e):
+  - The build: `DEP=/usr CLANG=/usr/bin/clang BPFTOOL=... ebpf_perf/build.sh`, with bpftool v7.3.0 built from
+    `libbpf-bootstrap/bpftool` in `/dev/shm` (PC1 has none).
+  - `hostmon_agg.bpf.o` is byte-identical (f0944e7a...); only `hostmon_agg.c` and the binary changed.
+  - `test_agg_equiv` passes: 3,006 scenarios, 37,445 rows identical.
+  - Every run's log has 41 `HOSTMON_WINDOW_DONE` lines.
+- **The forced run:** `http_poll`, alarm forced at window 8 with `--block-threshold 2`. The stacked verdict was
+  already at or above 0.5 from window 1, so without the higher threshold it would have alarmed there. It ran beside
+  `tcp_beacon` looping in `hazim_bg`.
+  - **Health:** 40 rows, `HOSTMON_HEALTH` and `SOCKOWNER_HEALTH` all zeros.
+  - **Blocks:** at the alarm the 10 flows seen so far (20 entries, 16.9 ms); then each window's new flow (30 times,
+    2 entries, 2.6-3.9 ms). 80 entries in all.
+  - **Nothing was dropped:** `blocked_pkts` 0. All 40 of the program's connections reached PC2 and were served, 30
+    of them after the alarm. Each of its connections lasts a few ms, so its entry came 0.13-0.46 s after its last
+    packet: no connection had a packet after its entry.
+  - **The background program:** its 21 echo connections reached PC2, 15 after the alarm.
+- **The seven workloads of section 2b, no forced alarm** (no background program, the conditions of section 2b and
+  part 6c):
+
+| Workload | Alarm (window, p) | Flows blocked (entries) | Connections on PC2 / after the alarm | Packets dropped |
+|---|---|---|---|---|
+| fanout | 0, 0.523 | 12 (24) | 12 / 11 | 0 |
+| http_poll | 1, 0.727 | 36 (72) | 36 / 33 | 2 (the end of one connection) |
+| http_bulk | 5, 0.540 | 6 (12) | 6 / 4 | 0 |
+| tcp_beacon | 2, 0.809 | 20 (40) | 20 / 18 | 0 |
+| interactive | 1, 0.603 | 1 (2) | 1 / 0 | 9 |
+| threaded | 7, 0.625 | 32 (64) | 32 / 15 | 0 |
+| mixed | 1, 0.609 | 12 (24) | 12 / 8 | 0 |
+
+- **Every run is clean:** 40 rows, `HOSTMON_HEALTH` and `SOCKOWNER_HEALTH` all zeros.
+- **All seven benign programs are flagged**, at windows 0-7, as part 6c's high scores suggested (`http_bulk`'s
+  40-window row was 0.46, but its prefix of 6 windows crossed 0.5). That is the false-alarm cost of the rule with the
+  dataset's detectors: every live program here would be blocked.
+- **The flow block stopped nothing it was meant to.** Six of the seven open short connections, so each one ended
+  before its entry was written, the next window. `interactive` keeps one echo session open, so its entry cut it:
+  PC2 echoed 7 of its 90 commands, and the program ended with code 1.
+- **Verdict timing** (50ef77e's check, "within about 0.1 s"): each `score` record came a median 268-275 ms after its
+  window ended (maximum 284-309 ms), not 0.1 s.
+  - The row was complete about 114 ms after the window's end. The switch's window is back at the collector after
+    107 ms; the monitor's window is already there by then.
+  - The stacked detector's scoring takes 158-162 ms per window on PC1.
+  - With the old monitor the row would wait for the next window, a further 0.5 s.
+
+**Changed here:**
+- `hybrid_collector.py --block-skip-windows K` (`block_policy.Blocker(skip_windows=K)`): a replay's collector
+  windows before the run's first (`replay_capture.py --align-window K`) are neither scored nor checked for a flood.
+  The detectors were trained on prefixes from the run's first window. Default 0, so a live run is unchanged. Test
+  `test_the_windows_before_the_run_are_not_scored`.
+- `replay_capture.py --send-log`: `replay_absolute.py`'s send log (this host's clock after each frame) in
+  `DIR/send_log.txt`.
+- `perf/variants/exact_block/README.md` (status and the compile result) and `p4_perf.md` section 5.9.
+
+**Open points:**
+- **The direct counter and the 12th stage:** alt2 keeps per-entry drops at the exact build's stages and latency. It
+  needs 11B-11D again before adoption, and bf-p4c's power estimate for it is 2.11 W.
+- **Short connections pass a flow block:** blocking at the alarm by host or by the program's local ports, or at the
+  socket on the host, would stop new connections.
+- **Live false alarms:** 7 of 7 live benign programs were flagged. The detectors need rows collected the way the
+  live rows are.
+- **Verdict latency on PC1** is about 0.27 s:
+  - the forest's scoring is about 160 ms, which more jobs, fewer trees or a compiled forest would cut;
+  - the switch's window reaches the collector about 107 ms after its end. Reading and clearing it take about 45 ms;
+    the reply leaves the reader about 50 ms after that, which the timing log does not break down.
+- **11B's optional step:** all 109 captures were not run (about an hour).
+
+**State after:**
+- **Switch:** `basic_exact_block` (pid 26079, our `hz_sw`), forwarding 132 <-> 140, the block table empty, `enp5s0`
+  down.
+- **PC1:** eth1 back to 1,024 receive descriptors, offloads untouched, the test cgroups removed. `ebpf_perf/build/`
+  holds the rebuilt monitors (git-ignored).
+- **PC2:** as found; the logging server was stopped and its files removed.

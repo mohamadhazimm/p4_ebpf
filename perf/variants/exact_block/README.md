@@ -5,9 +5,16 @@
 for line: 7 of the 8 files are identical to `perf/variants/exact`, and `ingress.p4` only has lines inserted (a header
 comment, the table, and its lookup after `forwarding.apply()`), checked by `tests/test_exact_block.py`.
 
-**Status (2026-11-19): not compiled yet.** The design, the control plane and the loop are tested offline (the
-program's software model `exact_model.py`, a fake BF Runtime client). Compile, resources, latency, line rate and the
-block function on the Wedge: `PC1.md` part 11.
+**Status (2026-11-19, `PC1.md` "Results, part 11"): compiled and run on the Wedge with `-DBLOCK_DIRECT_COUNTER=0`.**
+The default (`BLOCK_DIRECT_COUNTER=1`) does not compile: bf-p4c refuses `block_drop` counting the indirect
+`blocked_pkts` and the direct `block_hits` in one action ("all indirect externs to be addressed with the same
+expression across all actions"). With the fallback the build takes 12 ingress stages (the exact build 11) and 279
+cycles (260): `forwarding` and `block_drop` both write `drop_ctl`, so the table follows stage 0 and the flow-table
+chain behind it moves down one stage; latency 437 ns (421). Compiled as a side check, not run: counting
+`blocked_pkts` on `block_rules.apply().hit` keeps the direct counter, and also moving the lookup to the end of the
+data path gives 11 stages, 260 cycles and 421 ns (sources in `live_test/committee_replay/pc1_20261119_part11.tar.xz`,
+`part11_20261119/src/alt/`). Line rate, unchanged
+windows and the block function: `p4_perf.md` 5.9.
 
 ## The table
 

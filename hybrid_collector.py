@@ -3412,6 +3412,8 @@ def build_arg_parser(profile: Optional[str] = None) -> argparse.ArgumentParser:
     ap.add_argument("--block-force-alarm-window", type=int, metavar="W",
                     help="raise the alarm at window W whatever the probability (to test the blocking with benign "
                          "programs)")
+    ap.add_argument("--block-skip-windows", type=int, default=0, metavar="K",
+                    help="--block-on-alarm: the collector windows before K are not the run's (a replay anchored on window K, replay_capture.py --align-window K): they are neither scored nor checked for a flood, so that the detectors, trained on prefixes from the run's first window, see the same windows")
     ap.add_argument("--block-keep", action="store_true", help="leave the block entries in the switch at the end")
     ap.add_argument("--block-entries", type=int, default=1024,
                     help="the block table's size (the build's -DBLOCK_ENTRIES): when a flagged program's flow entries "
@@ -3809,7 +3811,7 @@ def main() -> None:
                 tail=block_policy.FlowTail(args.sockowner_log) if args.sockowner else None,
                 host_addresses=args.block_host, host_port=args.block_host_port, flood_flows=flood,
                 log_path=block_log, force_window=args.block_force_alarm_window, keep=args.block_keep,
-                max_entries=args.block_entries)
+                max_entries=args.block_entries, skip_windows=args.block_skip_windows)
             print(f"[INFO] block rules: flows of {'the monitored cgroup' if args.sockowner else 'no program (no --sockowner)'}"
                   f", host on more than {flood:g} active flows per window, log {block_log}")
         if exact:

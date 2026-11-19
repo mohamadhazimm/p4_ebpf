@@ -927,6 +927,60 @@ and no flow should go unread under a flood. **Where the remaining errors came fr
   - **So the 103 of 109 holds with in-band probes.** With the generator, a replay's rows lose parity. On PC1 (2 cores)
     a flood replay also cost exports at the NIC and once hung the host.
 
+### 5.9 Block rules on a malicious verdict (build `exact_block`, 19 November, tested on the switch)
+
+- **Idea.** `perf/variants/exact_block` is Section 5.7's exact build plus one ternary table, `block_rules`, on the
+  ingress port and the 5-tuple, looked up for every IPv4 packet after the forwarding table. A match is dropped at the
+  end of ingress, after the window registers have counted it, so the windows (and the verdicts after the block) still
+  see the attack. The control plane (`window_reader.py`, `block_policy.py`, `hybrid_collector.py --block-on-alarm`)
+  installs the flagged program's flows, or its host on a flood, when the detector's probability reaches 0.5. PC1.md
+  "Results, part 11"; `perf/results/part11_20261119/`.
+- **Compile** (bf-p4c 9.6.0). The design's per-entry direct counter is refused: `block_drop` counts both the indirect
+  `blocked_pkts` and the direct `block_hits`, and bf-p4c requires "all indirect externs to be addressed with the same
+  expression across all actions" ("The action block_drop uses Counter Ingress.blocked_pkts but does not use
+  DirectCounter Ingress.block_hits"). The plan's fallback `-DBLOCK_DIRECT_COUNTER=0` (the total only) compiles, but
+  takes all 12 ingress stages. `forwarding` and `block_drop` both write `drop_ctl` (an output dependency), so the
+  table cannot share stage 0 with `forwarding`, and the `is_flow` gateway that follows it in control order then
+  starts the whole flow-table chain one stage later. Two placements were compiled as a side check, not run on the
+  traffic tests: counting `blocked_pkts` on `block_rules.apply().hit` outside the action keeps the direct counter
+  (alt1), and also moving the lookup to the end of the data path gives the exact build's stages and cycles back (alt2).
+
+  | Build | Stages ig/eg | Critical path | SRAM | Map RAM | TCAM | Stateful ALUs | Ingress cycles | Median latency |
+  |---|---|---|---|---|---|---|---|---|
+  | exact v3 (Section 5.7) | 11/1 | 9 | 122 | 119 | 7 | 23 | 260 | 421 ns |
+  | exact_block, `-DBLOCK_DIRECT_COUNTER=0` (tested) | 12/1 | 10 | 125 | 121 | 13 | 23 | 279 | 437 ns |
+  | exact_block alt1: total counted on hit, direct counter kept | 12/1 | 10 | 127 | 123 | 13 | 23 | 279 | – |
+  | exact_block alt2: alt1, lookup at the end of the data path | 11/1 | 9 | 127 | 123 | 13 | 23 | 260 | 421 ns |
+
+  - The 1,024-entry, 113-bit table costs the expected 6 TCAM blocks and no stateful ALU. bf-p4c's power estimate is
+    0.52 W (ingress) for the tested build and 2.11 W for alt2, against 0.56 W for exact v3.
+  - **Latency:** hairpin as in Section 4.1, 3 runs of 1,010 probes per build, none missing, baseline 246 ns the same
+    day. The 12th stage costs 19 cycles and 16 ns; alt2 costs nothing measurable.
+- **Line rate** (Section 3.2's 27-run matrix, `--window-totals`): the same rates as exact v3 at every size, lossless,
+  the window totals exact for 18.0 billion packets. With 1,024 entries that match nothing (written in one request in
+  174 ms), the 1518 B paced and maximum runs and the 64 B maximum runs give the same rates again, and nothing is blocked.
+- **The windows are unchanged.** Ten distinct captures (Chaos, the floods and calm runs) through the build, with and
+  without entries, give every window equal to the exact build's in all 27 non-duration features, and every
+  collector-path replay's self-check is exact (44 of 44 windows). The packets dropped by the rule are still counted.
+- **The block on the switch** (replays into port 132, a 132 -> 132 hairpin so that PC1 captures what passed):
+  - **Timing:** one entry is written in 1.5 ms on the switch and 3-5 ms from the collector's request.
+  - **Exactness:** every frame from the blocked host sent after the reply is dropped, the frames toward it pass, and
+    `blocked_pkts` equals the frames dropped exactly. In `bulk2000`, 9,866 = 9,865 sent after the reply + 1 of the 2
+    sent during the write.
+  - **Port block:** a port entry drops everything entering port 132 from the write on.
+  - **A second client:** it can add entries while the collector's reader owns the program. It must use another BF
+    Runtime client id; with the same id it cannot subscribe.
+- **Time to containment** (real network verdicts on 7 replays, each capture's group held out of the training):
+  - **Alarms:** all 4 attacks alarm on their first 0.5-s window (p 0.871-0.983), 212-305 ms after it ends. That
+    delay is the reader's read and the forest's 80-145 ms of scoring on PC1.
+  - **Drops:** the host block then drops 36-55% of the attacker's frames. Only `syn_fan_40k`'s flood is over before
+    the block (0%).
+  - **False alarm:** `dns_10k` (benign) alarms on window 0 (p 0.700), so 36.5% of its frames are dropped.
+- **Limits measured live** (PC1.md 11F): the flows of a flagged program are blocked one window after they appear, so a
+  program of short connections (one HTTP fetch per 0.5 s) is never stopped. Every connection ends before its entry is
+  written, and nothing is dropped. The stacked detector's verdict came a median 275 ms after its window on PC1 (162 ms
+  of it scoring).
+
 ## 6. Switch CPU side
 
 These two measurements cover the switch CPU and its driver, not the P4 program. The P4

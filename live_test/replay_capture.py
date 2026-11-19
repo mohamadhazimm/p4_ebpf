@@ -427,6 +427,9 @@ def main():
     ap.add_argument("--execution-id", help="--sweep, --profile dataset: compare the row of the dataset's 40 windows "
                                            "with this execution id's published row")
     ap.add_argument("--release", default=str(REPO.parent / "p4-ebpf-malware-detection"))
+    ap.add_argument("--send-log", action="store_true",
+                    help="--replayer absolute: DIR/send_log.txt gets this host's clock just after each capture frame was "
+                         "sent (replay_absolute.py --send-log; one line per frame in capture order, \"-\" if refused)")
     ap.add_argument("--frame-min", action="append", default=None,
                     help="--exact, --sweep: DST/PREFIX toward which the switch counts the frame minimum (default with "
                          "--profile dataset: 10.0.0.10/32, the dataset's guest)")
@@ -483,6 +486,8 @@ def main():
             shlex.quote(args.tx_iface), args.align_window, args.anchor_offset, repr(window_sec),
             shlex.quote(str(capture)), " --markers --marker-windows %d" % n_windows if args.exact else
             " --probes changed --probe-windows %d" % n_windows if args.sweep == "inband" else "")
+        if args.send_log:
+            scenario += " --send-log %s" % shlex.quote(str(out / "send_log.txt"))
     stub = out / "hostmon_stub"
     stub.write_text("#!/bin/sh\n# stand-in HostMon: the host side of a replay comes from the recorded run\nexec sleep 86400\n")
     stub.chmod(0o755)
