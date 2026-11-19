@@ -48,18 +48,36 @@ class ProgramTest(unittest.TestCase):
             self.assertEqual(sorted(set(op for op, *_ in ops)), ["equal", "insert"])
             inserted = "\n".join(line for op, _, _, j1, j2 in ops if op == "insert"
                                  for line in b.split("\n")[j1:j2])
-            for needed in ("table block_rules", "block_rules.apply();", "ig_dprsr_md.drop_ctl = 3w1;",
+            for needed in ("table block_rules", "block_rules.apply().hit", "ig_dprsr_md.drop_ctl = 3w1;",
                            "ig_intr_md.ingress_port : ternary;", "hdr.ipv4.srcAddr        : ternary;",
                            "meta.l4_dport           : ternary;", "blocked_pkts.count(0);"):
                 self.assertIn(needed, inserted)
 
-    def test_the_lookup_comes_after_forwarding_and_only_for_ipv4(self):
+    def test_the_lookup_is_the_data_paths_last_step_and_only_for_ipv4(self):
+        # PC1.md part 11: right after forwarding.apply() the build needs a 12th ingress stage (both tables write
+        # drop_ctl), and bf-p4c refuses the indirect blocked_pkts next to the direct block_hits in one action
         text = (VARIANTS / "exact_block" / "ingress.p4").read_text()
-        i = text.index("            forwarding.apply();")
-        self.assertEqual(text[i:].split("\n")[1:4], ["            if (hdr.ipv4.isValid()) {",
-                                                     "                block_rules.apply();", "            }"])
+        apply = text[text.index("    apply {"):]
+        i = apply.index("            forwarding.apply();")
+        j = apply.index("                rst_add.execute(meta.bank);")       # the flow table's last update
+        k = apply.index("block_rules.apply()")
+        self.assertLess(i, j)
+        self.assertLess(j, k)
+        self.assertEqual(apply[j:].split("\n")[1:7], [
+            "            }",
+            "            /* block rules last: the windows above have counted the packet, the drop takes effect at the end */",
+            "            if (hdr.ipv4.isValid()) {",
+            "                if (block_rules.apply().hit) {",
+            "                    blocked_pkts.count(0);",
+            "                }"])
+        self.assertEqual(apply.count("block_rules.apply()"), 1)
         # the marker and timer branches come before, and never look the table up
-        self.assertLess(text.index("epoch_tick.execute(0);"), i)
+        self.assertLess(apply.index("epoch_tick.execute(0);"), i)
+        # the action uses only the direct counter
+        action = text[text.index("    action block_drop() {"):]
+        action = action[:action.index("    }")]
+        self.assertNotIn("blocked_pkts", action)
+        self.assertIn("block_hits.count();", action)
 
     def test_the_latency_patch_still_applies(self):
         with tempfile.TemporaryDirectory() as out:
@@ -68,7 +86,7 @@ class ProgramTest(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             text = (Path(out) / "basic_hwl_exact" / "ingress.p4").read_text()
             self.assertIn("hdr.hw_bridge.setValid();", text)
-            self.assertIn("block_rules.apply();", text)
+            self.assertIn("block_rules.apply().hit", text)
 
 
 # ------------------------------------------------------------------ window_reader.py's block command
@@ -103,8 +121,8 @@ class FakeGC:
 
 
 class FakeTable:
-    def __init__(self, name):
-        self.name, self.entries, self.writes = name, {}, []
+    def __init__(self, name, capacity=None):
+        self.name, self.entries, self.writes, self.capacity = name, {}, [], capacity
 
     def make_key(self, fields):
         return Key(fields)
@@ -116,7 +134,11 @@ class FakeTable:
         self.writes.append(("add", len(keys)))
         if any(k.fields in self.entries for k in keys):
             raise RuntimeError("Error: table_entry_add failed: ALREADY_EXISTS")
-        for k, d in zip(keys, datas):
+        for i, (k, d) in enumerate(zip(keys, datas)):
+            if self.capacity is not None and len(self.entries) >= self.capacity:
+                # as BF Runtime on the Wedge: the entries before the first that does not fit stay
+                raise RuntimeError("Error(s):\n\t* At index %d: RESOURCE_EXHAUSTED, 'Table Add failed "
+                                   "table:pipe.Ingress.block_rules Not enough space'" % i)
             self.entries[k.fields] = (d, 0)
 
     def entry_del(self, target, keys=None):
@@ -126,7 +148,13 @@ class FakeTable:
         for k in keys or []:
             self.entries.pop(k.fields, None)
 
+    def operations_execute(self, target, op):
+        if getattr(self, "no_sync", False):
+            raise RuntimeError("Error: operation %s not supported" % op)
+        self.writes.append(("op", op))
+
     def entry_get(self, target, keys, flags):
+        self.last_flags = flags
         if self.name == "blocked_pkts":
             yield Data([DataTuple("$COUNTER_SPEC_PKTS", [5, 6])]), None
             return
@@ -193,6 +221,34 @@ class ReaderBlockTest(unittest.TestCase):
         self.assertEqual(len(prog.tabs["block_rules"].entries), 2)
         self.assertEqual(window_reader.block_clear(prog), {"block_cleared": True})
         self.assertEqual(prog.tabs["block_rules"].entries, {})
+
+    def test_a_full_table_is_reported_not_raised(self):
+        # PC1.md part 11b: with the direct counter the 1,024-entry table holds 1,023, and BF Runtime keeps the
+        # entries of a batch before the first that does not fit
+        prog = FakeProg()
+        prog.tabs["block_rules"].capacity = 3
+        entries = [{"src": "203.0.113.%d" % i} for i in range(5)]
+        r = window_reader.block_add(prog, entries)
+        self.assertTrue(r["table_full"])
+        self.assertIn("error", r)
+        self.assertEqual(r["added"], 3)
+        self.assertEqual(len(window_reader.block_list(prog)["entries"]), 3)
+        # with entries there already: one by one, up to the first that does not fit
+        r = window_reader.block_add(prog, entries[2:])
+        self.assertEqual((r["added"], r["existing"], r["table_full"]), (0, 1, True))
+
+    def test_the_list_syncs_the_counters_once(self):
+        # PC1.md part 11b: read from the hardware the entries cost about 51 ms each on the Wedge
+        prog = FakeProg()
+        t = prog.tabs["block_rules"]
+        window_reader.block_add(prog, [{"src": "203.0.113.%d" % i} for i in range(4)])
+        listed = window_reader.block_list(prog)
+        self.assertEqual(len(listed["entries"]), 4)
+        self.assertEqual([w for w in t.writes if w[0] == "op"], [("op", "SyncCounters")])
+        self.assertEqual(t.last_flags, {"from_hw": False})
+        t.no_sync = True                                                   # without the operation: the hardware
+        self.assertEqual(len(window_reader.block_list(prog)["entries"]), 4)
+        self.assertEqual(t.last_flags, {"from_hw": True})
 
     def test_a_program_without_the_table(self):
         prog = FakeProg(with_block=False)
@@ -423,6 +479,22 @@ class PolicyTest(unittest.TestCase):
         b.on_net_window(1, {"net_flow_count_seen": 5})                    # 4 more entries would not fit
         self.assertEqual(reader.adds()[-1]["entries"], [{"src": "10.0.0.10"}])
         self.assertEqual(b.events[-1]["reason"], "table_full")
+
+    def test_the_host_block_always_fits(self):
+        # the flows leave room for the host's entries: with 8 entries and one host address, 3 flows (6 entries) fit,
+        # and the 4th (2 more) turns into the host block, which then fits (7 entries in all)
+        reader = FakeReader()
+        self.append("".join(flow_line(PROGRAM, "egress", "tcp", "10.0.0.10", 40000 + i, "203.0.113.5", 443)
+                            for i in range(3)))
+        b = self.blocker(reader, [0.9], max_entries=8)
+        b.on_row(0, {})
+        self.assertEqual(len(reader.adds()[0]["entries"]), 6)
+        self.append(flow_line(PROGRAM, "egress", "tcp", "10.0.0.10", 41000, "203.0.113.5", 443))
+        b.on_net_window(1, {"net_flow_count_seen": 4})
+        self.assertEqual(reader.adds()[-1]["entries"], [{"src": "10.0.0.10"}])
+        self.assertEqual(b.events[-1]["reason"], "table_full")
+        self.assertLessEqual(sum(len(a["entries"]) for a in reader.adds()), 8)
+        self.assertEqual(block_policy.BLOCK_ENTRIES, 1023)               # the default build's capacity
 
     def test_the_flood_threshold_follows_the_window(self):
         self.assertEqual(block_policy.flood_threshold(0.5), 500)

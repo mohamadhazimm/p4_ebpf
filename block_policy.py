@@ -32,7 +32,9 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set,
 import sockjoin
 
 FLOOD_FLOWS_PER_HALF_SECOND = 500
-BLOCK_ENTRIES = 1024        # the table's size (perf/variants/exact_block, -DBLOCK_ENTRIES)
+# the entries the table holds: perf/variants/exact_block's 1,024 (-DBLOCK_ENTRIES) less one with the per-entry direct
+# counter (the default): on the Wedge the 1,024th add fails with RESOURCE_EXHAUSTED (PC1.md part 11b)
+BLOCK_ENTRIES = 1023
 SCORE_WINDOWS = 40          # the detectors were trained on prefixes of up to 40 windows (stream_verdicts.PREFIXES)
 
 Entry = Dict[str, Any]
@@ -204,7 +206,9 @@ class Blocker:
         if not keys:
             return
         entries = [e for k in keys for e in flow_entries(k)]
-        if self.flow_entry_count + len(entries) > self.max_entries:
+        # the flows leave room for the host's entries, so that the host block always fits when they no longer do
+        reserve = len(host_entries(self._host_addresses(), self.host_port))
+        if self.flow_entry_count + len(entries) > self.max_entries - reserve:
             # more flows than the table holds: the host instead
             self._block_host(window, "table_full")
             return

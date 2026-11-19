@@ -3415,8 +3415,10 @@ def build_arg_parser(profile: Optional[str] = None) -> argparse.ArgumentParser:
     ap.add_argument("--block-skip-windows", type=int, default=0, metavar="K",
                     help="--block-on-alarm: the collector windows before K are not the run's (a replay anchored on window K, replay_capture.py --align-window K): they are neither scored nor checked for a flood, so that the detectors, trained on prefixes from the run's first window, see the same windows")
     ap.add_argument("--block-keep", action="store_true", help="leave the block entries in the switch at the end")
-    ap.add_argument("--block-entries", type=int, default=1024,
-                    help="the block table's size (the build's -DBLOCK_ENTRIES): when a flagged program's flow entries "
+    ap.add_argument("--block-entries", type=int, default=1023,
+                    help="the entries the block table holds (the build's -DBLOCK_ENTRIES less one with the per-entry "
+                         "direct counter: 1,023 for the default build on the Wedge, PC1.md part 11b): when a flagged "
+                         "program's flow entries "
                          "would exceed it, its host is blocked instead")
     ap.add_argument("--block-log",
                     help="JSONL of the scores, the alarm and every block request (default: --out-csv with "

@@ -587,30 +587,58 @@ def blocked_total(prog):
     return 0
 
 
+def _full_at(text):
+    """The index of the first entry a batch add could not fit ("At index K: RESOURCE_EXHAUSTED"), or None."""
+    for line in text.splitlines():
+        if "RESOURCE_EXHAUSTED" in line and "At index" in line:
+            try:
+                return int(line.split("At index", 1)[1].split(":", 1)[0])
+            except ValueError:
+                return None
+    return None
+
+
 def block_add(prog, entries):
-    """Install the entries in one write (one by one if some exist already). Returns what was added."""
+    """Install the entries in one write (one by one if some exist already). Returns what was added. A full table is
+    reported (an "error" and "table_full"), not raised: on the Wedge the 1,024-entry build with the direct counter
+    holds 1,023 entries (PC1.md part 11b), and BF Runtime keeps the entries of a batch before the first that did
+    not fit."""
     t = prog.table(BLOCK_TABLE)
     keys = [_block_key(prog, t, e) for e in entries]
     t0 = time.time()
-    added, existing = 0, 0
+    added, existing, full = 0, 0, None
     if keys:
         datas = [t.make_data([], BLOCK_ACTION) for _ in keys]
         try:
             t.entry_add(prog.target, keys, datas, **prog.kw(t.entry_add))
             added = len(keys)
         except Exception as error:
-            if "ALREADY_EXISTS" not in str(error):
+            text = str(error)
+            if "RESOURCE_EXHAUSTED" in text and "ALREADY_EXISTS" not in text:
+                k = _full_at(text)
+                added = k if k is not None else 0
+                full = text.strip().splitlines()[-1][:200]
+            elif "ALREADY_EXISTS" not in text:
                 raise
-            for key, data in zip(keys, datas):
-                try:
-                    t.entry_add(prog.target, [key], [data], **prog.kw(t.entry_add))
-                    added += 1
-                except Exception as error1:
-                    if "ALREADY_EXISTS" not in str(error1):
-                        raise
-                    existing += 1
-    return {"block": "add", "added": added, "existing": existing, "t_written": time.time(),
-            "write_ms": round((time.time() - t0) * 1e3, 3)}
+            else:
+                for key, data in zip(keys, datas):
+                    try:
+                        t.entry_add(prog.target, [key], [data], **prog.kw(t.entry_add))
+                        added += 1
+                    except Exception as error1:
+                        if "RESOURCE_EXHAUSTED" in str(error1):
+                            full = str(error1).strip().splitlines()[-1][:200]
+                            break
+                        if "ALREADY_EXISTS" not in str(error1):
+                            raise
+                        existing += 1
+    out = {"block": "add", "added": added, "existing": existing, "t_written": time.time(),
+           "write_ms": round((time.time() - t0) * 1e3, 3)}
+    if full is not None:
+        out["table_full"] = True
+        out["error"] = "the block table is full: %d of %d entries added or there (%s)" % (added + existing, len(keys),
+                                                                                          full.strip())
+    return out
 
 
 def block_del(prog, entries):
@@ -650,10 +678,20 @@ def _key_field(kd, name):
 
 
 def block_list(prog):
-    """Every entry, as an entry dict, with the packets it dropped (when the build has the direct counter)."""
+    """Every entry, as an entry dict, with the packets it dropped (when the build has the direct counter). The
+    table's direct counters are synced from the hardware once (the SyncCounters operation) and the entries read from
+    software: read from the hardware entry by entry they cost about 51 ms each on the Wedge (5.1 s for 100 entries,
+    PC1.md part 11b). Without the operation the entries are read from the hardware."""
     t = prog.table(BLOCK_TABLE)
     out = []
-    for data, key in t.entry_get(prog.target, None, {"from_hw": True}, **prog.kw(t.entry_get)):
+    flags = {"from_hw": True}
+    if hasattr(t, "operations_execute"):
+        try:
+            t.operations_execute(prog.target, "SyncCounters", **prog.kw(t.operations_execute))
+            flags = {"from_hw": False}
+        except Exception as error:
+            log("block list: no counter sync (%s): reading from the hardware" % str(error).splitlines()[0][:160])
+    for data, key in t.entry_get(prog.target, None, flags, **prog.kw(t.entry_get)):
         kd, dd = key.to_dict(), data.to_dict()
         entry = {}
         for name, field, bits in BLOCK_FIELDS:

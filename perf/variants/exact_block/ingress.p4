@@ -6,7 +6,14 @@
  * host (the source address, or the ingress port). A packet that matches is dropped at the end of ingress;
  * the window registers have still counted it, so the windows go on showing the attack. blocked_pkts counts
  * every blocked packet; block_hits (a direct counter, -DBLOCK_DIRECT_COUNTER=0 leaves it out) counts them per
- * entry. Only IPv4 packets are looked up; window markers and timer packets never are. */
+ * entry. Only IPv4 packets are looked up; window markers and timer packets never are.
+ *
+ * Placement (bf-p4c 9.6.0, PC1.md part 11): the lookup is the data path's last step, after the flow table,
+ * and blocked_pkts is counted on its hit outside the action. Right after forwarding.apply() the table cannot
+ * share stage 0 with forwarding (both write drop_ctl), and the flow-table chain behind it then starts a stage
+ * later: 12 ingress stages and 279 cycles instead of the exact build's 11 and 260. And an action that counts
+ * both the indirect blocked_pkts and the direct block_hits is refused ("all indirect externs ... addressed
+ * with the same expression across all actions"). Placed last, the table goes to a late stage that has room. */
 /* perf/variants/exact: the 29 window features of features/switch_model.py computed in the data plane,
  * so that no window depends on when or how much the control plane reads.
  *
@@ -388,11 +395,12 @@ control Ingress(
 #if BLOCK_DIRECT_COUNTER
     DirectCounter<bit<32>>(CounterType_t.PACKETS) block_hits;
 #endif
+    /* blocked_pkts is counted on the table's hit in apply, not here: bf-p4c refuses an action that uses the
+     * indirect counter next to the table's direct one */
     action block_drop() {
 #if BLOCK_DIRECT_COUNTER
         block_hits.count();
 #endif
-        blocked_pkts.count(0);
         ig_dprsr_md.drop_ctl = 3w1;
     }
     table block_rules {
@@ -430,9 +438,6 @@ control Ingress(
             ig_dprsr_md.drop_ctl = 3w1;
         } else {
             forwarding.apply();
-            if (hdr.ipv4.isValid()) {
-                block_rules.apply();
-            }
             meta.epoch = epoch_get.execute(0);
             if (meta.is_flow == 1w1) {
                 prep();
@@ -501,6 +506,12 @@ control Ingress(
                 tot_add.execute(meta.bank ++ meta.found ++ meta.dir_ab);
                 flags_add.execute(meta.bank);
                 rst_add.execute(meta.bank);
+            }
+            /* block rules last: the windows above have counted the packet, the drop takes effect at the end */
+            if (hdr.ipv4.isValid()) {
+                if (block_rules.apply().hit) {
+                    blocked_pkts.count(0);
+                }
             }
         }
     }

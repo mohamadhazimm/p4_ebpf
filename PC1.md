@@ -2793,7 +2793,7 @@ part 9C, `compare_11b.py`):
 
 **Open points:**
 - **The direct counter and the 12th stage:** alt2 keeps per-entry drops at the exact build's stages and latency. It
-  needs 11B-11D again before adoption, and bf-p4c's power estimate for it is 2.11 W.
+  needs 11B-11D again before adoption, and bf-p4c's power estimate for it is 2.11 W. (Done: "Results, part 11b".)
 - **Short connections pass a flow block:** blocking at the alarm by host or by the program's local ports, or at the
   socket on the host, would stop new connections.
 - **Live false alarms:** 7 of 7 live benign programs were flagged. The detectors need rows collected the way the
@@ -2810,3 +2810,90 @@ part 9C, `compare_11b.py`):
 - **PC1:** eth1 back to 1,024 receive descriptors, offloads untouched, the test cgroups removed. `ebpf_perf/build/`
   holds the rebuilt monitors (git-ignored).
 - **PC2:** as found; the logging server was stopped and its files removed.
+
+## Results, part 11b (PC1, 2026-11-19): the block table in the exact build's 11 stages
+
+The user asked whether `block_drop` could be worked around so that the build fits. It can: part 11's alt2 is now
+`perf/variants/exact_block` itself (`basic_exact_block_v2` on the switch), and 11B-11F were run again on it. Files:
+`*_v2` directories in `perf/results/part11_20261119/`, the archive `live_test/committee_replay/pc1_20261119_part11b.tar.xz`.
+
+**The change** (`ingress.p4`, still only inserted lines against `perf/variants/exact`):
+- `block_drop` only drops and counts the entry's direct counter `block_hits`.
+- `blocked_pkts` is counted on `block_rules.apply().hit`, outside the action. bf-p4c refused the action with both
+  counters.
+- The lookup is the data path's last step, after the flow table. Right after `forwarding.apply()` it needed a 12th
+  stage: both tables write `drop_ctl`, and the flow-table chain that follows it in control order started a stage later.
+- The semantics are unchanged: every IPv4 packet of the data path is looked up (markers and timer packets never), and
+  the drop takes effect at the end of ingress, after the window registers have counted the packet.
+
+**Compile:** `basic_exact_block_v2`, `_v2_timer` and `basic_hwl_exact_block_v2` compile with the defaults (direct
+counter on).
+
+| Build | Stages ig/eg | Critical path | SRAM | Map RAM | TCAM | Stateful ALUs | Ingress cycles | Latency (median) |
+|---|---|---|---|---|---|---|---|---|
+| basic_exact_v3 | 11/1 | 9 | 122 | 119 | 7 | 23 | 260 | 421 ns |
+| basic_exact_block_v2 | 11/1 | 9 | 127 | 123 | 13 | 23 | 260 | 421 ns |
+| basic_exact_block (part 11, `-DBLOCK_DIRECT_COUNTER=0`) | 12/1 | 10 | 125 | 121 | 13 | 23 | 279 | 437 ns |
+
+- **Latency:** 3 runs of 1,010 probes per build, none missing; baseline 246 ns and v3 421 ns the same hour.
+- **bf-p4c's power estimate** is 2.11 W (ingress), against v3's 0.56 W. It counts the table's 6 TCAM blocks, searched
+  for every IPv4 packet, which part 11's build searched too: its 0.52 W left the table off the estimate's worst-case
+  path (`always_runs` false there, true here).
+
+**Found on the switch, fixed:**
+- **Capacity:** with the direct counter the table takes 1,023 entries. The 1,024th add fails with `RESOURCE_EXHAUSTED,
+  'Table Add failed table:pipe.Ingress.block_rules Not enough space'`, and BF Runtime keeps the batch's earlier entries.
+  - `window_reader.py block_add` now reports a full table (`table_full`, an `error`, the entries added) instead of
+    raising.
+  - `block_policy.BLOCK_ENTRIES` and `--block-entries` default to 1,023.
+  - The flow entries leave room for the host's entries, so a `table_full` host block always fits.
+- **Listing:** with the counter attached, reading every entry from the hardware costs 51 ms per entry (5.1 s for 100).
+  At the end of the forced live run, listing 80 entries held the run 4.1 s.
+  - `block_list` now syncs the table's counters once (the `SyncCounters` operation of BF Runtime) and reads the entries
+    from software: 1,023 entries in 0.61-0.68 s.
+  - Checked with pings: an ICMP entry showed 5 and then 8 dropped, the counts sent.
+- **Tests:** 3 new and the placement test rewritten (300 run, 8 skipped, under the `.venv`).
+
+**The checks again** (the same commands as part 11):
+- **11B** (`exact_replays_5_v2/`): the 5 rows equal v3's in 135 of 135 non-duration columns, every window equal, the
+  reset clearing the table.
+- **11C** (`linerate_v2/`): the 27-run matrix gives the same rates as v3 at every size, lossless, totals exact
+  (18.0 billion packets). With the table full (1,023 entries that match nothing) the 1518 B paced and maximum runs and
+  the 64 B runs give the same rates again, and nothing is blocked.
+- **11D** (`11d_v2/`, hairpin):
+
+| Run | Entries | Alarm to reply | From 10.0.0.10: before / during / after the write | Through | Dropped per entry | `blocked_pkts` | Windows |
+|---|---|---|---|---|---|---|---|
+| cohort, forced at 10 (threshold 2) | src | 3.3 ms | 4 / 0 / 5 | 4 | 10.0.0.10: 5 | 5 | 40/40 |
+| bulk2000, forced at 10 | src | 4.1 ms | 2,151 / 0 / 9,849 | 2,151 | 10.0.0.10: 9,849 | 9,849 | 40/40 |
+| bulk2000 + `--block-host-port 132` | src, port 132 | 5.0 ms | 2,127 / 2 / 9,871 | 2,127 | 10.0.0.10: 9,873; port 132: 9,874 | 19,747 | 40/40 |
+
+  - **The per-entry counts add up to `blocked_pkts`.** A frame that matches both entries counts on one: the host's
+    frames on the host entry, and the replies toward it, which match only the port entry, on the port entry.
+  - The exact self-checks are 44 of 44.
+- **11E** (`11e_v2/`): the same decisions as part 11.
+
+| Capture | Alarm (dataset window, p) | After that window's end | Dropped (of the frames from 10.0.0.10) |
+|---|---|---|---|
+| udp_sink_60k | 0, 0.982 | 255 ms | 41.2% |
+| syn_sink_40k | 0, 0.871 | 316 ms | 58.3% |
+| syn_fan_40k | 0, 0.983 | 260 ms | 0% (the flood is over at 0.742 s, the block in at 0.764 s) |
+| goldeneye_p10 | 0, 0.911 | 201 ms | 35.9% |
+| bulk2000 / session_1000 (benign) | no alarm (max p 0.132 / 0.044) | | 0% |
+| dns_10k (benign) | 0, 0.700 | 367 ms | 31.7% |
+
+  - Every run's windows equal part 6's (40 of 40), the self-checks are 44 of 44, and the per-entry counts equal
+    `blocked_pkts`.
+- **11F** (`11f_v2/`, with the PC2 logging server):
+  - **Forced `http_poll` beside `tcp_beacon` in `hazim_bg`:** 40 rows, health zeros. 31 requests wrote 80 entries;
+    `blocked_pkts` 0. All 40 of the program's connections reached PC2, 30 after the alarm, none with a packet after its
+    entry. The background program's 26 connections all reached PC2, 20 after the alarm.
+  - **`interactive`:** alarm at window 1 (p 0.604). Its echo session's entry toward PC2 dropped 9 packets (the client's
+    retransmissions), the reply direction's entry 0.
+  - **Verdict timing:** a median 270-273 ms after the window's end, as in part 11.
+
+**State after:**
+- **Switch:** `basic_exact_block_v2` (pid 31757), forwarding 132 <-> 140, the block table empty and `blocked_pkts`
+  reset, `enp5s0` down. Part 11's builds stay in `/root/hazim_perf/build/` as the record.
+- **PC1:** eth1 at 1,024 receive descriptors.
+- **PC2:** as found.

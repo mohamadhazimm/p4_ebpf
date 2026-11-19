@@ -3,27 +3,29 @@
 `perf/variants/exact` (the 29 window features in the data plane, `README.md` there) plus one ternary table,
 `block_rules`, that drops the packets of a program the detectors flagged. Everything else is the exact build's, line
 for line: 7 of the 8 files are identical to `perf/variants/exact`, and `ingress.p4` only has lines inserted (a header
-comment, the table, and its lookup after `forwarding.apply()`), checked by `tests/test_exact_block.py`.
+comment, the table, and its lookup as the data path's last step), checked by `tests/test_exact_block.py`.
 
-**Status (2026-11-19, `PC1.md` "Results, part 11"): compiled and run on the Wedge with `-DBLOCK_DIRECT_COUNTER=0`.**
-The default (`BLOCK_DIRECT_COUNTER=1`) does not compile: bf-p4c refuses `block_drop` counting the indirect
-`blocked_pkts` and the direct `block_hits` in one action ("all indirect externs to be addressed with the same
-expression across all actions"). With the fallback the build takes 12 ingress stages (the exact build 11) and 279
-cycles (260): `forwarding` and `block_drop` both write `drop_ctl`, so the table follows stage 0 and the flow-table
-chain behind it moves down one stage; latency 437 ns (421). Compiled as a side check, not run: counting
-`blocked_pkts` on `block_rules.apply().hit` keeps the direct counter, and also moving the lookup to the end of the
-data path gives 11 stages, 260 cycles and 421 ns (sources in `live_test/committee_replay/pc1_20261119_part11.tar.xz`,
-`part11_20261119/src/alt/`). Line rate, unchanged
-windows and the block function: `p4_perf.md` 5.9.
+**Status (2026-11-19, `PC1.md` "Results, part 11" and "part 11b"): compiled and tested on the Wedge.** The exact
+build's 11 ingress stages, 260 cycles and 421 ns, with the per-entry counter.
+- **The placement.** The table is looked up after the flow table, and `blocked_pkts` is counted on
+  `block_rules.apply().hit`, outside the action.
+- **The first version** (part 11) looked the table up right after `forwarding.apply()` and counted both counters in
+  `block_drop`. bf-p4c refused the action ("all indirect externs to be addressed with the same expression across
+  all actions"). With `-DBLOCK_DIRECT_COUNTER=0` it took 12 stages, 279 cycles and 437 ns: `forwarding` and
+  `block_drop` both write `drop_ctl`, so the table could not share stage 0 and the flow-table chain behind it
+  moved down one stage.
+- **Power:** bf-p4c's estimate is 2.11 W (ingress) against the exact build's 0.56 W, for the 6 TCAM blocks searched
+  per packet. The first version's 0.52 W left the table off its worst-case path; it searched the same blocks.
+- Resources, line rate, unchanged windows and the block function: `p4_perf.md` 5.9.
 
 ## The table
 
 | | |
 |---|---|
 | Key | `ig_intr_md.ingress_port`, `hdr.ipv4.srcAddr`, `hdr.ipv4.dstAddr`, `hdr.ipv4.protocol`, `meta.l4_sport`, `meta.l4_dport`, all ternary (113 bits: 3 TCAM blocks wide); a field set to mask 0 matches anything |
-| Actions | `block_drop` (drop, count in `blocked_pkts` and the entry's direct counter `block_hits`); default `NoAction` |
-| Size | 1,024 entries (`-DBLOCK_ENTRIES=N`); 1,024 entries are 2 TCAM blocks deep, 6 blocks in all |
-| Lookup | every IPv4 packet of the data path, after `forwarding.apply()`; window markers and timer packets never |
+| Actions | `block_drop` (drop, count in the entry's direct counter `block_hits`; `blocked_pkts` is counted on the hit); default `NoAction` |
+| Size | 1,024 entries (`-DBLOCK_ENTRIES=N`); 1,024 entries are 2 TCAM blocks deep, 6 blocks in all. With the direct counter the Wedge takes 1,023 (the 1,024th add fails with `RESOURCE_EXHAUSTED`), so `--block-entries` defaults to 1,023 |
+| Lookup | every IPv4 packet of the data path, as its last step (after the flow table, stage 10 of 11); window markers and timer packets never |
 | Counting | a dropped packet is still counted by the window registers (the drop takes effect at the end of ingress), so the windows, and the verdicts after the block, go on seeing the attack |
 
 Entries the control plane installs (`block_policy.py`):
@@ -44,7 +46,7 @@ perf/tools/sw_compile.sh perf/variants/exact_block basic.p4 OUT_DIR [-DTIMER_LOC
 | Option | Default | Meaning |
 |---|---|---|
 | `BLOCK_ENTRIES` | 1024 | the table's size |
-| `BLOCK_DIRECT_COUNTER` | 1 | 0 leaves out the per-entry counter `block_hits` (then `--block-list` gives no per-entry drops; `blocked_pkts` still counts them all): a fallback if bf-p4c refuses the direct counter |
+| `BLOCK_DIRECT_COUNTER` | 1 | 0 leaves out the per-entry counter `block_hits` (then `--block-list` gives no per-entry drops; `blocked_pkts` still counts them all); the default compiles with bf-p4c 9.6.0 |
 | `WAY_BITS`, `TIMER_LOCAL_PORT` | as in `exact` | |
 
 Latency build: `perf/variants/hwl/make_hwl_exact.sh perf/variants/exact_block OUT_DIR` (the exact build's patch applies
@@ -59,6 +61,11 @@ unchanged).
 | `--block-add SPEC` / `--block-del SPEC` / `--block-clear` / `--block-list` | by hand; SPEC is `port=,src=,dst=,proto=,sport=,dport=` (an address may be `ADDR/PREFIX`; a field left out matches anything) |
 | `--serve`: `{"cmd": "block", "op": "add"/"del"/"clear"/"list", "entries": [...]}` | the collector's requests; one write for a list of entries |
 | `"setup"` with `"reset"` | also deletes every block entry and zeroes `blocked_pkts` (the exact build, without the table, is unaffected) |
+| A second client | while the collector's reader owns the program, another `window_reader.py` needs its own `--client-id` (with the default 9 it cannot subscribe); it then works unbound |
+
+A full table is reported, not raised: the add returns `table_full` and the entries that went in (BF Runtime keeps those
+of a batch before the first that did not fit). The list syncs the table's counters once (`SyncCounters`) and reads the
+entries from software: 1,023 entries in 0.6 s, where reading each from the hardware took 51 ms per entry.
 
 `hybrid_collector.py --switch-program exact --block-on-alarm` (or `--profile exact --block-on-alarm`): the detector of
 `live_test/streaming/stream_verdicts.py` (`--block-detector`, default stacked with the host monitor, network without),
