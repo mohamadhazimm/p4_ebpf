@@ -42,9 +42,20 @@ clocked pipes is "lost" (after a change of the set, the next window of each bank
                                               switch), so that a slow requester cannot make a read late
         {"cmd": "read", "epoch": e, "timeout": s}   wait until window e has ended, read it, clear it (after
                                               "follow": the line it read, once it has)
+        {"cmd": "block", "op": "add", "entries": [ENTRY, ...]}   perf/variants/exact_block: drop packets that
+                                              match (one write for the list); "del" removes these entries,
+                                              "clear" all, "list" returns them with their dropped packets
         {"cmd": "epoch"} / {"cmd": "quit"}
+    window_reader.py --block-add SPEC / --block-del SPEC / --block-clear / --block-list
+                                              the block table by hand (exact_block): SPEC is comma-separated
+                                              port=, src=, dst= (an address or ADDR/PREFIX), proto=, sport=,
+                                              dport=; a field left out matches anything
     window_reader.py --once                   the current epoch and the bank of the window before it
                                               (reads and clears that window: not during a run)
+
+A block ENTRY: {"port", "src", "dst", "proto", "sport", "dport"}, every field optional (missing or null:
+any value); src and dst as "a.b.c.d" or "a.b.c.d/prefix". A "setup" with "reset" also clears the block table
+(when the program has one) and its total counter.
 
 A window line: {"epoch", "bank", "regs": {register: {index: value or [lo, hi]}}, "epoch_seen" (the clock when
 the window was found finished), "epoch_after" (after the read and the clear), "lost" (the bank may hold
@@ -499,6 +510,182 @@ def clear_frame_len(prog):
         log("clearing frame_len: %s" % str(error).splitlines()[0][:200])
 
 
+# ---------------------------------------------------------------- block rules (perf/variants/exact_block)
+BLOCK_TABLE = "block_rules"
+BLOCK_ACTION = DATA_PREFIX + "block_drop"
+BLOCK_PRIORITY = 1
+# entry field -> (key field, width in bits)
+BLOCK_FIELDS = [("port", "ig_intr_md.ingress_port", 9), ("src", "hdr.ipv4.srcAddr", 32),
+                ("dst", "hdr.ipv4.dstAddr", 32), ("proto", "hdr.ipv4.protocol", 8),
+                ("sport", "meta.l4_sport", 16), ("dport", "meta.l4_dport", 16)]
+
+
+def block_key_spec(entry):
+    """An entry (dict) -> [(key field, value, mask)] for every key of block_rules; a field left out (or null)
+    matches anything (value 0, mask 0). Raises ValueError on an unknown field or a value out of range."""
+    unknown = set(entry) - set(f for f, _, _ in BLOCK_FIELDS)
+    if unknown:
+        raise ValueError("unknown block field(s): %s" % ", ".join(sorted(unknown)))
+    spec = []
+    for name, key, bits in BLOCK_FIELDS:
+        full = (1 << bits) - 1
+        value = entry.get(name)
+        if value is None or value == "":
+            spec.append((key, 0, 0))
+            continue
+        if name in ("src", "dst"):
+            addr, _, plen = str(value).partition("/")
+            plen = int(plen) if plen else 32
+            if not 0 <= plen <= 32:
+                raise ValueError("bad prefix length in %s=%s" % (name, value))
+            mask = (M32 << (32 - plen)) & M32
+            spec.append((key, ip_to_int(addr) & mask, mask))
+        else:
+            v = int(value)
+            if not 0 <= v <= full:
+                raise ValueError("%s=%s is out of range (%d bits)" % (name, value, bits))
+            spec.append((key, v, full))
+    return spec
+
+
+def parse_block_spec(text):
+    """'src=10.0.0.10,dport=80' -> {"src": "10.0.0.10", "dport": 80}."""
+    entry = {}
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        name, sep, value = part.partition("=")
+        if not sep:
+            raise ValueError("block spec %r: expected NAME=VALUE" % part)
+        entry[name.strip()] = value.strip() if name.strip() in ("src", "dst") else int(value.strip(), 0)
+    block_key_spec(entry)
+    return entry
+
+
+def has_table(prog, name):
+    try:
+        prog.table(name)
+        return True
+    except Exception:
+        return False
+
+
+def _block_key(prog, t, entry):
+    gc = prog.gc
+    return t.make_key([gc.KeyTuple(k, v, m) for k, v, m in block_key_spec(entry)] +
+                      [gc.KeyTuple("$MATCH_PRIORITY", BLOCK_PRIORITY)])
+
+
+def blocked_total(prog):
+    """The packets block_rules has dropped since the last reset (blocked_pkts)."""
+    t = prog.table("blocked_pkts")
+    for data, _ in t.entry_get(prog.target, [t.make_key([prog.gc.KeyTuple("$COUNTER_INDEX", 0)])],
+                               {"from_hw": True}, **prog.kw(t.entry_get)):
+        v = data.to_dict().get("$COUNTER_SPEC_PKTS", 0)
+        return int(sum(v) if isinstance(v, (list, tuple)) else v)
+    return 0
+
+
+def block_add(prog, entries):
+    """Install the entries in one write (one by one if some exist already). Returns what was added."""
+    t = prog.table(BLOCK_TABLE)
+    keys = [_block_key(prog, t, e) for e in entries]
+    t0 = time.time()
+    added, existing = 0, 0
+    if keys:
+        datas = [t.make_data([], BLOCK_ACTION) for _ in keys]
+        try:
+            t.entry_add(prog.target, keys, datas, **prog.kw(t.entry_add))
+            added = len(keys)
+        except Exception as error:
+            if "ALREADY_EXISTS" not in str(error):
+                raise
+            for key, data in zip(keys, datas):
+                try:
+                    t.entry_add(prog.target, [key], [data], **prog.kw(t.entry_add))
+                    added += 1
+                except Exception as error1:
+                    if "ALREADY_EXISTS" not in str(error1):
+                        raise
+                    existing += 1
+    return {"block": "add", "added": added, "existing": existing, "t_written": time.time(),
+            "write_ms": round((time.time() - t0) * 1e3, 3)}
+
+
+def block_del(prog, entries):
+    t = prog.table(BLOCK_TABLE)
+    keys = [_block_key(prog, t, e) for e in entries]
+    t0 = time.time()
+    if keys:
+        t.entry_del(prog.target, keys, **prog.kw(t.entry_del))
+    return {"block": "del", "deleted": len(keys), "write_ms": round((time.time() - t0) * 1e3, 3)}
+
+
+def block_clear(prog, missing_ok=False, zero_total=False):
+    """Delete every entry (and with zero_total, zero blocked_pkts). Without the table: an error, or with
+    missing_ok nothing (the exact build has no block table)."""
+    if not has_table(prog, BLOCK_TABLE):
+        if missing_ok:
+            return {}
+        raise RuntimeError("the program has no %s table (a build of perf/variants/exact_block?)" % BLOCK_TABLE)
+    t = prog.table(BLOCK_TABLE)
+    t.entry_del(prog.target, **prog.kw(t.entry_del))
+    out = {"block_cleared": True}
+    if zero_total:
+        c = prog.table("blocked_pkts")
+        try:
+            c.entry_mod(prog.target, [c.make_key([prog.gc.KeyTuple("$COUNTER_INDEX", 0)])],
+                        [c.make_data([prog.gc.DataTuple("$COUNTER_SPEC_PKTS", 0)])], **prog.kw(c.entry_mod))
+        except Exception as error:
+            out["blocked_pkts_reset_error"] = str(error).splitlines()[0][:200]
+    return out
+
+
+def _key_field(kd, name):
+    v = kd.get(name)
+    if isinstance(v, dict):
+        return int(v.get("value", 0)), int(v.get("mask", 0))
+    return (int(v), None) if v is not None else (0, 0)
+
+
+def block_list(prog):
+    """Every entry, as an entry dict, with the packets it dropped (when the build has the direct counter)."""
+    t = prog.table(BLOCK_TABLE)
+    out = []
+    for data, key in t.entry_get(prog.target, None, {"from_hw": True}, **prog.kw(t.entry_get)):
+        kd, dd = key.to_dict(), data.to_dict()
+        entry = {}
+        for name, field, bits in BLOCK_FIELDS:
+            value, mask = _key_field(kd, field)
+            if mask == 0:
+                continue
+            if name in ("src", "dst"):
+                plen = bin(mask if mask is not None else M32).count("1")
+                text = socket.inet_ntoa(struct.pack("!I", value))
+                entry[name] = text if plen == 32 else "%s/%d" % (text, plen)
+            else:
+                entry[name] = value
+        pkts = dd.get("$COUNTER_SPEC_PKTS")
+        if pkts is not None:
+            entry["dropped_pkts"] = int(sum(pkts) if isinstance(pkts, (list, tuple)) else pkts)
+        out.append(entry)
+    return {"block": "list", "entries": out, "blocked_pkts": blocked_total(prog)}
+
+
+def do_block(prog, req):
+    op = req.get("op")
+    if op == "add":
+        return block_add(prog, req.get("entries") or [])
+    if op == "del":
+        return block_del(prog, req.get("entries") or [])
+    if op == "clear":
+        return block_clear(prog, zero_total=bool(req.get("zero_total")))
+    if op == "list":
+        return block_list(prog)
+    return {"error": "unknown block op %r (add, del, clear, list)" % op}
+
+
 def setup(prog, reset=False, frame_min=None, marker_ports=None, timer=None):
     """frame_min (a list, possibly empty) and marker_ports replace what the tables held. A reset first stops the
     window timer (`timer`, a WindowTimer; every pipe), so that no tick left from an earlier run moves the clock."""
@@ -507,6 +694,7 @@ def setup(prog, reset=False, frame_min=None, marker_ports=None, timer=None):
         if timer is not None:
             timer.stop(list(range(len(prog.pipe_epochs()))))
         out.update(do_reset(prog))
+        out.update(block_clear(prog, missing_ok=True, zero_total=True))
     if frame_min is not None:
         clear_frame_len(prog)
         out["frame_min"] = [do_frame_min(prog, spec)["frame_len"] for spec in frame_min]
@@ -619,6 +807,8 @@ def do_serve(prog, reader, timer):
                     out = follower.get(int(req["epoch"]), float(req.get("timeout", 5.0)))
                 else:
                     out = reader.wait_and_read(int(req["epoch"]), float(req.get("timeout", 5.0)))
+            elif cmd == "block":
+                out = do_block(prog, req)
             elif cmd == "epoch":
                 out = {"pipe_epochs": prog.pipe_epochs()}
             elif cmd == "quit":
@@ -654,6 +844,11 @@ def main():
     ap.add_argument("--timer-ns", type=int, help="--follow: start the window timer (every pipe) with this period")
     ap.add_argument("--timer-local-port", type=int, default=68, help="the generator port of the timer build")
     ap.add_argument("--once", action="store_true")
+    ap.add_argument("--block-add", action="append", default=[], metavar="SPEC",
+                    help="exact_block: add a block entry (port=,src=,dst=,proto=,sport=,dport=); repeatable")
+    ap.add_argument("--block-del", action="append", default=[], metavar="SPEC", help="exact_block: delete an entry")
+    ap.add_argument("--block-clear", action="store_true", help="exact_block: delete every block entry")
+    ap.add_argument("--block-list", action="store_true", help="exact_block: print the entries and their drops")
     args = ap.parse_args()
     gc = import_client(args.sde_install)
     prog = Program(gc, args.grpc_addr, args.client_id, args.device_id, args.p4_name)
@@ -661,6 +856,15 @@ def main():
     timer = WindowTimer(prog, args.timer_local_port)
     ports = None if args.marker_ports is None else [int(p) for p in args.marker_ports.split(",") if p.strip()]
     try:
+        if args.block_clear:
+            print(json.dumps(block_clear(prog)))
+        if args.block_del:
+            print(json.dumps(block_del(prog, [parse_block_spec(s) for s in args.block_del])))
+        if args.block_add:
+            print(json.dumps(block_add(prog, [parse_block_spec(s) for s in args.block_add])))
+        if args.block_list:
+            print(json.dumps(block_list(prog), sort_keys=True))
+        sys.stdout.flush()
         if args.reset or args.frame_min or ports is not None:
             print(json.dumps(setup(prog, args.reset, args.frame_min or None, ports, timer)))
             sys.stdout.flush()

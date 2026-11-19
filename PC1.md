@@ -2478,3 +2478,114 @@ which must be `0,0,0`), the timing logs and the collector's console, including i
 build): cgroup ..., N owned buckets, ...`. Also note the generator's sweep timing (`lag_s` in the timing log). The
 join attributes a name lookup sent through the host's local resolver to the resolver, as before; `workloads.py`
 connects to the server's address directly.
+
+## Part 11 (proposed, 2026-11-19): the exact build with a block rule, `perf/variants/exact_block`
+
+*Why. The user chose the exact build for the architecture and asked for a rule that, when a program is flagged
+malicious, the switch stops forwarding its flows. `perf/variants/exact_block` is the exact build plus one ternary
+table, `block_rules` (ingress port and 5-tuple), looked up for every IPv4 packet after `forwarding.apply()`; a match
+is dropped at the end of ingress, after the window registers have counted it (`README.md` there). 7 of the 8 files
+are the exact build's, and `ingress.p4` only has lines inserted. The control plane: `window_reader.py` gains a
+`block` command (add, del, clear, list) and `--block-add/--block-del/--block-clear/--block-list`; a reset also clears
+the table. The loop: `hybrid_collector.py --block-on-alarm` scores the run after every window with
+`live_test/streaming/stream_verdicts.py`'s detectors and, at the first window over `--block-threshold`, blocks the
+flagged program's flows (both directions, named by `--sockowner`, and the flows it opens later) and, when a window
+has more than 500 active flows, its host (`block_policy.py`). Tests without a switch (`tests/test_exact_block.py`,
+25): the program's sources, the reader's command on a fake BF Runtime client, the policy, and the whole loop on
+`exact_model.py` (after the alarm the program's packets are dropped and still counted; another program's flow
+passes). Not compiled yet. Part 7's drop rule (for `basic_fix`) is replaced by this part.*
+
+**11A. Compile.** Copy `perf/variants/exact_block` to the switch as the other variants, then:
+
+      perf/tools/sw_compile.sh SRC/exact_block basic.p4 BUILD/basic_exact_block
+      perf/tools/sw_compile.sh SRC/exact_block basic.p4 BUILD/basic_exact_block_timer -DTIMER_LOCAL_PORT=68
+      perf/variants/hwl/make_hwl_exact.sh SRC/exact_block OUT_DIR
+      perf/tools/sw_compile.sh OUT_DIR/basic_hwl_exact basic.p4 BUILD/basic_hwl_exact_block
+
+- Record, as in p4_perf section 5.7's table, ingress/egress stages, SRAM, map RAM, TCAM, stateful ALUs, the critical
+  path and the latency cycles, next to `basic_exact_v3` (11/1 stages, SRAM 122 = 12.7%, map RAM 119 = 20.7%, TCAM 7
+  = 2.4%, 23 ALUs, 260 cycles).
+- **Expected:** TCAM +6 blocks (a 113-bit key is 3 blocks wide, 1,024 entries 2 deep), no new ALU, the same stages if
+  bf-p4c places the table in an early stage (it depends only on the headers and on the forwarding table).
+- If it does not fit in 12 ingress stages or bf-p4c refuses the direct counter: `-DBLOCK_DIRECT_COUNTER=0`, then
+  `-DBLOCK_ENTRIES=512` (then give the collector `--block-entries 512`), and say which. Any other failure: stop and
+  report the message.
+
+**11B. The windows are unchanged.** With no entry the program computes exactly the exact build's windows. Replay
+the 5 captures of part 9C through `basic_exact_block` as in part 6b (`exact_replay.py`) and compare the rows with
+`basic_exact_v3`'s rows of the same captures (part 6b's `perf/results/exact_replay/`): expected identical in all 145
+columns. If time allows, all 109 (`run_exact.py`).
+
+**11C. Latency and line rate.** `basic_hwl_exact_block` as `basic_hwl_exact_v3` in part 6b (3 x 1010 hairpin
+probes, the baseline the same day): expected near 421 ns if the stage count is unchanged. Line rate: p4_perf section
+3.2's 27-run matrix with the table empty, then the 1518 B and 64 B paced runs again with 1,024 entries installed that
+match nothing (a lookup that misses must cost nothing extra), e.g.:
+
+      for i in $(seq 0 1023); do echo "--block-add src=203.0.$((i/256)).$((i%256)),dport=9"; done | \
+          xargs python2.7 window_reader.py      # on the switch, under the SDE environment
+      python2.7 window_reader.py --block-list | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["entries"]))'
+
+  and `--block-clear` afterwards.
+
+**11D. The block function, by hand, on a replay.** One cohort capture with the replayed host's packets in both
+directions (the first of part 9C), replayed into port 132 with in-band markers, a capture on PC2 behind port 140:
+
+      python3 live_test/replay_capture.py CAPTURE --exact --profile dataset --out perf/results/exact_block/11d \
+          -- --block-on-alarm --block-detector network --block-host 10.0.0.10 --block-force-alarm-window 10
+
+- The alarm is forced at window 10, and there is no `--sockowner` in a replay, so the reader blocks the host:
+  `src=10.0.0.10`.
+- **Expected:**
+  - PC2 receives every frame of the capture sent before the block was written (`t_reply` of the `block` record in
+    `OUT.block.jsonl`), and after it none from 10.0.0.10, while the frames toward 10.0.0.10 keep arriving.
+  - The summary's `blocked_pkts` equals the frames from 10.0.0.10 that the replayer sent after that time
+    (`replay_absolute.py`'s send log).
+  - The 40 rows are equal to 11B's rows of the same capture: the blocked packets are still counted.
+- Then the same with `--block-host-port 132` added: after the block, nothing from port 132 reaches PC2.
+- Note the reader's write time (`write_ms`) and the time from the alarm's row to `t_reply`.
+- One check by hand, while a replay runs: `window_reader.py --block-add src=10.0.0.10` from a second shell. The
+  collector's reader owns the program, so this client runs unbound; record whether BF Runtime accepts the write.
+
+**11E. Time to containment, real verdicts on replays** (Part 7 step 3, now on the exact build). Each capture with its
+own group held out (`cv_group` in `live_test/captures/cohort/manifest.csv` or the cohort-extra manifest):
+
+      python3 live_test/replay_capture.py CAPTURE --exact --profile dataset --out perf/results/exact_block/11e/NAME \
+          -- --block-on-alarm --block-detector network --block-host 10.0.0.10 --block-hold-out-group CV_GROUP
+
+- **Attacks:** `udp_sink_60k`, `syn_sink_40k`, `syn_fan_40k` and a GoldenEye run.
+- **Benign:** `bulk2000`, `session_1000`, `dns_10k`: is any blocked, and when?
+- **Per run:**
+  - the first attack packet sent;
+  - the alarm's window and time;
+  - `t_request` and `t_reply` of each block;
+  - the last frame from 10.0.0.10 that reached PC2;
+  - the share of the run's frames from 10.0.0.10 that the switch dropped (`blocked_pkts` against the send log).
+
+**11F. Live, with the host monitor and the socket tracer** (part 10's set-up on `basic_exact_block`, `servers.py` on
+PC2). Only benign programs run on PC1, so the alarm is forced:
+
+      E="sudo python3 hybrid_collector.py --profile exact --mode command --switch-ssh root@172.168.1.2 \
+          --forward-int-port 132 --forward-ext-port 140 --cpu-iface enp5s0 --frame-min 192.168.0.1/32 \
+          --p4-forwarder thesis-hybrid-ebpf-p4/python/program_forwarding.py --windows 40 \
+          --hostmon ebpf_perf/build/hostmon_agg --hostmon-cgroup /sys/fs/cgroup/unified/hazim_collect \
+          --sockowner ebpf_perf/sockowner/build/sockowner --sockowner-attach /sys/fs/cgroup/unified \
+          --block-on-alarm --block-force-alarm-window 8"
+      $E --scenario-name blk_poll --label benign --sockowner-log $OUT/poll.sockowner.log \
+         --command "python3 $REL/validation/hybrid/workloads.py http_poll --server 192.168.0.2" --out-csv $OUT/poll.csv
+
+- Run it beside part 10B's background `tcp_beacon` in `hazim_bg`.
+- **Expected:**
+  - The block log has `flows` at the alarm and `new_flows` in later windows: `http_poll` opens a new connection
+    every poll.
+  - PC2's capture has the program's connections up to the window after each one starts, and none of them later.
+    The background program's connections keep arriving throughout.
+  - `HOSTMON_HEALTH` all zeros, 40 rows.
+- Then the same without `--block-force-alarm-window`, with each of the seven workloads of section 2b. The detectors
+  were trained on the dataset's rows, and part 2-3's live benign rows scored high, so record each false alarm and
+  block. That is the false-alarm cost of the rule as it stands.
+
+**What comes back.**
+- 11A's resource table.
+- 11B's comparison.
+- 11C's latencies and rates.
+- For 11D-11F, per run: `OUT.block.jsonl`, the rows, PC2's capture counts and the summary.

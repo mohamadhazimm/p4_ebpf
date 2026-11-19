@@ -6,6 +6,9 @@ cells per window, so a window never depends on when, or how much, the control pl
 The design is in the header comment of `ingress.p4`. The measurements are in `p4_perf.md`,
 section 5.7, and `PC1.md`, part 6.
 
+`perf/variants/exact_block` is this build plus a block table that drops a flagged program's flows (its `README.md`;
+`PC1.md` part 11). These sources stay as compiled and measured (`basic_exact_v3`).
+
 ## Build
 
 ```sh

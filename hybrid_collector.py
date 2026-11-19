@@ -1335,7 +1335,15 @@ PROFILES: Dict[str, Dict[str, Any]] = {
                 "clear_expired": 0, "clear_budget_frac": 0.5,
                 "dormant_reads": 1, "dormant_probe": 1, "byte_layer": "frame", "duration_unit": "s", "windows": 40,
                 "launcher": "dataset", "frame_min_default": ["10.0.0.10/32"]},
+    # "exact": perf/variants/exact (or exact_block, for --block-on-alarm) on the Wedge: every window computed in
+    # the data plane, 0.5-s windows cut by markers from the switch's CPU port, the dataset's launcher and frame
+    # bytes, so that the detectors trained on dataset/features.csv score the rows unchanged.
+    "exact": {"switch_program": "exact", "window_sec": 0.5, "window_markers": "cpu", "forward_report_port": 192,
+              "byte_layer": "frame", "duration_unit": "s", "launcher": "dataset"},
 }
+
+# --block-on-alarm: active flows per 0.5-s window over which a flagged program's host is blocked (block_policy.py)
+FLOOD_FLOWS_DEFAULT = 500
 
 # Ethernet header bytes: the dataset counted frame bytes, the switch counts IPv4 totalLen.
 ETHERNET_HEADER_BYTES = 14
@@ -3141,7 +3149,9 @@ def profile_parser() -> argparse.ArgumentParser:
                           "or 'model' (Tofino software model: 60 s windows, batched reader with register syncs, "
                           "600 s read timeout, no idle clearing, no budget) or 'dataset' (the Wedge producing rows by "
                           "the dataset's definitions for its detectors: 40 windows of 0.5 s, the dataset's launcher, "
-                          "frame bytes, durations in seconds, dormant reads instead of clears; RUNBOOK 19.9). Options "
+                          "frame bytes, durations in seconds, dormant reads instead of clears; RUNBOOK 19.9) or "
+                          "'exact' (perf/variants/exact or exact_block: 0.5 s windows computed in the data plane, cut "
+                          "by CPU-port markers, the dataset's launcher, frame bytes). Options "
                           "given explicitly override the profile")
     return pre
 
@@ -3313,6 +3323,41 @@ def build_arg_parser(profile: Optional[str] = None) -> argparse.ArgumentParser:
                          ".<directory name> before the suffix; network columns only (its host columns are zero). "
                          "Repeatable. With the monitored cgroup's rows it lets a run check that the socket joins "
                          "partition the window-level rows")
+    ap.add_argument("--block-on-alarm", action="store_true",
+                    help="--switch-program exact with a build of perf/variants/exact_block: score the run after every "
+                         "window (the detectors of live_test/streaming/stream_verdicts.py) and, at the first window "
+                         "whose probability reaches --block-threshold, have the switch drop the monitored program's "
+                         "flows (named by --sockowner; both directions, and the flows it opens later) and, on a flood "
+                         "or scan (more active flows than --block-flood-flows), its host (block_policy.py). Without "
+                         "--sockowner the alarm blocks the host (--block-host, --block-host-port). At the end the "
+                         "entries are listed with their dropped packets and deleted")
+    ap.add_argument("--block-detector", choices=["auto", "network", "host", "concat", "stacked"], default="auto",
+                    help="the detector for --block-on-alarm (auto: stacked with --hostmon-cgroup, network without)")
+    ap.add_argument("--block-threshold", type=float, default=0.5)
+    ap.add_argument("--block-hold-out-group", action="append", default=[], metavar="CV_GROUP",
+                    help="train the detector without the dataset runs of this group (features.csv cv_group; a replay "
+                         "of a dataset run: its own group, or the verdict is in-sample); repeatable")
+    ap.add_argument("--block-host", action="append", default=[], metavar="ADDRESS",
+                    help="a host block also drops everything from this source address (repeatable); with --sockowner "
+                         "the program's own local addresses are always included")
+    ap.add_argument("--block-host-port", type=int, metavar="DEV_PORT",
+                    help="a host block also drops everything entering this switch dev_port (sources spoofed)")
+    ap.add_argument("--block-flood-flows", type=float,
+                    help="active flows in a window over which a flagged program's host is blocked (default "
+                         f"{FLOOD_FLOWS_DEFAULT} per 0.5 s, scaled to --window-sec)")
+    ap.add_argument("--block-force-alarm-window", type=int, metavar="W",
+                    help="raise the alarm at window W whatever the probability (to test the blocking with benign "
+                         "programs)")
+    ap.add_argument("--block-keep", action="store_true", help="leave the block entries in the switch at the end")
+    ap.add_argument("--block-entries", type=int, default=1024,
+                    help="the block table's size (the build's -DBLOCK_ENTRIES): when a flagged program's flow entries "
+                         "would exceed it, its host is blocked instead")
+    ap.add_argument("--block-log",
+                    help="JSONL of the scores, the alarm and every block request (default: --out-csv with "
+                         ".block.jsonl instead of the suffix)")
+    ap.add_argument("--block-release",
+                    help="the release checkout whose evaluation/ has the detectors' forest (default: "
+                         "p4-ebpf-malware-detection next to this repository)")
 
     ap.add_argument("--dormant-reads", type=int, default=0, choices=[0, 1],
                     help="1: a bucket that leaves the active set is not cleared but read again, round robin, with the "
@@ -3379,9 +3424,21 @@ def main() -> None:
         ap.error("--hostmon-cgroup applies to --mode command (the replayed packets have no local process to monitor)")
 
     exact = args.switch_program == "exact"
-    if exact and args.sockowner:
+    if exact and args.sockowner and not args.block_on_alarm:
         ap.error("--sockowner needs the per-bucket registers of --switch-program buckets or sweep: perf/variants/exact "
+                 "keeps no per-flow counters for the socket-level join (with --block-on-alarm, --sockowner names the "
+                 "flagged program's flows for the block rules)")
+    if exact and (args.socket_join_csv or args.socket_join_also):
+        ap.error("--socket-join-csv and --socket-join-also need --switch-program buckets or sweep: perf/variants/exact "
                  "keeps no per-flow counters for the socket-level join")
+    if args.block_on_alarm and not exact:
+        ap.error("--block-on-alarm needs --switch-program exact (a build of perf/variants/exact_block)")
+    if args.block_on_alarm and args.block_detector in ("host", "concat", "stacked") and not args.hostmon_cgroup:
+        ap.error(f"--block-detector {args.block_detector} needs the host monitor's windows (--hostmon-cgroup); "
+                 "without it use network")
+    if args.block_on_alarm and not args.sockowner and not args.block_host and args.block_host_port is None:
+        ap.error("--block-on-alarm without --sockowner can only block a host: give --block-host ADDRESS and/or "
+                 "--block-host-port DEV_PORT")
     if exact and args.global_totals:
         ap.error("--global-totals is for the gtot test build; --switch-program exact computes the windows itself")
     if exact and args.scope_ip:
@@ -3445,6 +3502,8 @@ def main() -> None:
     net_windows: List[Dict[str, object]] = []
     net_summaries: List[Dict[str, object]] = []
     committed = False
+    block_score = None          # --block-on-alarm: the detector, trained before the run
+    blocker = None              # block_policy.Blocker, from the run's start
 
     def write_ready_rows(host_windows: List[Dict[str, object]], final: bool) -> None:
         # Row i pairs host window i with network window i; the network windows
@@ -3456,11 +3515,20 @@ def main() -> None:
             if not final and i >= ready:
                 break
             host_meta = host_windows[i] if i < len(host_windows) else None
-            writer.write(build_row(args, run_id, i, host_meta, net_windows[i], net_summaries[i]))
+            row = build_row(args, run_id, i, host_meta, net_windows[i], net_summaries[i])
+            writer.write(row)
+            if blocker is not None and args.hostmon_cgroup:
+                blocker.on_row(i, row)
 
     def on_window(win: Dict[str, object]) -> None:
         net_windows.append(win)
         net_summaries.append(win["exact_features"] if "exact_features" in win else summarizer.add(win))
+        if blocker is not None:
+            blocker.on_net_window(len(net_windows) - 1, net_summaries[-1])
+            if not args.hostmon_cgroup:
+                # no host monitor (a replay): the row has only network columns and is complete now
+                i = len(net_windows) - 1
+                blocker.on_row(i, build_row(args, run_id, i, None, net_windows[i], net_summaries[i]))
         write_ready_rows(read_host_windows(args.hostmon_log), final=False)
 
     try:
@@ -3496,6 +3564,19 @@ def main() -> None:
             if "error" in got:
                 raise P4ReadError(f"window reader setup: {got['error']}")
             print(f"[INFO] exact build: {json.dumps({k: v for k, v in got.items() if k != 'sizes'})}")
+            if args.block_on_alarm:
+                import block_policy
+                probe = window_reader.request({"cmd": "block", "op": "list"})
+                if "error" in probe:
+                    raise P4ReadError(f"--block-on-alarm: the program has no usable block table ({probe['error']}); "
+                                      "load a build of perf/variants/exact_block")
+                detector = (args.block_detector if args.block_detector != "auto"
+                            else "stacked" if args.hostmon_cgroup else "network")
+                t_train = time.monotonic()
+                block_score = block_policy.load_scorer(detector, args.block_hold_out_group, args.block_release)
+                print(f"[INFO] block rules: {detector} detector trained in {time.monotonic() - t_train:.1f} s"
+                      + (f" without {', '.join(args.block_hold_out_group)}" if args.block_hold_out_group else "")
+                      + f"; alarm at p >= {args.block_threshold}")
         elif sweep:
             # perf/variants/sweep: its reader clears the registers, installs frame_len, the probe and export ports
             window_reader = SweepReaderProcess(
@@ -3643,6 +3724,20 @@ def main() -> None:
         def stop_fn() -> None:
             stop_scenario(workload_proc, own_session=args.launcher == "dataset")
 
+        if exact and block_score is not None:
+            import block_policy
+            flood = (args.block_flood_flows if args.block_flood_flows is not None
+                     else block_policy.flood_threshold(args.window_sec, FLOOD_FLOWS_DEFAULT))
+            block_log = args.block_log or str(Path(args.out_csv).with_suffix("")) + ".block.jsonl"
+            blocker = block_policy.Blocker(
+                window_reader.request, block_score, threshold=args.block_threshold,
+                cgroup_ids=[os.stat(cgroup_path).st_ino] if (args.sockowner and cgroup_path is not None) else [],
+                tail=block_policy.FlowTail(args.sockowner_log) if args.sockowner else None,
+                host_addresses=args.block_host, host_port=args.block_host_port, flood_flows=flood,
+                log_path=block_log, force_window=args.block_force_alarm_window, keep=args.block_keep,
+                max_entries=args.block_entries)
+            print(f"[INFO] block rules: flows of {'the monitored cgroup' if args.sockowner else 'no program (no --sockowner)'}"
+                  f", host on more than {flood:g} active flows per window, log {block_log}")
         if exact:
             print(f"[INFO] exact build: window markers {args.window_markers}, {args.byte_layer} bytes, durations in "
                   f"{args.duration_unit}" + (f", exactly {args.windows} windows" if args.windows else ""))
@@ -3653,6 +3748,8 @@ def main() -> None:
                 read_timeout=args.exact_read_timeout,
                 header=ETHERNET_HEADER_BYTES if args.byte_layer == "frame" else 0,
                 duration_unit=args.duration_unit, timing_path=args.reader_timing_file)
+            if blocker is not None:
+                blocker.finish()
             window_reader.stop()
             window_reader = None
         elif sweep:
@@ -3750,6 +3847,10 @@ def main() -> None:
             print("[INFO] Stopping sockowner")
             stop_hostmon(sock_proc)
             sock_proc = None
+        if exact and args.sockowner:
+            print("[INFO] sockowner named the flagged program's flows for the block rules (no socket-level join with "
+                  "--switch-program exact)")
+        elif args.sockowner:
             socket_rows = socket_join_rows(args, run_id, cgroup_path, global_t0, host_windows, net_windows,
                                            clock_offset_ns)
             for extra in args.socket_join_also:
@@ -3830,6 +3931,13 @@ def main() -> None:
         if batched_reader is not None:
             batched_reader.stop()
 
+        if blocker is not None and not blocker.finished and window_reader is not None:
+            try:
+                blocker.finish()
+            except Exception as error:
+                print(f"[WARN] block rules: could not list or delete the entries: {error}")
+        if blocker is not None:
+            blocker.close()
         if window_reader is not None:
             window_reader.stop()
 

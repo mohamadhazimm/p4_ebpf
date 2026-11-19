@@ -8,12 +8,16 @@ register names, index layout, the per-packet updates, the reader's clears of the
     m = ExactModel(frame_min={"10.0.0.10"})
     m.marker(1); m.packet(src, dst, proto, sport, dport, flags, total_len, t_ns); ...; m.marker(2)
     line = m.read(1)       # what window_reader.py --follow prints for window 1
+
+The block table of perf/variants/exact_block (block_add / block_del / block_clear / block_list, the replies of
+window_reader.py's "block" command): packet() counts every packet in the window registers, then returns False
+if a block entry matches it (the switch drops it at the end of ingress), True otherwise.
 """
 import socket
 import zlib
 from typing import Dict, Iterable, Optional
 
-from window_reader import EXTREMES, WINDOW_REGS
+from window_reader import EXTREMES, WINDOW_REGS, block_key_spec, ip_to_int
 
 M32 = (1 << 32) - 1
 TTL = 3
@@ -42,6 +46,8 @@ class ExactModel:
         self.r: Dict[tuple, object] = {}
         self.epoch = 0
         self.untracked_flows = set()
+        self.block: Dict[tuple, int] = {}       # an entry's key spec (block_key_spec) -> packets it dropped
+        self.blocked_pkts = 0
 
     # ------------------------------------------------------------ registers
     def _add(self, reg, idx, lo, hi=None):
@@ -77,8 +83,9 @@ class ExactModel:
         return None, False
 
     def packet(self, src: str, dst: str, proto: int, sport: int, dport: int, flags: int, total_len: int,
-               t_ns: int) -> None:
-        """One IPv4 TCP/UDP packet (flags: the 9-bit TCP flags, 0 for UDP)."""
+               t_ns: int, port: int = 0) -> bool:
+        """One IPv4 TCP/UDP packet (flags: the 9-bit TCP flags, 0 for UDP; port: the ingress dev_port). Returns
+        whether it is forwarded (False: a block entry matched; the registers counted it anyway)."""
         e = self.epoch
         b = e & 1
         e16 = e & 0xFFFF
@@ -130,6 +137,43 @@ class ExactModel:
         else:
             self.untracked_flows.add(key)
         self._add("reg_w_tot", (b << 2) | (found << 1) | dir_ab, 1, L)
+        return self._forward(port, src, dst, proto, sport, dport)
+
+    # ------------------------------------------------------------ block rules (exact_block)
+    def _forward(self, port, src, dst, proto, sport, dport) -> bool:
+        values = {"ig_intr_md.ingress_port": port, "hdr.ipv4.srcAddr": ip_to_int(src),
+                  "hdr.ipv4.dstAddr": ip_to_int(dst), "hdr.ipv4.protocol": proto, "meta.l4_sport": sport,
+                  "meta.l4_dport": dport}
+        for spec in self.block:
+            if all((values[k] & m) == v for k, v, m in spec):
+                self.block[spec] += 1
+                self.blocked_pkts += 1
+                return False
+        return True
+
+    def block_add(self, entries) -> dict:
+        added = existing = 0
+        for e in entries:
+            spec = tuple(block_key_spec(e))
+            if spec in self.block:
+                existing += 1
+            else:
+                self.block[spec] = 0
+                added += 1
+        return {"block": "add", "added": added, "existing": existing}
+
+    def block_del(self, entries) -> dict:
+        for e in entries:
+            self.block.pop(tuple(block_key_spec(e)), None)
+        return {"block": "del", "deleted": len(entries)}
+
+    def block_clear(self) -> dict:
+        self.block.clear()
+        return {"block_cleared": True}
+
+    def block_list(self) -> dict:
+        return {"block": "list", "blocked_pkts": self.blocked_pkts,
+                "entries": [{"spec": [list(x) for x in spec], "dropped_pkts": n} for spec, n in self.block.items()]}
 
     # ------------------------------------------------------------ the reader
     def read(self, epoch: Optional[int] = None) -> dict:
