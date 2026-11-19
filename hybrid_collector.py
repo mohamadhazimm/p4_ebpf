@@ -3390,11 +3390,16 @@ def build_arg_parser(profile: Optional[str] = None) -> argparse.ArgumentParser:
     ap.add_argument("--block-on-alarm", action="store_true",
                     help="--switch-program exact with a build of perf/variants/exact_block: score the run after every "
                          "window (the detectors of live_test/streaming/stream_verdicts.py) and, at the first window "
-                         "whose probability reaches --block-threshold, have the switch drop the monitored program's "
-                         "flows (named by --sockowner; both directions, and the flows it opens later) and, on a flood "
-                         "or scan (more active flows than --block-flood-flows), its host (block_policy.py). Without "
-                         "--sockowner the alarm blocks the host (--block-host, --block-host-port). At the end the "
-                         "entries are listed with their dropped packets and deleted")
+                         "whose probability reaches --block-threshold, have the switch stop forwarding from the "
+                         "flagged host: every source address of the monitored program (from --sockowner) and each "
+                         "--block-host, and with --block-host-port everything entering that port (--block-scope "
+                         "host, the default), or only the program's flows (--block-scope flows; block_policy.py). "
+                         "At the end the entries are listed with their dropped packets and deleted")
+    ap.add_argument("--block-scope", choices=["host", "flows"], default="host",
+                    help="what an alarm blocks: host (default): everything the flagged host sends, from the alarm "
+                         "on, new connections included; flows: the monitored program's 5-tuples, each new one "
+                         "from the next window on, and its host only on a flood (PC1.md part 11: short "
+                         "connections pass)")
     ap.add_argument("--block-detector", choices=["auto", "network", "host", "concat", "stacked"], default="auto",
                     help="the detector for --block-on-alarm (auto: stacked with --hostmon-cgroup, network without)")
     ap.add_argument("--block-threshold", type=float, default=0.5)
@@ -3813,9 +3818,16 @@ def main() -> None:
                 tail=block_policy.FlowTail(args.sockowner_log) if args.sockowner else None,
                 host_addresses=args.block_host, host_port=args.block_host_port, flood_flows=flood,
                 log_path=block_log, force_window=args.block_force_alarm_window, keep=args.block_keep,
-                max_entries=args.block_entries, skip_windows=args.block_skip_windows)
-            print(f"[INFO] block rules: flows of {'the monitored cgroup' if args.sockowner else 'no program (no --sockowner)'}"
-                  f", host on more than {flood:g} active flows per window, log {block_log}")
+                max_entries=args.block_entries, skip_windows=args.block_skip_windows, scope=args.block_scope)
+            if args.block_scope == "host":
+                print("[INFO] block rules: at the alarm, everything from the host: "
+                      + ", ".join((["the monitored program's source addresses"] if args.sockowner else [])
+                                  + [f"src {a}" for a in args.block_host]
+                                  + ([f"port {args.block_host_port}"] if args.block_host_port is not None else []))
+                      + f"; log {block_log}")
+            else:
+                print(f"[INFO] block rules: flows of {'the monitored cgroup' if args.sockowner else 'no program (no --sockowner)'}"
+                      f", host on more than {flood:g} active flows per window, log {block_log}")
         if exact:
             print(f"[INFO] exact build: window markers {args.window_markers}, {args.byte_layer} bytes, durations in "
                   f"{args.duration_unit}" + (f", exactly {args.windows} windows" if args.windows else ""))

@@ -932,9 +932,10 @@ and no flow should go unread under a flood. **Where the remaining errors came fr
 - **Idea.** `perf/variants/exact_block` is Section 5.7's exact build plus one ternary table, `block_rules`, on the
   ingress port and the 5-tuple, looked up for every IPv4 packet of the data path. A match is dropped at the end of
   ingress, after the window registers have counted it, so the windows (and the verdicts after the block) still see the
-  attack. The control plane (`window_reader.py`, `block_policy.py`, `hybrid_collector.py --block-on-alarm`) installs the
-  flagged program's flows, or its host on a flood, when the detector's probability reaches 0.5. PC1.md "Results, part
-  11" and "part 11b"; `perf/results/part11_20261119/`.
+  attack. When the detector's probability reaches 0.5, the control plane (`window_reader.py`, `block_policy.py`,
+  `hybrid_collector.py --block-on-alarm`) has the switch drop everything the flagged host sends: one entry per source
+  address, plus one for its switch port with `--block-host-port`. With `--block-scope flows` it blocks the program's
+  5-tuples only. PC1.md "Results, part 11", "part 11b" and "part 11c"; `perf/results/part11_20261119/`.
 - **Placement, the result of two compiles** (bf-p4c 9.6.0):
   - **The first version** looked the table up right after `forwarding.apply()` and counted the indirect `blocked_pkts`
     and the per-entry direct `block_hits` in its action. bf-p4c refused the action ("all indirect externs to be
@@ -984,10 +985,16 @@ and no flow should go unread under a flood. **Where the remaining errors came fr
   - **Drops:** the host block then drops 36-58% of the attacker's frames. Only `syn_fan_40k`'s flood is over before
     the block (0%).
   - **False alarm:** `dns_10k` (benign) alarms on window 0 (p 0.700), so 32-37% of its frames are dropped.
-- **Limits measured live** (PC1.md 11F): the flows of a flagged program are blocked one window after they appear, so a
-  program of short connections (one HTTP fetch per 0.5 s) is never stopped. Every connection ends before its entry is
-  written, and nothing is dropped; a long session (`interactive`) is cut. The stacked detector's verdict came a median
-  270-275 ms after its window on PC1 (about 160 ms of it scoring).
+- **Live** (PC1.md 11F and part 11c):
+  - **The host block, the default,** stops everything from the host. The entry was in place 3.0-3.3 ms after the
+    alarm, PC2 accepted no connection from the host afterwards, and every later connection attempt was dropped (11 and
+    4 SYNs, equal to `blocked_pkts`). Another program on the same host was cut off too: the switch sees addresses, not
+    programs.
+  - **Blocking only the flagged program's flows does not stop it** when it opens short connections. Each flow is
+    blocked one window after it appears, so every connection ended before its entry was written, and nothing was
+    dropped. A long session (`interactive`) was cut.
+  - **Verdict timing:** the stacked detector's verdict came a median 270-275 ms after its window on PC1, about 160 ms
+    of it scoring.
 
 ## 6. Switch CPU side
 

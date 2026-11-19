@@ -2897,3 +2897,40 @@ counter on).
   reset, `enp5s0` down. Part 11's builds stay in `/root/hazim_perf/build/` as the record.
 - **PC1:** eth1 at 1,024 receive descriptors.
 - **PC2:** as found.
+
+## Results, part 11c (PC1, 2026-11-19): an alarm stops all forwarding from the flagged host
+
+The user's requirement: once the control plane classifies something as malicious, the switch forwards nothing more
+from it. Part 11's live policy blocked only the flagged program's 5-tuples, each new one from the next window on, so
+every new short connection got through (11F).
+
+**The change** (control plane only; the P4 program of part 11b is unchanged):
+- `hybrid_collector.py --block-scope host|flows`, default `host`, through `block_policy.Blocker(scope=...)`.
+- **`host`:** at the alarm the collector has the switch drop everything the flagged host sends: one entry
+  `src=ADDRESS` for each source address of the monitored program (sockowner's `FLOW` lines) and each `--block-host`,
+  and with `--block-host-port` one entry for everything entering that switch port.
+  - Every later window adds an address the program has used since, and retries a write that failed.
+  - If the program has sent nothing yet at the alarm, its address is blocked as soon as sockowner shows one.
+- **`flows`:** part 11's policy, unchanged.
+- **Tests:** 304 run, 8 skipped. The loop test runs the same traffic under both scopes. Under `host`, nothing from the
+  host passes after the alarm, including a flow it opens later and another program's flow from the same host. The
+  replies toward it pass, and every packet is still counted.
+
+**Live, on `basic_exact_block_v2`** (`11f_host/`; the 11F set-up, `servers_log.py` on PC2, clock offset measured
+with its accepts the same minutes, -1.7 ms):
+
+| Run | Alarm | Entry, alarm to reply | PC2 accepts from PC1 before / after the block | PC1's SYNs after the block | Packets from PC2 after it | `blocked_pkts` |
+|---|---|---|---|---|---|---|
+| `http_poll`, forced at window 8 (threshold 2), beside `tcp_beacon` in `hazim_bg` | window 8 | `src=192.168.0.1`, 3.3 ms | 15 (10 of the program, 5 of the background) / **0** | 11 | 0 | 11 |
+| `tcp_beacon`, real verdict | window 2, p 0.758 | `src=192.168.0.1`, 3.0 ms | 2 / **0** | 4 | 0 | 4 |
+
+- **Nothing more from the host reached PC2 after the block**, new connections included. Every later connection
+  attempt (its SYN and the retransmissions) was dropped, and the counts equal `blocked_pkts` and the entry's own
+  counter.
+- **The background program in another cgroup was blocked too.** The switch sees addresses, not programs: that is the
+  price of blocking at the switch by host.
+- The verdict timing is that of 11F (about 0.27 s after the window).
+- Both runs: 40 rows, `HOSTMON_HEALTH` zeros.
+
+**State after:** switch on `basic_exact_block_v2`, block table empty and `blocked_pkts` reset, `enp5s0` down; PC2 as
+found.

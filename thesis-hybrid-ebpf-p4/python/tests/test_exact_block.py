@@ -341,6 +341,7 @@ class PolicyTest(unittest.TestCase):
 
     def blocker(self, reader, scores, **kw):
         it = iter(scores)
+        kw.setdefault("scope", "flows")
         kw.setdefault("cgroup_ids", [PROGRAM])
         kw.setdefault("tail", block_policy.FlowTail(self.log))
         blk = block_policy.Blocker(reader.request, lambda rows: next(it), echo=False,
@@ -496,6 +497,52 @@ class PolicyTest(unittest.TestCase):
         self.assertLessEqual(sum(len(a["entries"]) for a in reader.adds()), 8)
         self.assertEqual(block_policy.BLOCK_ENTRIES, 1023)               # the default build's capacity
 
+    # ---- scope "host" (the default): the switch forwards nothing more from the flagged host
+    def test_host_scope_blocks_the_host_at_the_alarm_and_nothing_per_flow(self):
+        reader = FakeReader()
+        self.append(flow_line(PROGRAM, "egress", "tcp", "10.0.0.10", 40000, "203.0.113.5", 443))
+        b = self.blocker(reader, [0.1, 0.9], scope="host")
+        b.on_net_window(0, {"net_flow_count_seen": 1})
+        b.on_row(0, {})
+        self.assertEqual(reader.adds(), [])
+        b.on_net_window(1, {"net_flow_count_seen": 1})
+        b.on_row(1, {})                                                    # the alarm
+        self.assertEqual([a["entries"] for a in reader.adds()], [[{"src": "10.0.0.10"}]])
+        self.assertEqual(b.events[-1]["reason"], "alarm")
+        # new flows of the program need nothing more; a new local address is added at the next window
+        self.append(flow_line(PROGRAM, "egress", "tcp", "10.0.0.10", 40001, "203.0.113.6", 80)
+                    + flow_line(PROGRAM, "egress", "udp", "10.0.0.11", 5353, "198.51.100.9", 53))
+        b.on_net_window(2, {"net_flow_count_seen": 3})
+        b.on_net_window(3, {"net_flow_count_seen": 3})
+        self.assertEqual([a["entries"] for a in reader.adds()], [[{"src": "10.0.0.10"}], [{"src": "10.0.0.11"}]])
+        self.assertEqual(b.blocked_addresses, {"10.0.0.10", "10.0.0.11"})
+        self.assertEqual(b.blocked_flows, set())
+
+    def test_host_scope_retries_a_failed_write_and_blocks_the_port_once(self):
+        reader = FakeReader(fail=True)
+        self.append(flow_line(PROGRAM, "egress", "tcp", "10.0.0.10", 40000, "203.0.113.5", 443))
+        b = self.blocker(reader, [0.9], scope="host", host_port=132)
+        b.on_row(0, {})
+        self.assertFalse(b.host_blocked)
+        self.assertEqual(b.errors, 1)
+        reader.fail = False
+        b.on_net_window(1, {"net_flow_count_seen": 1})
+        b.on_net_window(2, {"net_flow_count_seen": 1})
+        self.assertEqual(reader.adds()[-1]["entries"], [{"src": "10.0.0.10"}, {"port": 132}])
+        self.assertEqual(len(reader.adds()), 2)                            # the failed write and its retry only
+        self.assertTrue(b.port_blocked)
+
+    def test_host_scope_without_any_address_waits_for_one(self):
+        # the program has sent nothing yet at the alarm: its address is blocked as soon as sockowner shows one
+        reader = FakeReader()
+        b = self.blocker(reader, [0.9], scope="host")
+        b.on_row(0, {})
+        self.assertEqual(reader.adds(), [])
+        self.assertEqual(b.events[-1]["event"], "block_skipped")
+        self.append(flow_line(PROGRAM, "egress", "tcp", "10.0.0.10", 40000, "203.0.113.5", 443))
+        b.on_net_window(1, {"net_flow_count_seen": 1})
+        self.assertEqual(reader.adds()[0]["entries"], [{"src": "10.0.0.10"}])
+
     def test_the_flood_threshold_follows_the_window(self):
         self.assertEqual(block_policy.flood_threshold(0.5), 500)
         self.assertEqual(block_policy.flood_threshold(1.0), 1000)
@@ -520,14 +567,15 @@ class DoneProc:
 
 
 class LoopTest(unittest.TestCase):
-    def test_after_the_alarm_the_switch_drops_the_programs_packets_and_still_counts_them(self):
+    def run_loop(self, scope):
+        """The program's TCP flow with replies, a flow it opens in window 5, and another program's UDP flow from the
+        same host, through exact_model.py and the collector's window loop; the alarm comes at window 2."""
         t0 = 1_792_932_220.0
         d = tempfile.TemporaryDirectory()
         self.addCleanup(d.cleanup)
         log = os.path.join(d.name, "sockowner.log")
         open(log, "w").close()
-        # (owner, flow name, src, sport, dst, dport, proto, first window): the program's TCP flow with replies, a
-        # flow it opens in window 5, and another program's UDP flow
+        # (owner, flow name, src, sport, dst, dport, proto, first window)
         flows = [(PROGRAM, "a_out", "10.0.0.10", 40000, "203.0.113.5", 443, 6, 0),
                  (PROGRAM, "a_in", "203.0.113.5", 443, "10.0.0.10", 40000, 6, 0),
                  (PROGRAM, "b_out", "10.0.0.10", 40001, "203.0.113.6", 80, 6, 5),
@@ -558,7 +606,7 @@ class LoopTest(unittest.TestCase):
         reader = FakeReader(model)
         blocker = block_policy.Blocker(reader.request, lambda rows: 0.9 if len(rows) >= 3 else 0.1,
                                        cgroup_ids=[PROGRAM], tail=block_policy.FlowTail(log), echo=False,
-                                       clock=clock)
+                                       clock=clock, scope=scope)
         rows = []
 
         def on_window(win):
@@ -571,6 +619,31 @@ class LoopTest(unittest.TestCase):
         hc.collect_windows_exact(reader, DoneProc(), 0.5, t0, markers="cpu", on_window=on_window, max_windows=10,
                                  clock=clock)
         self.assertEqual(blocker.alarm["window"], 2)
+        for w, feats in enumerate(rows):                                    # every packet is still counted
+            self.assertEqual(feats["net_pkts_total_delta"], sum(len(v) for (n, ww), v in sent.items() if ww == w))
+        dropped = sum(v.count(False) for v in sent.values())
+        summary = blocker.finish()
+        self.assertEqual(summary["blocked_pkts"], dropped)
+        self.assertEqual(model.block, {})                                   # deleted at the end
+        kinds = [r["cmd"] for r in reader.requests]
+        self.assertEqual(kinds.count("mark"), 11)                           # the window clock is undisturbed
+        return sent, summary
+
+    def test_after_the_alarm_the_switch_forwards_nothing_more_from_the_host(self):
+        # the default scope: the host, from the alarm on, new flows and the host's other programs included
+        sent, summary = self.run_loop("host")
+        for (name, w), oks in sent.items():
+            if name == "a_in":
+                self.assertTrue(all(oks), (name, w))                        # toward the host: not "from it"
+            else:
+                self.assertEqual(all(oks), w <= 2, (name, w))               # from the host: nothing after the alarm
+                self.assertEqual(any(oks), w <= 2, (name, w))               # (b_out dropped from its first packet)
+        self.assertEqual(summary["scope"], "host")
+        self.assertEqual(summary["addresses_blocked"], ["10.0.0.10"])
+        self.assertEqual(summary["flows_blocked"], 0)
+
+    def test_flows_scope_drops_the_programs_flows_and_still_counts_them(self):
+        sent, summary = self.run_loop("flows")
         for (name, w), oks in sent.items():
             if name == "c_out":
                 self.assertTrue(all(oks), (name, w))                        # another program's flow passes
@@ -579,15 +652,7 @@ class LoopTest(unittest.TestCase):
                 self.assertEqual(any(oks), w <= 2, (name, w))
             else:
                 self.assertEqual(all(oks), w <= 5, (name, w))               # its new flow: from the window after
-        for w, feats in enumerate(rows):                                    # every packet is still counted
-            self.assertEqual(feats["net_pkts_total_delta"], sum(len(v) for (n, ww), v in sent.items() if ww == w))
-        dropped = sum(v.count(False) for v in sent.values())
-        summary = blocker.finish()
-        self.assertEqual(summary["blocked_pkts"], dropped)
         self.assertEqual(summary["flows_blocked"], 2)
-        self.assertEqual(model.block, {})                                   # deleted at the end
-        kinds = [r["cmd"] for r in reader.requests]
-        self.assertEqual(kinds.count("mark"), 11)                           # the window clock is undisturbed
 
 
 # ------------------------------------------------------------------ the collector's options
@@ -631,6 +696,9 @@ class CollectorOptionsTest(unittest.TestCase):
                          ("exact", 0.5, "cpu", "frame", "dataset"))
         self.assertFalse(args.block_on_alarm)                               # blocking stays a choice
         self.assertEqual(args.block_skip_windows, 0)                         # live: every window is the run's
+        self.assertEqual(args.block_scope, "host")                           # an alarm blocks the host
+        with self.assertRaises(ValueError):
+            block_policy.Blocker(lambda r: {}, lambda rows: 0.0, scope="program")
         self.assertEqual(hc.build_arg_parser("exact").parse_args(BASE + ["--block-skip-windows", "2"])
                          .block_skip_windows, 2)
 

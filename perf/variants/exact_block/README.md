@@ -1,7 +1,7 @@
 # perf/variants/exact_block: the exact build with a block table
 
 `perf/variants/exact` (the 29 window features in the data plane, `README.md` there) plus one ternary table,
-`block_rules`, that drops the packets of a program the detectors flagged. Everything else is the exact build's, line
+`block_rules`: once the detectors flag a host, the switch forwards nothing more from it. Everything else is the exact build's, line
 for line: 7 of the 8 files are identical to `perf/variants/exact`, and `ingress.p4` only has lines inserted (a header
 comment, the table, and its lookup as the data path's last step), checked by `tests/test_exact_block.py`.
 
@@ -28,14 +28,12 @@ build's 11 ingress stages, 260 cycles and 421 ns, with the per-entry counter.
 | Lookup | every IPv4 packet of the data path, as its last step (after the flow table, stage 10 of 11); window markers and timer packets never |
 | Counting | a dropped packet is still counted by the window registers (the drop takes effect at the end of ingress), so the windows, and the verdicts after the block, go on seeing the attack |
 
-Entries the control plane installs (`block_policy.py`):
+What an alarm blocks (`block_policy.py`, `hybrid_collector.py --block-scope`):
 
-| Verdict | Entries |
-|---|---|
-| A flagged program, with `--sockowner` | each 5-tuple its sockets carried, one exact entry per direction; after the alarm, every new 5-tuple of its cgroup, once per window |
-| A flood or a scan (more than 500 active flows in a 0.5-s window, about twice the busiest benign window of the dataset) | its host: `src=ADDRESS` for each local address of its flows and each `--block-host`, and with `--block-host-port` everything entering that port (spoofed sources) |
-| No flow identities (a replay, no `--sockowner`) | the host, as above |
-| More flow entries than the table holds (`--block-entries`, 1,024) | the host, as above |
+| Scope | Entries | From when |
+|---|---|---|
+| `host` (the default) | everything the flagged host sends: `src=ADDRESS` for each source address of the monitored program (from `--sockowner`) and each `--block-host`, and with `--block-host-port` everything entering that switch port (spoofed sources). Each later window adds an address the program has used since, and retries a write that failed | the alarm: entries written 3-5 ms after it, new connections dropped from their first packet (`PC1.md` part 11c) |
+| `flows` | each 5-tuple the program's sockets carried, one exact entry per direction, and every new 5-tuple of its cgroup once per window; its host on a flood (more than 500 active flows in a 0.5-s window, about twice the busiest benign window of the dataset), when no flow is named (a replay without `--sockowner`), or when the flow entries would not fit (`--block-entries`, 1,023) | a new connection only from the next window: one that ends sooner is never stopped (`PC1.md` 11F) |
 
 ## Build
 
@@ -82,13 +80,16 @@ Needs NumPy and scikit-learn older than 1.8.
   `HOSTMON_WINDOW_DONE` line, so the verdict on window w comes about 50-60 ms after it ends, plus the write of the
   entries. (With a monitor build before 2026-11-19, which has no such line, the row waits for the next window's
   header: about 1 to 1.5 s.) Without the host monitor (a replay, the network detector) each window is scored as soon
-  as the switch's window is read. A new flow of a flagged program passes until the end of the window it starts in.
-- **The host block is by address or port, not by program.** It also drops the host's benign traffic. Without
-  `--block-host-port`, a program that spoofs its source addresses is not stopped by it.
+  as the switch's window is read. With `--block-scope flows` a new flow of a flagged program passes until the end of
+  the window it starts in.
+- **The host block is by address or port, not by program.** The switch sees addresses and ports, so a host block
+  also drops the host's other programs (`PC1.md` part 11c: the background program's connections stopped too).
+  Without `--block-host-port`, a program that spoofs its source addresses is not stopped by it. Traffic toward the
+  host still passes (the block is on what it sends).
 - **The live detectors are the dataset's.** They were trained on the dataset's rows, with its launcher and its C
   library; live benign programs started differently score higher (`PC1.md` parts 2-3), so live false blocks are
   likely until the detectors are trained on rows collected the same way.
 - **One switch-wide flood measure.** `net_flow_count_seen` counts every flow through the switch, so other hosts'
   traffic adds to it.
-- **Entries are never aged.** They stay until the run ends (or the next reset); 1,024 entries hold 512 flows in both
-  directions.
+- **Entries are never aged.** They stay until the run ends (or the next reset). A host block takes one or two
+  entries; with `--block-scope flows` the 1,023 entries hold 511 flows in both directions.

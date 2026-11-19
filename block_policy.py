@@ -1,22 +1,27 @@
-"""Block rules on a malicious verdict: the switch drops the flagged program's flows (perf/variants/exact_block).
+"""Block rules on a malicious verdict: the switch stops forwarding from the flagged host (perf/variants/exact_block).
 
 hybrid_collector.py --block-on-alarm (with --switch-program exact and a build of perf/variants/exact_block) scores
 the run after every window with the detectors of live_test/streaming/stream_verdicts.py. At the first window whose
-probability reaches the threshold (the alarm) it has the switch drop:
+probability reaches the threshold (the alarm) the switch is told to drop, from then on:
 
-- the program's flows: every 5-tuple a socket of the monitored cgroup has carried so far (sockowner's FLOW lines,
-  --sockowner), one exact entry per direction; after the alarm, every new 5-tuple of the cgroup, once per window;
+scope "host" (the default, --block-scope host): everything the flagged host sends. One entry per source address of
+  the host (the local addresses of the monitored cgroup's flows, from sockowner's FLOW lines, and every --block-host
+  address) and, with --block-host-port, one for everything entering that switch port (sources that are spoofed). The
+  entries are written about 3-5 ms after the alarm; new connections are dropped from their first packet. The switch
+  sees addresses and ports, not programs, so the host's other programs are blocked as well. After the alarm every
+  window adds an address the program has used since, and retries a write that failed.
+
+scope "flows" (--block-scope flows, PC1.md part 11): the program's own flows only:
+- every 5-tuple a socket of the monitored cgroup has carried so far, one exact entry per direction; after the alarm,
+  every new 5-tuple of the cgroup, once per window. A new connection therefore passes until the next window, so a
+  program of short connections is never stopped (PC1.md 11F: every connection ended before its entry);
 - its host, for a flood or a scan: when a window after the alarm, or the alarm's own window, has more active flows
-  on the switch (net_flow_count_seen) than flood_flows, the program opens flows faster than flow entries can follow,
-  so the switch drops everything from the host's addresses (the source addresses of the cgroup's flows, plus any
-  given with --block-host) and, with --block-host-port, everything entering that switch port (sources that are
-  spoofed). Default 500 active flows per 0.5-s window: about twice the busiest benign window of the dataset (231, a
-  network-active benign client; every other benign run has at most 1), while the dataset's floods and scans have
-  1,000 to 98,000. A flood that uses one flow (a UDP flood to one server) is stopped by its flow entry. The host is
-  also blocked when the program's flow entries would no longer fit in the table (max_entries).
-
-Without --sockowner (a replay: no local sockets) the switch cannot name the program's flows: the alarm blocks the
-host (--block-host addresses, --block-host-port).
+  on the switch (net_flow_count_seen) than flood_flows. Default 500 active flows per 0.5-s window: about twice the
+  busiest benign window of the dataset (231, a network-active benign client; every other benign run has at most 1),
+  while the dataset's floods and scans have 1,000 to 98,000. The host is also blocked when the program's flow entries
+  would no longer fit in the table (max_entries);
+- without --sockowner (a replay: no local sockets) the switch cannot name the program's flows: the alarm blocks the
+  host.
 
 Blocked packets are still counted by the window registers, so the windows (and later verdicts) still show the
 attack. At the end the entries are listed with their dropped packets and deleted (unless keep).
@@ -36,6 +41,7 @@ FLOOD_FLOWS_PER_HALF_SECOND = 500
 # counter (the default): on the Wedge the 1,024th add fails with RESOURCE_EXHAUSTED (PC1.md part 11b)
 BLOCK_ENTRIES = 1023
 SCORE_WINDOWS = 40          # the detectors were trained on prefixes of up to 40 windows (stream_verdicts.PREFIXES)
+SCOPES = ("host", "flows")  # what an alarm blocks: everything from the host, or the program's flows
 
 Entry = Dict[str, Any]
 
@@ -143,8 +149,14 @@ class Blocker:
                  host_addresses: Sequence[str] = (), host_port: Optional[int] = None,
                  flood_flows: float = FLOOD_FLOWS_PER_HALF_SECOND, log_path: Optional[str] = None,
                  force_window: Optional[int] = None, keep: bool = False, echo: bool = True,
-                 clock: Any = time, max_entries: int = BLOCK_ENTRIES, skip_windows: int = 0):
+                 clock: Any = time, max_entries: int = BLOCK_ENTRIES, skip_windows: int = 0,
+                 scope: str = "host"):
+        if scope not in SCOPES:
+            raise ValueError("block scope %r: one of %s" % (scope, ", ".join(SCOPES)))
         self.request_fn, self.score, self.threshold = request, score, threshold
+        self.scope = scope
+        self.blocked_addresses: Set[str] = set()
+        self.port_blocked = False
         self.skip_windows = int(skip_windows)
         self.cgroup_ids = set(int(c) for c in cgroup_ids)
         self.tail, self.host_addresses, self.host_port = tail, list(host_addresses), host_port
@@ -225,16 +237,24 @@ class Blocker:
         return sorted(addrs)
 
     def _block_host(self, window: int, reason: str, active_flows: Optional[float] = None) -> None:
-        if self.host_blocked:
-            return
-        entries = host_entries(self._host_addresses(), self.host_port)
+        """Everything from the host: each of its source addresses, and with host_port everything entering that
+        port. Called again, it adds only what is not blocked yet (an address the program used since, or a write
+        that failed)."""
+        addrs = [a for a in self._host_addresses() if a not in self.blocked_addresses]
+        port = self.host_port if not self.port_blocked else None
+        entries = host_entries(addrs, port)
         if not entries:
-            self._record({"event": "block_skipped", "reason": reason, "window": window,
-                          "why": "no host address (no --sockowner flows and no --block-host) and no --block-host-port"})
-            self._say(f"window {window}: {reason}: nothing to block (no host address or port)")
+            if not self.host_blocked and not self.blocked_addresses:
+                self._record({"event": "block_skipped", "reason": reason, "window": window,
+                              "why": "no host address (no --sockowner flows and no --block-host) and no "
+                                     "--block-host-port"})
+                self._say(f"window {window}: {reason}: nothing to block (no host address or port)")
             return
         reply = self._block(entries, reason, window, active_flows=active_flows)
         if "error" not in reply:
+            self.blocked_addresses.update(addrs)
+            if port is not None:
+                self.port_blocked = True
             self.host_blocked = True
 
     def _is_flood(self, features: Dict[str, Any]) -> bool:
@@ -245,6 +265,11 @@ class Blocker:
         """The switch's window `window` has been read: after the alarm, block the flows that appeared and, on a
         flood window, the host; before it, remember a flood window for the alarm."""
         if self.finished or window < self.skip_windows:
+            return
+        if self.scope == "host":
+            if self.alarm is not None:
+                # a write that failed, or an address the program has used since the alarm
+                self._block_host(window, "alarm_host_update")
             return
         flood = self._is_flood(features)
         if self.alarm is None:
@@ -279,6 +304,10 @@ class Blocker:
                       "threshold": self.threshold}
         self._record(dict(self.alarm))
         self._say(f"window {window}: ALARM p={p:.3f}" + (" (forced)" if forced else ""))
+        if self.scope == "host":
+            # the switch forwards nothing more from the flagged host
+            self._block_host(window, "alarm")
+            return
         flood_row = self._is_flood(row)
         if flood_row or self.pending_flood is not None:
             info = self.pending_flood or {"window": window, "active_flows": row.get("net_flow_count_seen")}
@@ -292,8 +321,10 @@ class Blocker:
     def finish(self) -> Dict[str, Any]:
         """The entries with their dropped packets, then (unless keep) delete them all."""
         listed = self._request({"cmd": "block", "op": "list"}) if (self.blocked_flows or self.host_blocked) else {}
-        summary = {"event": "summary", "alarm": self.alarm, "flows_blocked": len(self.blocked_flows),
-                   "host_blocked": self.host_blocked, "errors": self.errors,
+        summary = {"event": "summary", "scope": self.scope, "alarm": self.alarm,
+                   "flows_blocked": len(self.blocked_flows), "host_blocked": self.host_blocked,
+                   "addresses_blocked": sorted(self.blocked_addresses), "port_blocked": self.port_blocked,
+                   "errors": self.errors,
                    "entries": listed.get("entries"), "blocked_pkts": listed.get("blocked_pkts")}
         if not self.keep and (self.blocked_flows or self.host_blocked):
             cleared = self._request({"cmd": "block", "op": "clear"})
@@ -302,8 +333,11 @@ class Blocker:
         if self.alarm is None:
             self._say("no alarm")
         else:
-            self._say(f"alarm at window {self.alarm['window']}; {len(self.blocked_flows)} flow(s)"
-                      + (", host" if self.host_blocked else "") + f" blocked; {listed.get('blocked_pkts')} packets "
+            what = (f"host {', '.join(sorted(self.blocked_addresses)) or '(no address)'}"
+                    + (f" and port {self.host_port}" if self.port_blocked else "")
+                    if self.scope == "host" else
+                    f"{len(self.blocked_flows)} flow(s)" + (", host" if self.host_blocked else ""))
+            self._say(f"alarm at window {self.alarm['window']}; {what} blocked; {listed.get('blocked_pkts')} packets "
                       "dropped" + ("" if self.keep else "; entries deleted"))
         self.finished = True
         return summary
