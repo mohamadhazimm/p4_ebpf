@@ -215,77 +215,141 @@ def get_row_float(row: Dict[str, Any], key: str, default: float = 0.0) -> float:
 # HOSTMON PARSER
 # ============================================================
 
-def parse_host_windows(text: str) -> List[Dict[str, object]]:
-    windows: List[Dict[str, object]] = []
-    current_meta: Optional[Dict[str, object]] = None
-    current_rows: List[Dict[str, object]] = []
+HOST_WINDOW_DONE = "HOSTMON_WINDOW_DONE,"   # hostmon_agg's last line of a window (since 2026-11-19)
 
-    for raw in text.splitlines():
-        line = raw.strip()
 
+def parse_host_row(line: str) -> Optional[Dict[str, object]]:
+    """One process row of a window block, or None for any other line. The 18 numbers are taken from the right, so
+    a process name with commas (or any other character) keeps its row; the name is the CSV-quoted field before."""
+    parts = line.rsplit(",", len(HOST_HEADER) - 1)
+    if len(parts) != len(HOST_HEADER):
+        return None
+    comm = parts[0].strip()
+    if len(comm) >= 2 and comm[0] == '"' and comm[-1] == '"':
+        comm = comm[1:-1].replace('""', '"')
+    parts = [comm] + [x.strip() for x in parts[1:]]
+    return {
+        "comm": parts[0],
+        "pid": safe_int(parts[1]),
+
+        "exec": safe_int(parts[2]),
+        "open": safe_int(parts[3]),
+        "ren": safe_int(parts[4]),
+        "del": safe_int(parts[5]),
+        "conn": safe_int(parts[6]),
+
+        "uniqip": safe_int(parts[7]),
+        "uniqprt": safe_int(parts[8]),
+
+        "total_syscalls": safe_int(parts[9]),
+        "unique_syscalls": safe_int(parts[10]),
+
+        "entropy": safe_float(parts[11]),
+        "top_syscall_freq": safe_float(parts[12]),
+
+        "avg_run_length": safe_float(parts[13]),
+        "max_run_length": safe_int(parts[14]),
+
+        "transition_count": safe_int(parts[15]),
+        "rare_syscall_ratio": safe_float(parts[16]),
+
+        "first50_unique": safe_int(parts[17]),
+        "first100_unique": safe_int(parts[18]),
+    }
+
+
+class HostLogParser:
+    """The host monitor's output, fed in pieces (HostLogTail) or at once (parse_host_windows). Lines are split on
+    "\\n" only: hostmon_agg replaces \\n and \\r in a process name but nothing else, and str.splitlines() also
+    cuts at a vertical tab, a form feed or a file separator, which would drop that process's row. `windows` holds
+    every window seen so far, each with its rows and "complete": its HOSTMON_WINDOW_DONE line (hostmon_agg since
+    2026-11-19) or the next window's header has been read."""
+
+    def __init__(self) -> None:
+        self.windows: List[Dict[str, object]] = []
+        self.partial = ""
+
+    def feed(self, text: str, final: bool = False) -> None:
+        lines = (self.partial + text).split("\n")
+        self.partial = "" if final else lines.pop()
+        for raw in lines:
+            self._line(raw.strip())
+
+    def _line(self, line: str) -> None:
         if not line:
-            continue
-
+            return
         m = HOST_WINDOW_RE.match(line)
-
         if m:
-            if current_meta is not None:
-                current_meta["rows"] = current_rows
-                windows.append(current_meta)
-                current_rows = []
-
-            current_meta = {
+            if self.windows:
+                self.windows[-1]["complete"] = True
+            self.windows.append({
                 "host_window_id": safe_int(m.group(1)),
                 "host_window_start_sec": safe_float(m.group(2)),
                 "host_window_end_sec": safe_float(m.group(3)),
                 "host_window_duration_sec": safe_float(m.group(4)),
-            }
-            continue
+                "rows": [],
+                "complete": False,
+            })
+            return
+        if line.startswith(HOST_WINDOW_DONE):
+            if self.windows and str(self.windows[-1]["host_window_id"]) == line[len(HOST_WINDOW_DONE):].strip():
+                self.windows[-1]["complete"] = True
+            return
+        if not self.windows or line == ",".join(HOST_HEADER):
+            return
+        row = parse_host_row(line)
+        if row is not None:
+            self.windows[-1]["rows"].append(row)
 
-        if line == ",".join(HOST_HEADER):
-            continue
 
-        parts = [x.strip() for x in line.split(",")]
+def parse_host_windows(text: str) -> List[Dict[str, object]]:
+    parser = HostLogParser()
+    parser.feed(text, final=True)
+    return parser.windows
 
-        if len(parts) != len(HOST_HEADER):
-            continue
 
-        row = {
-            "comm": parts[0],
-            "pid": safe_int(parts[1]),
+def complete_host_windows(windows: List[Dict[str, object]]) -> int:
+    """How many windows, from the first, are complete."""
+    n = 0
+    for w in windows:
+        if not w.get("complete"):
+            break
+        n += 1
+    return n
 
-            "exec": safe_int(parts[2]),
-            "open": safe_int(parts[3]),
-            "ren": safe_int(parts[4]),
-            "del": safe_int(parts[5]),
-            "conn": safe_int(parts[6]),
 
-            "uniqip": safe_int(parts[7]),
-            "uniqprt": safe_int(parts[8]),
-
-            "total_syscalls": safe_int(parts[9]),
-            "unique_syscalls": safe_int(parts[10]),
-
-            "entropy": safe_float(parts[11]),
-            "top_syscall_freq": safe_float(parts[12]),
-
-            "avg_run_length": safe_float(parts[13]),
-            "max_run_length": safe_int(parts[14]),
-
-            "transition_count": safe_int(parts[15]),
-            "rare_syscall_ratio": safe_float(parts[16]),
-
-            "first50_unique": safe_int(parts[17]),
-            "first100_unique": safe_int(parts[18]),
-        }
-
-        current_rows.append(row)
-
-    if current_meta is not None:
-        current_meta["rows"] = current_rows
-        windows.append(current_meta)
-
+def wait_host_windows(tail: "HostLogTail", needed: int, timeout_s: float, clock: Any = time,
+                      poll_s: float = 0.005) -> List[Dict[str, object]]:
+    """The tail's windows once `needed` of them are complete, or when timeout_s has passed."""
+    windows = tail.poll()
+    deadline = clock.monotonic() + timeout_s
+    while complete_host_windows(windows) < needed and clock.monotonic() < deadline:
+        clock.sleep(poll_s)
+        windows = tail.poll()
     return windows
+
+
+class HostLogTail:
+    """The host monitor's log as it grows: poll() reads only what was appended (the collector used to parse the
+    whole log after every window) and returns every window so far."""
+
+    def __init__(self, path: str) -> None:
+        import codecs
+        self.path, self.offset = path, 0
+        self.parser = HostLogParser()
+        self.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+    def poll(self) -> List[Dict[str, object]]:
+        try:
+            with open(self.path, "rb") as stream:
+                stream.seek(self.offset)
+                data = stream.read()
+        except OSError:
+            return self.parser.windows
+        if data:
+            self.offset += len(data)
+            self.parser.feed(self.decoder.decode(data))
+        return self.parser.windows
 
 
 def summarize_host_window(win: Optional[List[Dict[str, object]]]) -> Dict[str, object]:
@@ -403,7 +467,7 @@ def stop_hostmon(proc: subprocess.Popen, grace: float = 5.0) -> None:
 
 def read_host_windows(path: str) -> List[Dict[str, object]]:
     p = Path(path)
-    return parse_host_windows(p.read_text(errors="replace")) if p.exists() else []
+    return parse_host_windows(p.read_bytes().decode("utf-8", errors="replace")) if p.exists() else []
 
 
 # ------------------------------------------------------------
@@ -3507,9 +3571,10 @@ def main() -> None:
 
     def write_ready_rows(host_windows: List[Dict[str, object]], final: bool) -> None:
         # Row i pairs host window i with network window i; the network windows
-        # define the rows. HostMon prints a window when it ends, so during the
-        # run a host window is used only once the next one has appeared.
-        ready = len(host_windows) if final else len(host_windows) - 1
+        # define the rows. During the run a host window is used once it is
+        # complete: its HOSTMON_WINDOW_DONE line (hostmon_agg) or the next
+        # window's header (older monitors) has been read.
+        ready = len(host_windows) if final else complete_host_windows(host_windows)
         while writer.count < len(net_windows):
             i = writer.count
             if not final and i >= ready:
@@ -3520,6 +3585,11 @@ def main() -> None:
             if blocker is not None and args.hostmon_cgroup:
                 blocker.on_row(i, row)
 
+    host_tail = HostLogTail(args.hostmon_log)
+    # --block-on-alarm with the host monitor: after each switch window, wait this long at most for the monitor's
+    # window (printed about 50 ms after it ends), so that the verdict on a window comes right after it
+    host_wait_s = min(0.25, 0.5 * args.window_sec)
+
     def on_window(win: Dict[str, object]) -> None:
         net_windows.append(win)
         net_summaries.append(win["exact_features"] if "exact_features" in win else summarizer.add(win))
@@ -3529,7 +3599,11 @@ def main() -> None:
                 # no host monitor (a replay): the row has only network columns and is complete now
                 i = len(net_windows) - 1
                 blocker.on_row(i, build_row(args, run_id, i, None, net_windows[i], net_summaries[i]))
-        write_ready_rows(read_host_windows(args.hostmon_log), final=False)
+        if blocker is not None and args.hostmon_cgroup:
+            host_windows = wait_host_windows(host_tail, len(net_windows), host_wait_s)
+        else:
+            host_windows = host_tail.poll()
+        write_ready_rows(host_windows, final=False)
 
     try:
         if not args.skip_p4_forwarding:

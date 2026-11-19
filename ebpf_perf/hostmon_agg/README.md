@@ -50,6 +50,11 @@ design, not to the eBPF hook itself:
 * `HOSTMON_HEALTH` lost is always 0 (there is no ring buffer). Events that find no
   free map entry are counted as capacity errors, like hostmon's full table.
 * No 128-process limit, so rows appear for processes hostmon dropped.
+* Since 2026-11-19 each window's block ends with `HOSTMON_WINDOW_DONE,<window>`, written with the block, so that a
+  reader can use a window as soon as it is printed (about 50 ms after it ends) instead of waiting for the next
+  window's header; `hybrid_collector.py` does. Every parser of this output skips the line (it skips lines that
+  start with `HOSTMON_`, or keeps only lines that start with `"`). The benchmarks of `../COMPARISON.md` ran on the
+  build without it; the kernel program (`hostmon_agg.bpf.o`) is byte-identical, and `test_agg_equiv` still passes.
 
 ## Validation
 

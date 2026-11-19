@@ -6,6 +6,9 @@
  * prints HOSTMON_READY,<cgroup id>, reads the shared monotonic start time (s) on
  * stdin, prints one "==== HOST WINDOW" block per window with the same CSV columns,
  * and on SIGINT/SIGTERM prints the last partial window and HOSTMON_HEALTH.
+ * Each block ends with a line HOSTMON_WINDOW_DONE,<window>, written with the block, so
+ * that a reader can use a window as soon as it is printed instead of waiting for the
+ * next window's header (a long block reaches the file in several writes).
  *
  * The kernel side keeps one entry per (process, window). This program sleeps until
  * a window has ended (plus a short grace period), marks it closed, reads its
@@ -148,6 +151,7 @@ static void flush_window(int fd, unsigned long w, double start_sec, double end_s
 		agg_print_row(rows[i].pid, &rows[i].val);
 		t->capacity_errors += rows[i].val.cap_errors;
 	}
+	printf("HOSTMON_WINDOW_DONE,%lu\n", w);
 	fflush(stdout);
 	free(rows);
 	free(keys);

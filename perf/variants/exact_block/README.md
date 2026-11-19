@@ -63,11 +63,12 @@ Needs NumPy and scikit-learn older than 1.8.
 
 ## Limits
 
-- **The first packets pass.** With the host monitor, the row of window w is written once the monitor's window w + 1
-  has appeared (a window's block is complete only when the next begins), so the verdict on window w comes when window
-  w + 2 has been read: about 1 to 1.5 s after window w ends at 0.5-s windows, plus the write of the entries. Without
-  the host monitor (a replay, the network detector) each window is scored as soon as the switch's window is read. A new
-  flow of a flagged program passes until the end of the window it starts in.
+- **The first packets pass.** With the host monitor, after each switch window the collector waits (at most 0.25 s)
+  for the monitor's window, which `hostmon_agg` prints about 50 ms after the window ends and closes with a
+  `HOSTMON_WINDOW_DONE` line, so the verdict on window w comes about 50-60 ms after it ends, plus the write of the
+  entries. (With a monitor build before 2026-11-19, which has no such line, the row waits for the next window's
+  header: about 1 to 1.5 s.) Without the host monitor (a replay, the network detector) each window is scored as soon
+  as the switch's window is read. A new flow of a flagged program passes until the end of the window it starts in.
 - **The host block is by address or port, not by program.** It also drops the host's benign traffic. Without
   `--block-host-port`, a program that spoofs its source addresses is not stopped by it.
 - **The live detectors are the dataset's.** They were trained on the dataset's rows, with its launcher and its C

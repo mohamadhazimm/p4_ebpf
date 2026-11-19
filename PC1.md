@@ -2562,9 +2562,17 @@ own group held out (`cv_group` in `live_test/captures/cohort/manifest.csv` or th
   - the share of the run's frames from 10.0.0.10 that the switch dropped (`blocked_pkts` against the send log).
 
 **11F. Live, with the host monitor and the socket tracer** (part 10's set-up on `basic_exact_block`, `servers.py` on
-PC2). Only benign programs run on PC1, so the alarm is forced:
+PC2). Rebuild the monitor first (`ebpf_perf/build.sh`): since 2026-11-19 `hostmon_agg` ends each window with
+`HOSTMON_WINDOW_DONE,<window>` (the kernel program is unchanged), and the collector then writes a row, and scores it,
+about 50 ms after its window ends instead of about 1 s later; check that the monitor's log has those lines. Only
+benign programs run on PC1, so the alarm is forced. The collector runs under the interpreter that has NumPy and
+scikit-learn (the dataset repository's `.venv`, as for part 2's scoring: PC1 has no room for its own venv); its own
+modules need only the standard library. That venv has scikit-learn 1.9.1, so the stacked detector's inner folds, and
+its probabilities, differ a little from the published ones (they need older than 1.8); the forced alarm does not
+depend on them.
 
-      E="sudo python3 hybrid_collector.py --profile exact --mode command --switch-ssh root@172.168.1.2 \
+      PY=../p4_ebpf-dataset-construction/.venv/bin/python3   # NumPy and scikit-learn for the detectors (part 2's score.py)
+      E="sudo $PY hybrid_collector.py --profile exact --mode command --switch-ssh root@172.168.1.2 \
           --forward-int-port 132 --forward-ext-port 140 --cpu-iface enp5s0 --frame-min 192.168.0.1/32 \
           --p4-forwarder thesis-hybrid-ebpf-p4/python/program_forwarding.py --windows 40 \
           --hostmon ebpf_perf/build/hostmon_agg --hostmon-cgroup /sys/fs/cgroup/unified/hazim_collect \
@@ -2580,6 +2588,8 @@ PC2). Only benign programs run on PC1, so the alarm is forced:
   - PC2's capture has the program's connections up to the window after each one starts, and none of them later.
     The background program's connections keep arriving throughout.
   - `HOSTMON_HEALTH` all zeros, 40 rows.
+  - Each `score` record of the block log is written within about 0.1 s after its window ends (its `time` against
+    the run's start plus (window + 1) x 0.5 s).
 - Then the same without `--block-force-alarm-window`, with each of the seven workloads of section 2b. The detectors
   were trained on the dataset's rows, and part 2-3's live benign rows scored high, so record each false alarm and
   block. That is the false-alarm cost of the rule as it stands.
