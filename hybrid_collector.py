@@ -3432,6 +3432,11 @@ def build_arg_parser(profile: Optional[str] = None) -> argparse.ArgumentParser:
                     help="--block-on-alarm: train the detector on this window table too (the format of "
                          "live_test/streaming/dataset_windows.csv.gz; e.g. live runs collected through this "
                          "pipeline, PC1.md part 12); repeatable; --block-hold-out-group applies to it")
+    ap.add_argument("--block-train-table", metavar="WINDOWS_CSV_GZ",
+                    help="--block-on-alarm: the window table the detector trains on (default by --window-sec, "
+                         "block_policy.default_table: live_test/streaming/dataset_windows.csv.gz at 0.5 s, "
+                         "dataset_windows_<w>s.csv.gz at another length, or for the network detector its network half "
+                         "net_windows_<w>s.csv.gz; PC1.md part 13); a table of another window length is refused")
     ap.add_argument("--block-release",
                     help="the release checkout whose evaluation/ has the detectors' forest (default: "
                          "p4-ebpf-malware-detection next to this repository)")
@@ -3660,9 +3665,16 @@ def main() -> None:
                 detector = (args.block_detector if args.block_detector != "auto"
                             else "stacked" if args.hostmon_cgroup else "network")
                 t_train = time.monotonic()
-                block_score = block_policy.load_scorer(detector, args.block_hold_out_group, args.block_release,
-                                                       extra_windows=args.block_train_extra)
+                try:
+                    block_score = block_policy.load_scorer(detector, args.block_hold_out_group, args.block_release,
+                                                           windows_path=args.block_train_table,
+                                                           extra_windows=args.block_train_extra,
+                                                           window_sec=args.window_sec)
+                except (FileNotFoundError, ValueError) as e:
+                    raise P4ReadError(f"--block-on-alarm: {e}")
                 print(f"[INFO] block rules: {detector} detector trained in {time.monotonic() - t_train:.1f} s"
+                      + f" on {Path(block_score.table).name} ({block_score.windows} windows of "
+                        f"{block_score.window_sec:g} s)"
                       + (f" without {', '.join(args.block_hold_out_group)}" if args.block_hold_out_group else "")
                       + (f", plus {', '.join(args.block_train_extra)}" if args.block_train_extra else "")
                       + f"; alarm at p >= {args.block_threshold}")

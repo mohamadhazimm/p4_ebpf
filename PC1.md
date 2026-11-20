@@ -3114,7 +3114,7 @@ standard library only):
 - **If runs are missing:** the report lists them, with each run tried and its cells off (`rejected`). `--index CSV`
   (execution_id,path,member) names the runs directly, for example the ones `build_05s.py` reads.
 
-**13C. Then, on PC1:**
+**13C. Then, on PC1** (done except what needs the host half: Results, part 13):
 - **`stream_verdicts.py`** assumes 40 windows of 0.5 s: make the window count and the prefixes (in seconds) follow
   the table.
 - **Offline:** the network, host and stacked detectors at 0.25 s against 0.5 s, cross-validated by group.
@@ -3126,3 +3126,87 @@ standard library only):
 **Tests:** `test_host_windows.py` (4): synthetic runs in a zip and in folders, named by run_id, by name or by content;
 the start from `run.json` or estimated; a rejected attempt; a run unlike its training row. The suite under the `.venv`
 is 311 OK, 8 skipped.
+
+## Results, part 13 (PC1, 2026-11-20): 0.25 s windows, everything before the host half
+
+The user asked for everything part 13 needs from PC1, then the push. Only the host half (13B) is left; it runs on the
+lab workstation. Switch: `basic_exact_block_v2` throughout. Files: `perf/results/part13_20261120/` (git-ignored;
+scripts in `src/`) and the archive `live_test/committee_replay/pc1_20261120_part13.tar.xz`.
+
+**13D. The detectors and the collector take any window length** (3b3ab11 and this commit):
+- **`stream_verdicts.py`:**
+  - the windows per run come from the table: 80 at 0.25 s;
+  - it trains at the same times as at 0.5 s plus the first three windows: `[1, 2, 3, 4, 8, 12, 20, 32, 40, 60, 80]`
+    at 0.25 s; at 40 windows nothing changes;
+  - an extra table may carry more signals, which are cut to the table's, but not another window count;
+  - the network half alone trains only the network detector.
+- **`block_policy.py`:**
+  - the Blocker scores up to the detector's window count;
+  - `default_table()` picks the training table by window length;
+  - `load_scorer(window_sec=...)` refuses a table of another length.
+- **`hybrid_collector.py --block-train-table`:** by default the table follows `--window-sec`, and the start-up line
+  names it ("network detector trained in 6.8 s on net_windows_0.25s.csv.gz (80 windows of 0.25 s)").
+- **Tests:** a collector option test, and the tests of 3b3ab11; the suite under the `.venv` is 318 OK, 8 skipped.
+
+**13E. The 74 live benign runs at 0.25 s** (`live_benign/`):
+- 12C's 74 cases, with `--window-sec 0.25 --windows 80`.
+- **All 74 clean:** 80 windows each, 0 windows lost, `HOSTMON_HEALTH` zeros; each run took 28-29 s, as at 0.5 s.
+- **The same programs as in 12C:** system calls per run 0.84-1.07 times 12C's (median 1.000); packets equal in 59
+  of 74 runs (the network clients' traffic varies).
+- **`live_test/streaming/live_benign_windows_0.25s.csv.gz`** (40 KB): the training table's layout, 80 windows.
+
+**13F. Offline: the network detector at 0.25 s against 0.5 s** (`evaluation/`, `src/evaluate_windows.py`):
+- 12C's study at any window count: the same 5 group folds over the 240 dataset runs and the 74 live benign runs.
+  Model A trains on the dataset runs of the training folds; B on those plus the live runs. Every run is scored after
+  each of its windows; "stream" means an alarm in any window.
+- **At 0.5 s it reproduces 12C's network rows exactly**, so the new code changes nothing at 0.5 s.
+
+| Window | Training | Dataset balanced accuracy (run level) | Dataset TPR / FPR (stream) | First alarm (median, attacks) | Live benign alarmed (stream) |
+|---|---|---|---|---|---|
+| 0.5 s | A, dataset only | 0.738 | 0.588 / 0.111 | 0.5 s | 9.5% |
+| 0.5 s | B, + live benign | 0.774 | 0.588 / 0.048 | 0.5 s | 5.4% |
+| 0.25 s | A, dataset only | 0.738 | 0.588 / 0.111 | 0.25 s | 9.5% |
+| 0.25 s | B, + live benign | 0.782 | 0.588 / 0.024 | 0.25 s | 5.4% |
+
+- **Nothing is lost at 0.25 s, and the alarm comes twice as early.**
+  - Model A flags as many runs at both lengths: 52 of 99 malware, all 15 floods, 8 of 105 benign workloads and 6 of
+    18 network-benign runs.
+  - The median first alarm is the first window at both lengths, so it comes at 0.25 s instead of 0.5 s.
+- **With the live runs (B) it is a little better at 0.25 s:** 3 network-benign runs flagged instead of 6.
+- **The live false alarms come from the same programs at both lengths:** telnet and the `interactive` workload, and
+  for A also `tcp_beacon`.
+- **As deployed** (A on all 240 runs), live benign false alarms are 8.1% at 0.5 s and 5.4% at 0.25 s.
+- **The network detector sees only the malware with traffic** (TPR 0.588). The host and stacked detectors at 0.25 s
+  need the host half.
+
+**13G. Live attacks, the network detector at both lengths** (`live_attack/`, `src/run_attacks.sh`,
+`summarize_attacks.py`):
+- 12D's three `hping3` floods from PC1 in the monitored cgroup to PC2, with a host block on 192.168.0.1.
+- The network detector trained on the dataset only, at each length (stacked needs the host half). At 0.25 s it
+  trained on `net_windows_0.25s.csv.gz`.
+- All six runs: 0 windows lost, an alarm at window 0, the block written in 2.6-3.4 ms.
+
+| Attack | Window | Alarm p | Alarm after the window's end | Dropped by the switch | Reached PC2 |
+|---|---|---|---|---|---|
+| SYN flood, 60,000 | 0.25 s | 0.802 | 322 ms | 54,070 (90.1%) | 5,930 |
+| | 0.5 s | 0.786 | 189 ms | 52,337 (87.2%) | 7,663 |
+| UDP flood, 60,000 | 0.25 s | 0.819 | 213 ms | 50,754 (84.6%) | 9,246 |
+| | 0.5 s | 0.794 | 191 ms | 44,645 (74.4%) | 15,355 |
+| port scan, 30,000 | 0.25 s | 0.801 | 208 ms | 27,039 (90.1%) | 2,961 |
+| | 0.5 s | 0.770 | 199 ms | 25,705 (85.7%) | 4,295 |
+
+- **The block comes sooner:** the alarm follows the end of window 0, which comes 0.25 s earlier. 23-40% fewer
+  attack packets reached PC2.
+- **The time after the window's end stays about 0.2 s.** Scoring took a median 85 ms per window at both lengths, so
+  it fits in 0.25 s windows. A run's first score took 77-209 ms; the SYN flood's 209 ms at 0.25 s gives its 322 ms.
+- `hping3`'s replies (5,930, 2,961, 7,663, 4,295) equal the packets that reached PC2, as in 12D.
+
+**Next, after the host half (13B):**
+- Evaluate the host and stacked detectors at 0.25 s: `src/evaluate_windows.py` with `dataset_windows_0.25s.csv.gz`
+  and `--detectors network,host,stacked`.
+- Live: the stacked detector at 0.25 s, recalibrated with `--block-train-extra
+  live_test/streaming/live_benign_windows_0.25s.csv.gz`, on the attacks and the 7 workloads of 11F. Its scoring
+  took a median 160 ms per window in 12D, so check that it keeps up with 0.25 s windows.
+
+**State after:** switch on `basic_exact_block_v2` (pid 31757), the block table empty (every run cleared its entry),
+`enp5s0` down; PC2 as found (its services stopped and `/tmp/hz_srv` removed); `/dev/shm` cleaned.

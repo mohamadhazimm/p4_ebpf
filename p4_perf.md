@@ -1017,6 +1017,12 @@ and no flow should go unread under a flood. **Where the remaining errors came fr
     (`live_test/streaming/net_windows_0.25s.csv.gz`; at 0.5 s the same code gives the training table bit for bit). The
     host half is recomputed on the lab workstation from the runs' raw system calls (`host_windows.py`), so the dataset
     is not collected again.
+  - **Live at 0.25 s** (part 13):
+    - 74 live benign runs through the whole pipeline ran clean: 80 windows each, 0 lost.
+    - The network detector alarmed the three `hping3` floods at window 0 at both lengths.
+    - The switch dropped 84.6-90.1% of their packets at 0.25 s, against 74.4-87.2% at 0.5 s; 23-40% fewer reached
+      the target.
+    - Scoring took a median 85 ms per window, which fits a 0.25 s window.
 - **Live attacks through the whole loop** (part 12D/E): `hping3` floods from the monitored host.
   - **Detection:** a SYN flood, a UDP flood and a port scan were each alarmed at window 0, with the original and with
     the recalibrated detector. The alarm came 274-381 ms after the window's end and the block 2.9-3.7 ms later.

@@ -734,6 +734,13 @@ class CollectorOptionsTest(unittest.TestCase):
         self.assertEqual(hc.build_arg_parser("exact").parse_args(BASE + ["--block-skip-windows", "2"])
                          .block_skip_windows, 2)
 
+    def test_the_training_table_option(self):
+        # PC1.md part 13: the table the detector trains on, by default chosen by --window-sec (block_policy)
+        self.assertIsNone(hc.build_arg_parser("exact").parse_args(BASE).block_train_table)
+        args = hc.build_arg_parser("exact").parse_args(BASE + ["--window-sec", "0.25", "--windows", "80",
+                                                               "--block-train-table", "t.csv.gz"])
+        self.assertEqual((args.window_sec, args.windows, args.block_train_table), (0.25, 80, "t.csv.gz"))
+
 
 if __name__ == "__main__":
     unittest.main()
