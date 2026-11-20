@@ -2977,6 +2977,12 @@ the archive `live_test/committee_replay/pc1_20261119_part12.tar.xz` (everything 
 | 0.25 s | 0.830 (0.967) | 67/67 | 14/43 | 0.25 s | 71% | 89% |
 | 0.1 s | 0.837 (0.969) | 67/67 | 14/43 | 0.10 s | 83% | 89% |
 
+  - **Corrected on the lab workstation (2026-11-20; Results, parts 13C/13K checked and 12B rerun):** the malware
+    column and the floods at 0.1 s count runs blocked before they sent anything. Trained only on these 110 runs,
+    whose 43 benign all send in their first window, the forests alarm on an empty first window (p = 1.000): 14
+    malware runs at every length, and the two GoldenEye runs at 0.1 s. Allowing an alarm only from a run's first
+    window with traffic, or training on all 240 runs as the live detector does, gives malware 82% at every length,
+    floods 55 / 71 / 78% and `goldeneye_p10` 36 / 79 / 66%. The other columns do not change.
   - **Per flood, at 0.5 / 0.25 / 0.1 s:** `syn_fan_40k` 24 / 58 / 79%, `goldeneye_p10` 36 / 79 / 100%, `udp_sink_60k`
     58 / 78 / 90%, `syn_sink_40k` 72 / 91 / 95%.
   - **Accuracy does not change with the window.** The same 14 benign runs alarm at every length: the bulk uploads,
@@ -3368,7 +3374,8 @@ network,host,concat,stacked`):
     - The switch's windows were 270 ms long (median), not 250 ms. So each row's network half drifted away from its
       host half, whose windows the monitor times itself.
     - Not affected: the floods' alarms at window 0, the 0.5 s runs (markers on time), 13E's live benign runs (at
-      most 7.7 ms late), and 13G (two windows of one run were 75 and 38 ms late).
+      most 7.7 ms late), and 13G (markers 38-97 ms late in 6 windows of the SYN flood run and 11-30 ms in 3 of the
+      UDP flood run; corrected on the lab workstation, 2026-11-20).
     - 13K fixes it and runs the 0.25 s tests again.
   - **Where it keeps up:** at 0.5 s, and for the network detector at 0.25 s, the loop waits for each window. The
     request leaves 4 ms after the window's end, and the score lands a steady 270 ms (stacked at 0.5 s) or 200 ms
@@ -3488,3 +3495,85 @@ per window, now in its own thread.
     their `src/` stay in place);
   - 380 MB free.
   - The journal (404 MB) is the user's to trim: `sudo journalctl --vacuum-size=100M`.
+
+## Results, parts 13C/13K checked and 12B rerun (lab workstation, 2026-11-20)
+
+The user pulled 89ffa35 and asked to check it, then to rerun here what the check found. Everything is offline; the
+archive `live_test/committee_replay/ws_20261120_check13_rerun12b.tar.xz` has the scripts (`src/`) and their outputs.
+
+**13C and 13K hold** (`src/check_13ck.py`, from the raw files of the part 13, 13C and 13K archives):
+- **13H, on the workstation's own files:**
+  - 110 runs matched by run_id and 130 by name;
+  - start intervals under 10 us in 10 runs, under 1 ms in 35, over 100 ms in 190;
+  - 10,006,454 calls in both tables;
+  - 2,379 of 6,202,977 transitions lost (in 432 windows), never more than either half's calls;
+  - no bound broken in the 9,600 window pairs;
+  - the network half equal to `net_windows_0.25s.csv.gz` in all 556,800 cells.
+- **13I:** its 0.5 s rows equal 12C's, and the live alarms per workload are as written (`evaluation.json`).
+- **13J and 13L:** every alarm delay, drop, packet reaching PC2, block time and benign maximum, and 13L's timing table.
+  That table's medians are medians of the per-run medians, without each run's first marker (the one that starts
+  window 0).
+- **The suite** passes here too (Python 3.10, scikit-learn 1.7.0): 325 OK, 8 skipped.
+
+**Three notes:**
+- **13G's late markers** (13J said two windows of one run): 38-97 ms late in 6 windows of the SYN flood run (windows
+  1-2 and 18-21) and 11-30 ms in 3 of the UDP flood run (windows 5-7). 13L's maximum, 97 ms, is right; 13J is
+  corrected.
+- **The overlapped loop costs the network detector about 30 ms per window.** Each score lands 226 ms after its window
+  instead of 197 ms:
+  - the switch's reader holds a fetch 123 ms instead of 100 ms (medians; the register read is 41 ms in both);
+  - a score through the scorer process takes 91 ms instead of 86 ms.
+  The verdicts and the drops are the same (13L).
+- **13I's host detector at 0.25 s** gains 0.020 there (one fold assignment, model A) and loses 0.016 in the
+  workstation's reference (13B: 10 fold assignments). Both are within the spread, so neither shows the host gaining or
+  losing at 0.25 s.
+
+**12B rerun** (`src/rerun_12b.py`; NumPy and scikit-learn):
+- **What the check found:** 12B trained and scored the network detector on the 110 runs with traffic only.
+  - All 43 benign runs among them send in their first window, so the forests learned that an empty first window is
+    malicious.
+  - Every attack run whose first window is empty alarmed at window 0 with p = 1.000, before it had sent anything: 14
+    malware runs at every length, and the two GoldenEye runs at 0.1 s (their first frame comes 0.18-0.20 s after the
+    anchor).
+  - Their blocked share counted 100%.
+  - 12A (the switch replays, with the collector's detector: the training table without the capture's own group) has
+    none of this: its 14 slow-starting malware runs alarmed at windows 1-10.
+- **The rerun reproduces 12B.** PC1's `study_windows.py`, copied verbatim, gives the same first alarm and blocked share
+  in all 110 runs at every length, and the same table.
+  - Its probabilities differ from `study.json` by up to 0.07, and about 60% of them differ at all.
+  - The likely cause is the scikit-learn version (1.7.0 here, 1.9.1 in PC1's .venv), not checked.
+  - No run's first alarm or final verdict changes, and the AUCs differ by at most 0.002.
+- **Two corrections give the same numbers on the 110 runs:**
+  - allowing an alarm only from a run's first window with traffic;
+  - training on all 240 runs, as the live detector does: the 130 without traffic are all-zero in every window, as in
+    the training tables, with the release's 73 cv_groups. An empty window then scores at most p 0.45 at every length:
+    no alarm, but only 0.05 below the threshold.
+  - Only one run differs between the two: trained on all 240, `slowloris_150` alarms one window earlier at 0.5 and
+    0.25 s.
+
+| Window | Training | Run-level balanced accuracy (AUC), the 110 | Alarmed before any traffic | Floods blocked (mean) | Malware blocked (mean) |
+|---|---|---|---|---|---|
+| 0.5 s | 12B, rerun here | 0.837 (0.972) | 14 | 55% | 89% |
+| | all 240 | 0.837 (0.997) | 0 | 55% | 82% |
+| 0.25 s | 12B, rerun here | 0.830 (0.969) | 14 | 71% | 89% |
+| | all 240 | 0.837 (0.997) | 0 | 71% | 82% |
+| 0.1 s | 12B, rerun here | 0.837 (0.969) | 16 | 83% | 89% |
+| | all 240 | 0.837 (0.997) | 0 | 78% | 82% |
+
+- **What changes:**
+  - Malware: 82% at every length, not 89%. Each of the 14 malware runs now alarms on its first window with traffic,
+    0.5-5 s after the start.
+  - Floods: 78% at 0.1 s, not 83%.
+  - `goldeneye_p10` at 0.1 s: 66%, not 100%, and so less than at 0.25 s (79%). Its first 0.1 s window with traffic
+    holds only its first 16 ms and scores 0.22, so the alarm comes a window later.
+- **What does not change:**
+  - the floods at 0.5 and 0.25 s (55%, 71%);
+  - the run-level accuracy and the first alarm (median: one window in);
+  - every live run and 13I, whose detectors train on all 240 runs.
+- **On all 240 runs**, the network detector alarms on 67 of 114 attack runs and 14 of 126 benign at every length
+  (balanced accuracy 0.738), the same as 12C's network A.
+
+**Changed here:**
+- PC1.md 12B: a correction under its table.
+- PC1.md 13J: 13G's late markers.
+- p4_perf.md: 78% at 0.1 s instead of 83%.

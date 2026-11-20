@@ -1011,8 +1011,9 @@ and no flow should go unread under a flood. **Where the remaining errors came fr
   - **For 0.1 s:** a faster reader, or more than two banks, would give the reads more slack.
   - **What shorter windows buy, offline** (the network detector retrained on the 110 captures at each length):
     accuracy does not change (balanced accuracy 0.83-0.84), and the first alarm comes one window in. The host block
-    would catch on average 55% (0.5 s), 71% (0.25 s) and 83% (0.1 s) of a flood's packets, with the block 50 ms after
-    the alarm.
+    would catch on average 55% (0.5 s), 71% (0.25 s) and 78% (0.1 s) of a flood's packets, with the block 50 ms after
+    the alarm. (PC1.md 12B first gave 83% at 0.1 s: trained on the 110 captures alone, its detector alarmed two
+    GoldenEye runs on an empty first window, before they sent anything; PC1.md, 12B rerun on the lab workstation.)
   - **The training table at 0.25 s** (part 13), so the dataset is not collected again:
     - The network half of all 240 runs is built on PC1 (`live_test/streaming/net_windows_0.25s.csv.gz`); at 0.5 s the
       same code gives the training table bit for bit.
