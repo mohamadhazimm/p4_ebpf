@@ -1013,6 +1013,10 @@ and no flow should go unread under a flood. **Where the remaining errors came fr
     accuracy does not change (balanced accuracy 0.83-0.84), and the first alarm comes one window in. The host block
     would catch on average 55% (0.5 s), 71% (0.25 s) and 83% (0.1 s) of a flood's packets, with the block 50 ms after
     the alarm.
+  - **The training table at 0.25 s** (part 13): the network half of all 240 runs is built on PC1
+    (`live_test/streaming/net_windows_0.25s.csv.gz`; at 0.5 s the same code gives the training table bit for bit). The
+    host half is recomputed on the lab workstation from the runs' raw system calls (`host_windows.py`), so the dataset
+    is not collected again.
 - **Live attacks through the whole loop** (part 12D/E): `hping3` floods from the monitored host.
   - **Detection:** a SYN flood, a UDP flood and a port scan were each alarmed at window 0, with the original and with
     the recalibrated detector. The alarm came 274-381 ms after the window's end and the block 2.9-3.7 ms later.

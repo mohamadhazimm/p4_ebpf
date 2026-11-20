@@ -3063,3 +3063,66 @@ the archive `live_test/committee_replay/pc1_20261119_part12.tar.xz` (everything 
 
 **State after:** switch on `basic_exact_block_v2` (pid 31757), the block table empty and reset, `enp5s0` down; PC2 as
 found (its services stopped and files removed); `/dev/shm` cleaned.
+
+## Part 13 (2026-11-20): the training table at 0.25 s windows
+
+*0.25 s windows run exactly on the switch (12B), and a detector must be trained on windows of the length it scores.
+The dataset is not collected again: its windows are recomputed from what each run saved.*
+
+**13A. The network half, on PC1 (done)** (`live_test/streaming/net_windows.py`):
+- **`live_test/streaming/net_windows_0.25s.csv.gz`:** the 29 network signals of all 240 runs, 80 windows of 0.25 s
+  each, in the training table's run order and layout.
+  - The 110 runs with TCP/UDP traffic: the release's switch model on their captures, from each manifest's anchor,
+    with the TTL of 3 windows that the switch's reader uses.
+  - The other 130 runs have no TCP/UDP traffic, so their windows are zero at any length.
+- **Checks** (`net_windows_0.25s.json`, all passed):
+  - At 0.5 s the same code gives the training table's network columns bit for bit, in every window of the 110 runs;
+    the 130 are zero there too.
+  - At 0.25 s each pair of windows adds up to its 0.5 s window: packets, bytes and flags sum, rates average.
+  - The 110 runs equal part 12B's 0.25 s windows in all 8,800 windows, and a second build gave the same bytes.
+
+**13B. The host half, on the lab workstation (to run)** (`live_test/streaming/host_windows.py`; Python 3.6 or later,
+standard library only):
+- **What it does:**
+  - finds the 240 runs' `run.json` and `syscall_events.csv` under the given folders (run folders, or the campaigns'
+    `runs/*.zip`);
+  - checks each against the training table at 0.5 s: binned by `window_id`, all 18 host columns must be equal in all
+    40 windows;
+  - re-bins every call by its timestamp into 0.25 s windows and computes the release's `host_model.py` features;
+  - with 13A's network half, writes the whole table.
+- **Run** (`--root` is the folder that holds the campaigns; repeat it for more):
+
+      cd p4_ebpf && git pull
+      # a trial on two runs, which writes only the report
+      python3 live_test/streaming/host_windows.py --window 0.25 --release ../p4-ebpf-malware-detection \
+          --root vbox-runs/hybrid-rf-study-20261010/data/versioned-collector \
+          --only syn_fan_40k --only 0004b57f7671cb3dbc993e632279e883d138ea72a271b3ab84637c918e391023
+      # then all 240 (a few minutes)
+      python3 live_test/streaming/host_windows.py --window 0.25 --release ../p4-ebpf-malware-detection \
+          --root vbox-runs/hybrid-rf-study-20261010/data/versioned-collector
+
+- **Expect** "240 of 240 executions found and equal to the training table at 0.5 s", then three files in
+  `live_test/streaming/` to commit and push:
+  - `dataset_windows_0.25s.csv.gz`, the whole table (240 runs x 80 windows);
+  - `dataset_windows_0.25s.json`, the report;
+  - `dataset_windows_0.25s_index.csv`, the runs used.
+- **The sample start** (the report's `start`):
+  - If a `run.json` number gives it (`start.key`), every call's 0.25 s window is exact.
+  - If not, it is estimated from the first call, and `uncertain_calls` counts the calls whose window could differ.
+    `--start-key KEY` names the field if you know it.
+  - Either way the 0.25 s windows nest inside the stored 0.5 s ones: `window_id` fixes every 0.5 s boundary.
+- **If runs are missing:** the report lists them, with each run tried and its cells off (`rejected`). `--index CSV`
+  (execution_id,path,member) names the runs directly, for example the ones `build_05s.py` reads.
+
+**13C. Then, on PC1:**
+- **`stream_verdicts.py`** assumes 40 windows of 0.5 s: make the window count and the prefixes (in seconds) follow
+  the table.
+- **Offline:** the network, host and stacked detectors at 0.25 s against 0.5 s, cross-validated by group.
+- **Live:**
+  - the collector with `--window-sec 0.25`;
+  - the 74 live benign runs again at 0.25 s, for the recalibration set (a 0.5 s window can't be split afterwards);
+  - then the live attacks.
+
+**Tests:** `test_host_windows.py` (4): synthetic runs in a zip and in folders, named by run_id, by name or by content;
+the start from `run.json` or estimated; a rejected attempt; a run unlike its training row. The suite under the `.venv`
+is 311 OK, 8 skipped.

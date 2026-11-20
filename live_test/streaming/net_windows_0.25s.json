@@ -1,0 +1,16 @@
+{
+ "window_s": 0.25,
+ "windows": 80,
+ "runs": 240,
+ "runs_with_capture": 110,
+ "base_equal_runs": 110,
+ "base_exact_runs": 110,
+ "base_differing": {},
+ "runs_without_capture": 130,
+ "runs_without_capture_zero": 130,
+ "subwindows_per_base": 2,
+ "additive_runs": 110,
+ "additive_failures": {},
+ "out": "live_test/streaming/net_windows_0.25s.csv.gz",
+ "ok": true
+}
