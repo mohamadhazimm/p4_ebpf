@@ -2,27 +2,30 @@
 __pycache__/
 *.py[cod]
 
-# Vendored libbpf-bootstrap build outputs
-/libbpf-bootstrap/examples/c/.output/
-/libbpf-bootstrap/examples/c/execmon
-/libbpf-bootstrap/examples/c/filemon
-/libbpf-bootstrap/examples/c/hostmon
-/libbpf-bootstrap/examples/c/modelmon
+# Secrets: never commit them
+.env
+
+# Build outputs of the streaming monitors (host/streaming/Makefile)
+/host/streaming/.output/
+/host/streaming/execmon
+/host/streaming/filemon
+/host/streaming/hostmon
+/host/streaming/modelmon
 
 # bf-p4c output directories, wherever a program is compiled
 *.tofino/
 
 # Hardware benchmark runs: per-command logs, P4 builds, pcaps, register dumps
-# and captures. They stay on disk; p4_perf.md is the summary.
+# and captures. They stay on disk; docs/p4_perf.md is the summary.
 # Exception: the per-probe latencies of the Section 4.1/5.5 hairpin runs
 # (collect_reports.py output: packet_latencies.csv and summary.json).
-/perf/results/**
-!/perf/results/**/
-!/perf/results/*/*_hairpin_r[0-9]/packet_latencies.csv
-!/perf/results/*/*_hairpin_r[0-9]/summary.json
-/perf/plots/
+/switch/results/**
+!/switch/results/**/
+!/switch/results/*/*_hairpin_r[0-9]/packet_latencies.csv
+!/switch/results/*/*_hairpin_r[0-9]/summary.json
+/switch/plots/
 
-# Generated host monitoring outputs
+# Outputs that scripts write to the working directory
 /benign_ls_clean.csv
 /process_summary.csv
 /ctu13_s13_peak10.csv
@@ -37,5 +40,5 @@ __pycache__/
 /test_ebpf_logs/
 /veth_sw_ext
 /veth_sw_int
-# The extra captures unpacked from live_test/captures/cohort-extra.tar.gz (771 MB; PC1.md Part 4)
-/live_test/captures/cohort-extra/
+# The extra captures unpacked from experiments/captures/cohort-extra.tar.gz (771 MB; docs/PC1.md Part 4)
+/experiments/captures/cohort-extra/

@@ -1,252 +1,73 @@
-# P4 + eBPF Hybrid Monitor
+# P4 + eBPF hybrid malware monitor
 
-This repository combines a libbpf host monitor with a Tofino P4 pipeline. The
-hybrid collector samples host activity and P4 flow counters in synchronized
-time windows and writes them to a CSV file.
+A malware monitor that watches a Linux host from two sides. A P4 program on a Tofino switch keeps per-flow
+state of the host's traffic, and an eBPF program in the host's kernel keeps statistics of each process's system
+calls. A collector cuts both views into the same windows, joins them, scores every window with random forests
+trained on a dataset of 240 program executions, and can tell the switch to stop forwarding a flagged host's
+traffic.
 
-## Related Repositories
+This repository holds the system's code and the record of how it was built and measured. It has the switch
+programs and their control plane, the eBPF monitors, the collector and its detectors, and the experiments on the
+Tofino model and on a Wedge 100BF-32X (Tofino 1), with their logs and benchmarks. The dataset and the paper's
+evaluation are in the release repository ([below](#related-repositories)).
 
-This repository is one of five in the research project:
+## The system as measured
 
-- [Malware Dataset Construction Study](https://github.com/mohamadhazimm/p4_ebpf-dataset-construction)
-	contains malware acquisition, the isolated VirtualBox laboratory, the benign
-	workloads, the dataset collections, and the network/host/hybrid model
-	evaluation.
-- [p4-ebpf-malware-detection](https://github.com/mohamadhazimm/p4-ebpf-malware-detection)
-	is the public release of the ICC 2027 paper: the P4 program, the in-kernel
-	monitor, the feature code, the 240-execution dataset, and the evaluation
-	scripts.
-- [Thesis](https://github.com/mohamadhazimm/a-unified-p4-ebpf-architecture-for-host-and-network-malware-detection) (private)
-	contains the master's thesis LaTeX source and its writing reference.
-- [icc-2027-paper](https://github.com/mohamadhazimm/icc-2027-paper) (private)
-	contains the LaTeX source of the ICC 2027 paper, synced with Overleaf.
+The last version tested on the Wedge is tagged `final-2026-11-20` (in the file layout of before that day; see
+[docs/LAYOUT.md](docs/LAYOUT.md)). Its parts, in the current layout:
 
-These repositories are maintained and released independently, and each README
-links to the others.
+| Part | Where | What it does |
+|---|---|---|
+| Switch | [`switch/variants/exact_block/`](switch/variants/exact_block/) | Computes the 29 network window features of the dataset's model in the data plane, and drops the traffic of a host the collector blocks. 11 ingress stages, 421 ns latency, line rate. |
+| Host | [`host/hostmon_agg/`](host/hostmon_agg/) | Aggregates each process's system calls per window in the kernel. User space reads each window once and prints ten statistics per process, from which the collector builds the 18 host window features. |
+| Collector | [`collector/hybrid_collector.py`](collector/) | Reads both sides at every window boundary (`switch/control/window_reader.py` on the switch), writes one row per window and scores it. |
+| Detectors | [`collector/detector/`](collector/detector/), [`collector/block_policy.py`](collector/block_policy.py) | The paper's random forests, trained at several observation prefixes so that every window gets a verdict. At the first alarm the switch blocks the host. |
+| Windows | 0.25 s | The dataset's runs are 40 windows of 0.5 s; the detectors were retrained on the same runs in windows of 0.25 s (`collector/detector/dataset_windows_0.25s.csv.gz`). |
 
-## Requirements
+The measurements: [docs/PC1.md](docs/PC1.md) parts 11-13 (the final system live on the Wedge, from PC1, the host
+attached to it), [docs/p4_perf.md](docs/p4_perf.md) (the switch programs' resources, latency and line rate) and
+[host/COMPARISON.md](host/COMPARISON.md) (the eBPF monitor's overhead against published monitors).
 
-- Linux with a working eBPF-capable kernel and root access.
-- Intel Tofino P4 Studio/SDE and a compiled `basic.tofino` program for the
-	complete P4-backed workflow. The compiled output is local and is not stored
-	in this repository.
-- `clang` 11 or newer, `make`, `libelf-dev`, and `zlib1g-dev` to build the C
-	eBPF examples. On Ubuntu/Debian:
+## Layout
 
-	```sh
-	sudo apt install clang make libelf-dev zlib1g-dev
-	```
+| Folder | What |
+|---|---|
+| [`switch/`](switch/) | The P4 programs: the first version (`p4/`, a flow table read by the control plane) and the later builds (`variants/`, `exact_block` is the final one). Also the control plane (`control/`), the tools to compile, load and benchmark on the Wedge (`tools/`) and the hairpin latency records (`results/`). |
+| [`host/`](host/) | The eBPF monitors: `hostmon_agg/` (the one used), `sockowner/` (which process owns each flow), and the earlier streaming monitors (`hostmon_ref/`, `streaming/`), with their overhead benchmarks. |
+| [`collector/`](collector/) | The collector, the block policy, the socket-level join and the detectors with their training tables. |
+| [`experiments/`](experiments/) | Live tests on the Tofino model, replays of the dataset's captures through the Wedge, the captures themselves, the result archives of the runs on PC1, and the benign workloads. |
+| [`analysis/`](analysis/) | The offline studies of October 2026, which rebuilt the switch's features from packet captures. |
+| [`tests/`](tests/) | Unit tests of the control plane, the collector and the experiment scripts. They need no switch and no root. |
+| [`docs/`](docs/) | [`PC1.md`](docs/PC1.md) (the log of the hardware runs), [`p4_perf.md`](docs/p4_perf.md) (the switch's performance), [`RUNBOOK.md`](docs/RUNBOOK.md) (the register readout on the Wedge), [`USAGE.md`](docs/USAGE.md) (running the first version) and [`LAYOUT.md`](docs/LAYOUT.md). |
+| [`third_party/`](third_party/) | libbpf-bootstrap (libbpf, bpftool, `vmlinux.h`) and the reference detector of the latency method. |
+| [`archive/`](archive/) | Superseded code kept for the record. |
 
-- Python 3 and Scapy for packet capture/replay:
-
-	```sh
-	sudo apt install python3-scapy
-	```
-
-The Tofino model, `bf_switchd`, BPF loading, interface setup, and packet
-replay require elevated privileges. The scripts currently default to the SDE
-installation at `/home/ubuntu/open-p4studio/install` and this checkout at
-`/home/ubuntu/Desktop/p4_ebpf`; update the constants in the Python scripts if
-your paths differ.
-
-## Build And Run HostMon
-
-From the repository root, build the host monitor:
+## Quick start
 
 ```sh
-make -C libbpf-bootstrap/examples/c hostmon
+python3 -m unittest discover -s tests       # 325 tests, a minute; 8 skip without the SDE's generated bfruntime_pb2
+make -C host/streaming hostmon               # the streaming monitor (clang >= 11, libelf-dev, zlib1g-dev)
+DEP=/usr host/build.sh                       # hostmon_agg and the benchmark binaries into host/build/ (clang-14)
+python3 collector/hybrid_collector.py --help
 ```
 
-Run it with a 10-second reporting window (press Ctrl+C to stop):
+Some tests and the detectors read the release repository. Clone it next to this one
+(`../p4-ebpf-malware-detection`). The detectors need NumPy and scikit-learn; a scikit-learn older than 1.8
+reproduces the paper's fold assignments. Running the monitors needs root and a kernel with BTF. Running the switch
+side needs Intel's P4 Studio SDE: 9.6.0 on the Wedge, or open-p4studio for the Tofino model
+([experiments/README.md](experiments/README.md)).
 
-```sh
-sudo ./libbpf-bootstrap/examples/c/hostmon 10
-```
+## Related repositories
 
-HostMon prints per-process syscall and activity summaries. This standalone
-mode does not require the Tofino model.
+- [p4-ebpf-malware-detection](https://github.com/mohamadhazimm/p4-ebpf-malware-detection): the public release of
+  the paper. It holds the P4 program, the in-kernel monitor, the feature code, the 240-execution dataset and the
+  evaluation scripts.
+- [p4_ebpf-dataset-construction](https://github.com/mohamadhazimm/p4_ebpf-dataset-construction): the malware
+  acquisition, the isolated VirtualBox laboratory, the benign workloads, the dataset collections and the model
+  evaluations.
+- The thesis and the paper's LaTeX sources are in private repositories.
 
-## Run The Full P4 + eBPF Collector
+## License
 
-First compile the P4 program with your installed P4 Studio toolchain. The
-resulting `basic.tofino/basic.conf` and pipeline artifacts must be available;
-the compile command depends on the local P4 Studio installation and is not
-generated by this repository.
-
-The CPU report passed to TNA `Mirror.emit` is a P4 header, not a struct. Mark
-it valid only when creating a report; the normal packet deparser emits only
-the original packet headers.
-
-`thesis-hybrid-ebpf-p4/ingress.p4` has compile-time evaluation controls. The
-default preserves feature collection and first-flow CPU reports. Build the
-physical feature-collection variant with
-`-D P4_ENABLE_CPU_REPORTS=0`; it keeps the P4 counters but disables the CPU
-mirror because the two-host topology has no host connected to report port 2.
-Build the forwarding-only arm with both
-`-D P4_ENABLE_FEATURES=0 -D P4_ENABLE_CPU_REPORTS=0`. That variant retains the
-same parser and forwarding table but omits flow-register updates. The
-corresponding BFRT programmer supports `--skip-mirror`. These variants have
-been compiled in a separate switch staging directory only; none has been
-loaded on the switch.
-
-The CPU report header is 18 bytes (magic `0xBEF1`) and ends with
-`flow_index`, the register bucket the data plane chose, so the collector reads
-exactly that bucket instead of recomputing the hash. `listen_cpu_reports.py`
-still accepts the 16-byte `0xBEEF` reports of earlier builds and then computes
-the index. The no-report physical feature variant does not emit that header or
-a mirror clone; flow registers must instead be read through BFRT. Per-packet
-ASIC latency instrumentation is not part of either variant and must remain a
-separate benchmark build.
-
-The flow index is symmetric, so both directions of a connection share one
-bucket and `pkts_ab`/`pkts_ba` are meaningful. bf-p4c 9.6.0 drops arithmetic
-inside a hash field list: the earlier `{sip^dip, sip+dip, sp^dp, sp+dp, proto}`
-input compiled to a plain CRC of the raw 5-tuple, which split every connection
-over two buckets. The symmetry now comes from `@symmetric`. The compiled
-function, CRC-16/ARC over `(0, sip^dip, 0, sp^dp, proto)`, is implemented once
-in `thesis-hybrid-ebpf-p4/python/flow_index.py` and used by all scripts.
-
-Set the SDE path and start the virtual interfaces and Tofino model in one
-terminal:
-
-```sh
-export SDE=/home/ubuntu/open-p4studio/install
-sudo "$SDE/bin/veth_setup.sh" 128
-sudo "$SDE/bin/tofino-model" \
-	--no-cli \
-	--logs-disable \
-	-f "$PWD/thesis-hybrid-ebpf-p4/ports.json" \
-	--install-dir "$SDE"
-```
-
-In a second terminal, start `bf_switchd`. Set `P4_OUTPUT` to the directory
-created by your P4 Studio build:
-
-```sh
-export SDE=/home/ubuntu/open-p4studio/install
-export P4_OUTPUT="$PWD/thesis-hybrid-ebpf-p4/basic.tofino"
-sudo "$SDE/bin/bf_switchd" \
-	--install-dir "$SDE" \
-	--conf-file "$P4_OUTPUT/basic.conf"
-```
-
-With the model and switch running, start a PCAP collection from the repository
-root. Replace the PCAP path with a capture available on your machine:
-
-```sh
-sudo python3 hybrid_collector.py \
-	--mode pcap \
-	--scenario-name example \
-	--label malicious \
-	--pcap /path/to/input.pcap \
-	--window-sec 10 \
-	--drain-seconds 2 \
-	--out-csv hybrid_windows.csv
-```
-
-The collector starts HostMon, programs forwarding and mirroring through
-BFRT, replays the PCAP on the configured veth interfaces, and appends
-synchronized windows to `hybrid_windows.csv`. CPU reports are captured in the
-background. At the end of every window the P4 registers of the active bucket
-indexes are read, so each window's features are that window's traffic. The
-reader copies all registers with a register sync first, so one flow's values
-are taken at the same moment, and it combines the per-pipe register copies.
-A bucket sends its CPU report only once, when it is first used. An index
-therefore stays active while its packet counter keeps changing. A bucket idle
-for `--clear-idle-windows` reads (default 3, `0` disables) is cleared right
-after its read, so the next flow landing in it reports again instead of being
-merged silently into the old counters.
-
-For the same reason every run starts by clearing all detector registers
-(`thesis-hybrid-ebpf-p4/python/reset_registers.py`, which also works on its
-own and with `--ssh`; `--no-register-reset` skips it). A bucket left from an
-earlier run would keep `dir_valid` set, so a new flow landing in it would send
-no report and never be read, and `reg_newconn_dst` would return its count since
-the switch started.
-
-Two register readers exist. `--reader legacy` (the default) runs
-`read_registers_with_index.py`: a bfshell/bfrt_python session per window with one
-`get()` per register per bucket (14 calls, ~1.14 ms per bucket on the switch plus
-~1.5 s per session). `--reader batched` runs `batched_reader.py`: one long-lived BF
-Runtime gRPC client that syncs each register table once, reads all active buckets
-of a table in one Read RPC and clears idle buckets in one Write RPC per window, with
-the same rows (`thesis-hybrid-ebpf-p4/python/tests/test_batched_reader.py` checks
-both readers window by window on `bfrt_mock.py`). `--reader-raw-wire` makes it build
-its requests and decode its responses on the protobuf wire format directly, for a client
-whose protobuf package has no C implementation (the SDE 9.6 one on the switch), and
-`--reader-sync-batched` sends the register syncs in one RPC. `--reader-timing` prints the
-per-window sync/read/clear times of either reader. [`RUNBOOK.md`](RUNBOOK.md) has the
-commands to validate and time the batched reader on the Wedge100BF-32X, and the results
-of 2026-11-05 (Sections 9 and 10).
-
-A register read that fails, or takes longer than `--p4-read-timeout` (default
-120 s), is retried `--p4-read-retries` times (default 2). Each window's row is
-written to `OUT.<run_id>.partial.csv` as soon as it is complete. A finished run
-appends its rows to the output CSV; a failed or interrupted run keeps them in
-`OUT.<run_id>.incomplete.csv` and does not touch the output CSV. Rows follow the
-register reads: host windows after the last read get no row. HostMon runs in
-its own process group (directly when the collector runs as root), so the
-collector's stop signal reaches it and it prints its last, partial window.
-Its defaults use ports 0 and 1 for forwarding, report port 2, and CPU-report
-interface `veth5`; these are virtual-model defaults. The legacy collector
-emits a different feature schema from the shared-arm classifier and is not
-ready for physical classification.
-
-On the hardware Tofino the collector can run on another host and reach the
-switch over SSH. `--switch-ssh` makes it run bfshell on the switch and capture
-the reports there with `tcpdump`, so it needs no Python packages on the switch.
-On the NETLAB Wedge100BF-32X, front-panel ports 1/0 and 2/0 are dev_ports 132
-and 140, and the PCIe CPU port is 192, whose reports arrive on `enp5s0`:
-
-```sh
-sudo python3 hybrid_collector.py ... \
-	--switch-ssh root@172.168.1.2 \
-	--forward-int-port 132 --forward-ext-port 140 \
-	--forward-report-port 192 --cpu-iface enp5s0
-```
-
-`enp5s0` must be up on the switch to receive the reports. The P4 data plane's
-hardware evaluation on this switch (resources, packet rate, ASIC latency, flow
-table, CPU reports and readout), the list of fixes and a comparison with published
-P4 systems are in [`p4_perf.md`](p4_perf.md).
-
-For a physical comparison, verify the live switch port/link mapping and
-configure the eBPF collector for the specific workload PID before running
-traffic. Do not use the legacy model commands above as physical switch
-instructions. Pipeline loading, port enabling, and traffic generation require
-an approved run plan.
-
-To collect a generated command workload instead of replaying a PCAP, use
-`--mode command` and provide `--command`:
-
-```sh
-sudo python3 hybrid_collector.py \
-	--mode command \
-	--scenario-name benign-file-activity \
-	--label benign \
-	--command "python3 hybrid_data_generator.py --duration 120" \
-	--window-sec 10 \
-	--out-csv hybrid_windows.csv
-```
-
-The collector's PCAP and command modes both require the P4 model and
-`bf_switchd` to be running. For lower-level Tofino setup and BFRT commands,
-see [`thesis-hybrid-ebpf-p4/commands.txt`](thesis-hybrid-ebpf-p4/commands.txt).
-
-## Output And Troubleshooting
-
-- `hybrid_windows.csv` contains the collected windows. HostMon output is
-	captured in `hostmon_capture.log`.
-- Build output and run logs are local artifacts and are ignored by Git.
-- If the collector reports that `bfshell` is missing, set `SDE_INSTALL` (the
-	scripts default to `$SDE_INSTALL/bin/bfshell`) or pass `--bfshell` to
-	`thesis-hybrid-ebpf-p4/python/program_forwarding.py` and
-	`thesis-hybrid-ebpf-p4/python/read_registers_with_index.py`.
-- The scripts keep bfshell's stdin open until the session ends
-	(`bfshell_run.py`): `bfshell -b` without a terminal otherwise disconnects
-	before its script runs and silently does nothing.
-- Unit tests: `cd thesis-hybrid-ebpf-p4/python && python3 -m unittest discover -s tests`.
-- If it cannot connect to BFRT, confirm `bf_switchd` is running and listening
-	on port 9999: `sudo ss -lntp | grep :9999`.
-- Confirm the expected interfaces exist with `ip link show veth1` and
-	`ip link show veth5`.
+GPL-2.0 ([LICENSE](LICENSE)). The code in [`third_party/`](third_party/) keeps its own licenses, and files with
+their own SPDX header keep theirs.
