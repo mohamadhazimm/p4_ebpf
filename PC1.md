@@ -3081,8 +3081,8 @@ The dataset is not collected again: its windows are recomputed from what each ru
   - At 0.25 s each pair of windows adds up to its 0.5 s window: packets, bytes and flags sum, rates average.
   - The 110 runs equal part 12B's 0.25 s windows in all 8,800 windows, and a second build gave the same bytes.
 
-**13B. The host half, on the lab workstation (to run)** (`live_test/streaming/host_windows.py`; Python 3.6 or later,
-standard library only):
+**13B. The host half, on the lab workstation (done: Results, part 13B)** (`live_test/streaming/host_windows.py`;
+Python 3.6 or later, standard library only):
 - **What it does:**
   - finds the 240 runs' `run.json` and `syscall_events.csv` under the given folders (run folders, or the campaigns'
     `runs/*.zip`);
@@ -3095,11 +3095,11 @@ standard library only):
       cd p4_ebpf && git pull
       # a trial on two runs, which writes only the report
       python3 live_test/streaming/host_windows.py --window 0.25 --release ../p4-ebpf-malware-detection \
-          --root vbox-runs/hybrid-rf-study-20261010/data/versioned-collector \
+          --root ../vbox-runs/hybrid-rf-study-20261010/data/versioned-collector \
           --only syn_fan_40k --only 0004b57f7671cb3dbc993e632279e883d138ea72a271b3ab84637c918e391023
       # then all 240 (a few minutes)
       python3 live_test/streaming/host_windows.py --window 0.25 --release ../p4-ebpf-malware-detection \
-          --root vbox-runs/hybrid-rf-study-20261010/data/versioned-collector
+          --root ../vbox-runs/hybrid-rf-study-20261010/data/versioned-collector
 
 - **Expect** "240 of 240 executions found and equal to the training table at 0.5 s", then three files in
   `live_test/streaming/` to commit and push:
@@ -3114,7 +3114,7 @@ standard library only):
 - **If runs are missing:** the report lists them, with each run tried and its cells off (`rejected`). `--index CSV`
   (execution_id,path,member) names the runs directly, for example the ones `build_05s.py` reads.
 
-**13C. Then, on PC1** (done except what needs the host half: Results, part 13):
+**13C. Then, on PC1** (done: Results, part 13 and part 13C):
 - **`stream_verdicts.py`** assumes 40 windows of 0.5 s: make the window count and the prefixes (in seconds) follow
   the table.
 - **Offline:** the network, host and stacked detectors at 0.25 s against 0.5 s, cross-validated by group.
@@ -3236,3 +3236,154 @@ The training table at 0.25 s is complete, with the host half from the 240 runs' 
   the host monitor and the switch at the same window length: host 0.784 / 0.768, network 0.756 / 0.758,
   concatenated 0.812 / 0.811, stacked 0.823 / 0.818. The host loses a little (higher at 0.25 s in 1 of 10
   assignments); both hybrids keep their lead over it.
+
+## Results, part 13C (PC1, 2026-11-20): the host half checked, every detector at 0.25 s
+
+The user pulled 86743ce (part 13B) and asked to check it. This section has the check, and then the rest of 13C that
+needed the host half. Files: `perf/results/part13_20261120/` (`evaluation_full/`, `live_stacked/`, scripts in `src/`)
+and the archive `live_test/committee_replay/pc1_20261120_part13c.tar.xz`.
+
+**13H. The workstation's table, checked on PC1** (`src/check_host_half.py`; all passed):
+- **Layout:**
+  - the training table's columns;
+  - 240 runs x 80 windows, in its run order;
+  - the same label, category, group and split per run.
+- **Network half:** all 556,800 cells are equal to PC1's `net_windows_0.25s.csv.gz`, as text.
+- **Host half against the published 0.5 s table.** All 9,600 pairs of 0.25 s windows were checked against
+  `host_model.py`'s definitions:
+  - **Calls** add up exactly: 10,006,454 in both tables.
+  - **Transitions** are lost only where a process's call changes at the boundary between the halves: 2,379 of
+    6,202,977, and never more than either half's calls.
+  - **Each maximum stays inside the range its two halves allow:**
+    - unique calls and the longest run: from max(A, B) to A + B;
+    - first-50 and first-100 unique: from A to A + B;
+    - top-call frequency and rare ratio: at most max(A, B);
+    - mean run length: at most A + B;
+    - entropy: at most max(A, B) + 1 bit.
+  - **Empty windows:** a 0.5 s window is empty exactly when both its halves are, and an empty window is all zeros.
+- **The report:**
+  - 240 of 240 runs found: 110 by run_id, 130 by name through the index;
+  - the start from `run.json`'s `sample_started_monotonic_ns` in all 240;
+  - 0 nesting failures, 0 calls outside the 20 s.
+- **The start is exact:**
+  - The dataset runner bins calls by `(timestamp_ns - sample_started_ns) // window` (`malware_runner.py`). The
+    versioned collector's audits require the observation start to equal `sample_started_monotonic_ns`.
+  - The key falls inside every run's interval of possible starts, and that interval is under 10 us wide in 10 runs
+    and under 1 ms in 35.
+  - In 190 runs the stored windows leave over 100 ms of room, so there the key alone decides the 0.25 s boundaries.
+  - "0 uncertain calls" counts nothing when the key is used.
+- **Two faults in 13B's instructions, found by the workstation run and fixed here:**
+  - **`--root` stopped at an unreadable zip** (Go's test data under `committee-eval-20261113/toolchain/`: a
+    `UnicodeDecodeError`). `host_windows.py` now handles this:
+    - an archive it can't open is skipped and listed in the report's `skipped`;
+    - a run whose files can't be read (a damaged member: `zlib.error`) is rejected with its error, instead of
+      stopping the run.
+  - **The example's path:** `--root vbox-runs/...` is relative to the workspace folder, so after `cd p4_ebpf` it is
+    `../vbox-runs/...`. Fixed in 13B and in the script's usage.
+  - **Tests:** `test_host_windows.py` now has a zip with a malformed name among the runs, and a run with a damaged
+    member. The old script fails both ways (`UnicodeDecodeError`, `zlib.error`). The suite under the `.venv` is
+    319 OK, 8 skipped.
+
+**13I. Offline: every detector at 0.25 s against 0.5 s** (`evaluation_full/`, `src/evaluate_windows.py --detectors
+network,host,concat,stacked`):
+- The setup is 13F's: 12C's 5 group folds over the 240 dataset runs and the 74 live benign runs.
+  - Model A is trained on the dataset runs; model B also on the live benign runs.
+  - "Stream" means an alarm in any window.
+- **At 0.5 s it reproduces 12C's network, host and stacked rows exactly**; the concatenated detector is new.
+
+| Detector | Training | Dataset balanced accuracy (run level), 0.5 s / 0.25 s | Dataset TPR / FPR (stream), 0.5 s | 0.25 s | Live benign alarmed (stream), 0.5 s / 0.25 s |
+|---|---|---|---|---|---|
+| network | A | 0.738 / 0.738 | 0.588 / 0.111 | 0.588 / 0.111 | 9.5% / 9.5% |
+| network | B | 0.774 / 0.782 | 0.588 / 0.048 | 0.588 / 0.024 | 5.4% / 5.4% |
+| host | A | 0.813 / 0.833 | 0.816 / 0.230 | 0.825 / 0.191 | 83.8% / 83.8% |
+| host | B | 0.831 / 0.831 | 0.798 / 0.191 | 0.807 / 0.198 | 6.8% / 8.1% |
+| concatenated | A | 0.808 / 0.804 | 0.807 / 0.246 | 0.807 / 0.214 | 70.3% / 71.6% |
+| concatenated | B | 0.824 / 0.819 | 0.798 / 0.175 | 0.798 / 0.182 | 2.7% / 2.7% |
+| stacked | A | 0.807 / 0.819 | 0.798 / 0.175 | 0.781 / 0.167 | 56.8% / 47.3% |
+| stacked | B | 0.833 / 0.832 | 0.816 / 0.206 | 0.807 / 0.206 | 2.7% / 6.8% |
+
+- **The dataset accuracy holds at 0.25 s:**
+  - Every detector's balanced accuracy is within -0.005 to +0.020 of its value at 0.5 s, and its stream TPR within
+    0.02.
+  - Stacked B finds 92 of the 114 attack runs instead of 93: one malware run fewer (77 of 99), and all 15 floods.
+  - The workstation's reference (13B: the paper's protocol, 10 fold assignments) agrees: no detector moves by more
+    than 0.016.
+- **Every detector's median first alarm is the first window**, so it comes at 0.25 s instead of 0.5 s.
+- **Live false alarms with the live runs trained on (B):**
+  - Stacked B flags 5 of the 74 runs (6.8%): `rsync`'s 2, as at 0.5 s, and the 3 runs of the release's `files`
+    workload, which are new.
+  - Host B adds 1 `files` run to `rsync` and `fanout`, as at 0.5 s.
+  - Concatenated B leaves only `rsync` at both lengths.
+- **As deployed** (A on all 240 runs), live benign alarmed at 0.5 s / 0.25 s: network 8.1% / 5.4%, host 85.1% /
+  83.8%, concatenated 62.2% / 64.9%, stacked 70.3% / 56.8%.
+
+**13J. Live: the stacked detector at 0.25 s against 0.5 s** (`live_stacked/`, `src/run_recal_live.sh`,
+`src/summarize_stacked.py`):
+- **How:** part 12E's loop at each length, with the stacked detector recalibrated and a host block at the alarm.
+  - It trains on that length's training table plus its live benign runs: at 0.25 s, `dataset_windows_0.25s.csv.gz`
+    (the collector picks it by `--window-sec`) and `--block-train-extra live_benign_windows_0.25s.csv.gz`; at 0.5 s,
+    12C's tables.
+  - Each benign workload runs with its own live group held out.
+  - **Cases:**
+    - 11F's 7 workloads;
+    - the release's `files` (the workload 13I flags at 0.25 s) and `null`;
+    - 12D's 3 floods.
+  - Both lengths ran on the same switch in one session. Training took 59-60 s per run at 0.25 s (52-53 s at 0.5 s).
+- **All 24 runs clean:** every window written and scored (80 or 40), `HOSTMON_HEALTH` zeros.
+- **No false alarm at either length:** none of the 9 benign workloads alarmed.
+  - The highest probabilities were `files` 0.344 at 0.25 s (0.362 at 0.5 s) and `fanout` 0.294 (0.466).
+  - So `files`, which 13I flags offline, is not flagged live.
+- **The floods:** all alarmed at window 0 at both lengths.
+
+| Attack | Window | Alarm p | Alarm after the window's end | Dropped by the switch | Reached PC2 |
+|---|---|---|---|---|---|
+| SYN flood, 60,000 | 0.25 s | 0.859 | 268 ms | 54,575 (91.0%) | 5,425 |
+| | 0.5 s | 0.861 | 355 ms | 50,725 (84.5%) | 9,275 |
+| UDP flood, 60,000 | 0.25 s | 0.841 | 319 ms | 46,956 (78.3%) | 13,044 |
+| | 0.5 s | 0.914 | 319 ms | 40,347 (67.2%) | 19,653 |
+| port scan, 30,000 | 0.25 s | 0.824 | 324 ms | 26,413 (88.0%) | 3,587 |
+| | 0.5 s | 0.774 | 287 ms | 24,642 (82.1%) | 5,358 |
+
+- **33-42% fewer attack packets reached PC2 at 0.25 s.**
+  - The blocks were written in 2.9-3.3 ms.
+  - "Reached PC2" is sent minus dropped. It equals `hping3`'s replies for the SYN flood and the port scan, and PC2's
+    counter agrees within 3 frames.
+- **At 0.5 s it is close to 12E:** 84.5%, 67.2% and 82.1% dropped, against 84.6%, 71.2% and 82.8% yesterday.
+- **Against the network detector at 0.25 s (13G):**
+  - The SYN flood and the port scan come out about the same: 91.0% against 90.1%, and 88.0% against 90.1%.
+  - The UDP flood loses more, 78.3% dropped against 84.6%. The stacked alarm comes about 105 ms later after the
+    window's end (319 ms against 213 ms): window 0 reached the collector 105-111 ms after its end in both runs, but
+    the stacked score took 206 ms against the network detector's 106 ms.
+- **The stacked detector does not keep up with 0.25 s windows.** Whether it would was 13C's open question.
+  - **The loop:** the score takes a median 160 ms per window at both lengths, and the collector's loop is serial. It
+    requests window k from the switch's reader 4 ms after scoring window k-1, and the request takes a median 102 ms.
+  - **So one window costs about 270 ms against 250 ms.** A score lands later after its window's end with each window:
+    about 270 ms at window 0, 0.5 s at window 10, 1.1 s at window 40 and 1.8-2.1 s at window 79 (about 20 ms more
+    per window).
+  - **What it costs:** no window is lost and an alarm at window 0 is not delayed, but an alarm later in a run is: by
+    about 1.1 s at 10 s into the run.
+  - **Where it keeps up:** at 0.5 s, and for the network detector at 0.25 s, the loop waits for each window. The
+    request leaves 4 ms after the window's end, and the score lands a steady 270 ms (stacked at 0.5 s) or 200 ms
+    (network at 0.25 s) after it.
+  - **The fix:** request window k+1 while window k is being scored, with a scoring thread or a reader that streams
+    the windows. A window then costs the longer of the two (about 160 ms). Not done here: it changes the collector's
+    main loop.
+
+**Changed here:**
+- **`live_test/streaming/host_windows.py`:**
+  - `--root` skips archives it can't open and lists them in the report's `skipped`;
+  - a run whose files can't be read is rejected with its error;
+  - the usage example has the right `--root`.
+- **`test_host_windows.py`:** a malformed zip among the runs, and a run with a damaged member (5 tests).
+- **PC1.md 13B:** `--root ../vbox-runs/...`.
+
+**Next:**
+- Overlap the collector's request for the next window with the scoring (13J). Then run 13J's 0.25 s runs again, to
+  check that the delay stays flat.
+- 0.1 s windows still need a faster reader on the switch (12B).
+
+**State after:**
+- The switch is on `basic_exact_block_v2` (pid 31757), with the block table empty (the 6 alarmed runs cleared their
+  entries, and the other 18 had none) and `enp5s0` down.
+- PC2 is as found: `servers_log.py` stopped and `/tmp/hz_srv` removed; its log is `pc2/servers_13c.log`.
+- `/dev/shm` is clean.

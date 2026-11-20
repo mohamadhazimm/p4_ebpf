@@ -32,8 +32,9 @@ without it, host_windows_<window>s.csv.gz with the host columns only. Also a rep
 index of the runs used. Nothing is written but the report and the index unless every run is found and checked; the
 exit status is then 1.
 
+    cd p4_ebpf      # the workspace folder holds p4_ebpf, p4-ebpf-malware-detection and vbox-runs
     python3 live_test/streaming/host_windows.py --window 0.25 --release ../p4-ebpf-malware-detection \\
-        --root ~/vbox-runs/hybrid-rf-study-20261010/data/versioned-collector/additional-study-review-20261022
+        --root ../vbox-runs/hybrid-rf-study-20261010/data/versioned-collector
 
 Python 3.6 or later, standard library only. --only ID (repeatable) tries a few runs and writes only the report.
 """
@@ -50,6 +51,7 @@ import statistics
 import sys
 import tarfile
 import zipfile
+import zlib
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -63,6 +65,9 @@ EVENT_FILES = ("syscall_events.csv", "syscall_events.csv.gz")
 ID_RE = re.compile(r"(?:^|[\s,;])id=(-?\d+)")
 PIN_NS = 200000           # a start known within 0.2 ms
 TOL = 1e-9
+# a run's files could not be read: a damaged or encrypted zip member (BadZipFile, zlib.error, EOFError,
+# RuntimeError), a compression this Python lacks (NotImplementedError), bad text or numbers (ValueError)
+READ_ERRORS = (ValueError, OSError, EOFError, RuntimeError, NotImplementedError, zipfile.BadZipFile, zlib.error)
 
 
 def windows_in_run(window_s):
@@ -187,8 +192,9 @@ class Run:
                 zf.close()
 
 
-def discover(roots, log):
-    """Every run folder under the roots, on disk or inside zip files."""
+def discover(roots, log, skipped):
+    """Every run folder under the roots, on disk or inside zip files. Archives that can't be read are skipped and
+    listed in skipped: a campaign folder can hold other zips, such as a toolchain's malformed test archives."""
     runs = []
     for root in roots:
         root = os.path.abspath(os.path.expanduser(root))
@@ -202,18 +208,27 @@ def discover(roots, log):
             for z in sorted(f for f in files if f.lower().endswith(".zip")):
                 path = os.path.join(d, z)
                 try:
-                    with zipfile.ZipFile(path) as zf:
-                        names = set(zf.namelist())
-                        for name in sorted(names):
-                            if posixpath.basename(name) != "run.json":
-                                continue
-                            member = posixpath.dirname(name)
-                            ev = [e for e in EVENT_FILES if posixpath.join(member, e) in names]
-                            if ev:
-                                runs.append(load_run(path, member, ev[0], zf.read(name),
-                                                     rel + [z] + member.split("/")))
-                except (zipfile.BadZipFile, OSError) as e:
-                    log("skipping %s: %s" % (path, e))
+                    zf = zipfile.ZipFile(path)
+                except READ_ERRORS as e:          # a member name that isn't UTF-8 is a UnicodeDecodeError
+                    skipped.append({"where": path, "error": "%s: %s" % (type(e).__name__, e)})
+                    log("skipping %s: %s" % (path, skipped[-1]["error"]))
+                    continue
+                with zf:
+                    names = set(zf.namelist())
+                    for name in sorted(names):
+                        if posixpath.basename(name) != "run.json":
+                            continue
+                        member = posixpath.dirname(name)
+                        ev = [e for e in EVENT_FILES if posixpath.join(member, e) in names]
+                        if not ev:
+                            continue
+                        try:
+                            raw = zf.read(name)
+                        except READ_ERRORS as e:
+                            skipped.append({"where": path + "/" + name, "error": "%s: %s" % (type(e).__name__, e)})
+                            log("skipping %s: %s" % (skipped[-1]["where"], skipped[-1]["error"]))
+                            continue
+                        runs.append(load_run(path, member, ev[0], raw, rel + [z] + member.split("/")))
     return runs
 
 
@@ -341,6 +356,7 @@ def main(argv=None):
         print(msg, flush=True)
 
     # 1. the runs and their names
+    skipped = []
     if args.index:
         runs = []
         for r in csv.DictReader(open(args.index, newline="")):
@@ -356,7 +372,7 @@ def main(argv=None):
                 runs.append(load_run(None, path, ev[0], open(os.path.join(path, "run.json"), "rb").read(),
                                      [r["execution_id"]]))
     else:
-        runs = discover(args.root, log)
+        runs = discover(args.root, log, skipped)
     log("%d run folders with run.json and syscall_events.csv" % len(runs))
     by_run_id = manifest_run_ids(CAPS)
     ids = set(wanted)
@@ -383,8 +399,8 @@ def main(argv=None):
         if run.base is None:
             try:
                 run.base = base_pass(run, host_model)
-            except (ValueError, OSError, zipfile.BadZipFile) as err:
-                run.base = {"error": str(err)}
+            except READ_ERRORS as err:
+                run.base = {"error": "%s: %s" % (type(err).__name__, err)}
         if "error" in run.base:
             rejected.setdefault(e, []).append({"where": run.where(), "error": run.base["error"]})
             return False
@@ -414,8 +430,8 @@ def main(argv=None):
             if run.base is None:
                 try:
                     run.base = base_pass(run, host_model)
-                except (ValueError, OSError, zipfile.BadZipFile) as err:
-                    run.base = {"error": str(err)}
+                except READ_ERRORS as err:
+                    run.base = {"error": "%s: %s" % (type(err).__name__, err)}
             if "error" in run.base:
                 continue
             for e in left:
@@ -438,7 +454,7 @@ def main(argv=None):
     delay = int(statistics.median(pinned)) if pinned else 0
     spread = max([abs(d - delay) for d in pinned] + [PIN_NS]) if pinned else BASE_NS
     report = {"window_s": ws, "windows": n, "executions": len(wanted), "found": len(chosen),
-              "missing": [e for e in wanted if e not in chosen], "run_folders": len(runs),
+              "missing": [e for e in wanted if e not in chosen], "run_folders": len(runs), "skipped": skipped,
               "start": {"key": source, "pinned_runs": len(pinned), "first_call_delay_ns_median": delay,
                         "first_call_delay_spread_ns": spread},
               "runs": {}, "rejected": rejected}

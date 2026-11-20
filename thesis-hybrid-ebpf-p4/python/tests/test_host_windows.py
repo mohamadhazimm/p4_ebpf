@@ -8,6 +8,7 @@ import importlib.util
 import io
 import json
 import os
+import struct
 import sys
 import tempfile
 import unittest
@@ -54,6 +55,26 @@ def write_events(fileobj_text, calls, t0):
     w.writerow(["timestamp_ns", "window_id", "pid", "tid", "comm", "event", "detail"])
     for ts, pid, sid in calls:
         w.writerow([ts, (ts - t0) // (NS // 2), pid, pid, "prog,x", "syscall", "id=%d" % sid])
+
+
+def bad_name_zip(path):
+    """A zip with a member name flagged UTF-8 that isn't (as in Go's archive/zip test data): ZipFile() fails on it
+    with a UnicodeDecodeError."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("testdata/aé.txt", b"x")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(buf.getvalue().replace("aé".encode("utf-8"), b"a\xff\xa9"))
+
+
+def damage_member(path, name):
+    """Give a deflated member an invalid first block type (BTYPE 11): reading it raises zlib.error."""
+    with zipfile.ZipFile(str(path)) as zf:
+        offset = zf.getinfo(name).header_offset
+    raw = bytearray(path.read_bytes())
+    n, m = struct.unpack("<HH", bytes(raw[offset + 26:offset + 30]))
+    raw[offset + 30 + n + m] = 0x07
+    path.write_bytes(bytes(raw))
 
 
 @unittest.skipUnless(HAVE, "needs the release repository next to p4_ebpf")
@@ -104,6 +125,7 @@ class HostWindowsTest(unittest.TestCase):
                     write_events(f, self.calls[e], self.t0[e])
                 else:
                     write_events(f, calls_sparse(self.t0[E3], second=59), self.t0[E3])     # a repeat: other features
+        bad_name_zip(root / "campD" / "toolchain" / "bad_name.zip")      # not a run archive, and unreadable
         # the training table at 0.5 s (host from the calls, network a marker) and the network half at 0.25 s
         table, net = self.d / "table.csv.gz", self.d / "net.csv.gz"
         meta = {E1: [E1, "1", "malware", "fam::x", "train"], E2: [E2, "0", "benign", "proj::x", "test"],
@@ -147,6 +169,8 @@ class HostWindowsTest(unittest.TestCase):
         self.assertEqual({e: r["matched_by"] for e, r in report["runs"].items()},
                          {E1: "run_id", E2: "name", E3: "content"})
         self.assertEqual([r["where"].endswith("run_3_rejected") for r in report["rejected"][E3]], [True])
+        self.assertEqual([(Path(s["where"]).name, s["error"].split(":")[0]) for s in report["skipped"]],
+                         [("bad_name.zip", "UnicodeDecodeError")])
         self.assertEqual(report["runs"][E1]["calls_outside"], 1)
         header, rows = self.read(out)
         self.assertEqual(header, self.header)
@@ -194,6 +218,22 @@ class HostWindowsTest(unittest.TestCase):
         self.assertEqual(report["missing"], [E2])
         self.assertEqual(report["rejected"][E2][0]["cells_off"], 1)
         self.assertFalse(out.exists())
+
+    def test_a_run_whose_calls_cannot_be_read_is_rejected(self):
+        _, table, net = self.make()
+        z = self.d / "lone" / "tool-x-amd64_dynamic.zip"                # named E2 by the zip's name
+        z.parent.mkdir(parents=True)
+        with zipfile.ZipFile(str(z), "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("output/run_9/run.json", json.dumps({"windows": 40}))
+            text = io.StringIO()
+            write_events(text, self.calls[E2], self.t0[E2])
+            zf.writestr("output/run_9/syscall_events.csv", text.getvalue())
+        damage_member(z, "output/run_9/syscall_events.csv")
+        code, out, report = self.run_script("--only", E2, root=z.parent, table=table, net=net)
+        self.assertEqual(code, 1)
+        self.assertEqual(report["missing"], [E2])
+        self.assertEqual(len(report["rejected"][E2]), 1)
+        self.assertIn("invalid block type", report["rejected"][E2][0]["error"])
 
     def test_a_trial_on_one_run_writes_only_the_report(self):
         root, table, net = self.make()

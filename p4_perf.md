@@ -1013,16 +1013,32 @@ and no flow should go unread under a flood. **Where the remaining errors came fr
     accuracy does not change (balanced accuracy 0.83-0.84), and the first alarm comes one window in. The host block
     would catch on average 55% (0.5 s), 71% (0.25 s) and 83% (0.1 s) of a flood's packets, with the block 50 ms after
     the alarm.
-  - **The training table at 0.25 s** (part 13): the network half of all 240 runs is built on PC1
-    (`live_test/streaming/net_windows_0.25s.csv.gz`; at 0.5 s the same code gives the training table bit for bit). The
-    host half is recomputed on the lab workstation from the runs' raw system calls (`host_windows.py`), so the dataset
-    is not collected again.
+  - **The training table at 0.25 s** (part 13), so the dataset is not collected again:
+    - The network half of all 240 runs is built on PC1 (`live_test/streaming/net_windows_0.25s.csv.gz`); at 0.5 s the
+      same code gives the training table bit for bit.
+    - The host half is recomputed on the lab workstation from the runs' raw system calls (`host_windows.py`, part
+      13B).
+    - Checked on PC1 (part 13C): each pair of 0.25 s windows agrees with its published 0.5 s row. The sample start
+      comes from each run's own record, so the window boundaries are exact.
+  - **Offline at 0.25 s** (part 13C; 5 group folds over the 240 dataset runs and 74 live benign runs):
+    - Every detector (network, host, concatenated, stacked) keeps its accuracy: balanced accuracy within -0.005 to
+      +0.020 of its value at 0.5 s.
+    - Each detector's first alarm comes one window in, at 0.25 s.
+    - Recalibrated on live benign runs, the stacked detector flags 6.8% of them, against 2.7% at 0.5 s.
   - **Live at 0.25 s** (part 13):
     - 74 live benign runs through the whole pipeline ran clean: 80 windows each, 0 lost.
-    - The network detector alarmed the three `hping3` floods at window 0 at both lengths.
-    - The switch dropped 84.6-90.1% of their packets at 0.25 s, against 74.4-87.2% at 0.5 s; 23-40% fewer reached
-      the target.
-    - Scoring took a median 85 ms per window, which fits a 0.25 s window.
+    - **The network detector** alarmed the three `hping3` floods at window 0 at both lengths.
+      - The switch dropped 84.6-90.1% of their packets at 0.25 s, against 74.4-87.2% at 0.5 s; 23-40% fewer reached
+        the target.
+      - Scoring took a median 85 ms per window, which fits a 0.25 s window.
+    - **The stacked detector**, recalibrated, alarmed the three floods at window 0 at both lengths, and none of 9 benign
+      workloads.
+      - The switch dropped 78.3-91.0% of the flood packets at 0.25 s, against 67.2-84.5% at 0.5 s; 33-42% fewer
+        reached the target.
+    - **But the stacked detector's scoring falls behind at 0.25 s.** The collector requests a window only after scoring
+      the last one: about 102 ms for the request plus 160 ms for the score is about 270 ms per 250 ms window.
+      - The delay grows by about 20 ms per window, to 2 s by the end of a 20 s run. No window is lost.
+      - Overlapping the request with the scoring would fix it.
 - **Live attacks through the whole loop** (part 12D/E): `hping3` floods from the monitored host.
   - **Detection:** a SYN flood, a UDP flood and a port scan were each alarmed at window 0, with the original and with
     the recalibrated detector. The alarm came 274-381 ms after the window's end and the block 2.9-3.7 ms later.
