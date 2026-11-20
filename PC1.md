@@ -3210,3 +3210,29 @@ scripts in `src/`) and the archive `live_test/committee_replay/pc1_20261120_part
 
 **State after:** switch on `basic_exact_block_v2` (pid 31757), the block table empty (every run cleared its entry),
 `enp5s0` down; PC2 as found (its services stopped and `/tmp/hz_srv` removed); `/dev/shm` cleaned.
+
+## Results, part 13B (lab workstation, 2026-11-20): the host half
+
+The training table at 0.25 s is complete, with the host half from the 240 runs' archived system calls.
+
+- **Files** (`live_test/streaming/`): `dataset_windows_0.25s.csv.gz` (240 runs x 80 windows),
+  `dataset_windows_0.25s.json` (the report) and `dataset_windows_0.25s_index.csv` (the runs used).
+- **"240 of 240 executions found and equal to the training table at 0.5 s".** The start is `run.json`'s
+  `sample_started_monotonic_ns` in all 240 runs, so every call's 0.25 s window is exact: 10,006,454 calls, none
+  outside the 20 s, 0 uncertain, 0 nesting failures.
+- **The same table as the workstation's own rebuild** (`build_short.py`, written separately and reading the same raw
+  files; both use the release's feature code): all 902,400 cells (240 runs x 80 windows x 47 signals) identical as
+  text.
+- **Run with `--index`** (the 240 run folders), not `--root`:
+  - `--root` over `versioned-collector` stops with a `UnicodeDecodeError`: it opens a deliberately malformed zip from
+    Go's test data under `committee-eval-20261113/toolchain/`, and only `BadZipFile` is caught.
+  - The example's `--root vbox-runs/...` is relative to the workspace folder; after `cd p4_ebpf` it is
+    `../vbox-runs/...`.
+- **Paths:** the report's `where` and `out` and the index's `path` are relative to the workspace folder (the one that
+  holds `p4_ebpf`, `p4-ebpf-malware-detection` and `vbox-runs`). They were made relative after the run, by text
+  replacement; nothing else in the report or the index changed, and the table is as written.
+- **A reference for 13C** (the workstation's rebuild under the paper's Table V protocol: grouped cross-validation
+  over the 240 dataset runs only, 10 fold assignments; not 12C's folds). Balanced accuracy at 0.5 s / 0.25 s, with
+  the host monitor and the switch at the same window length: host 0.784 / 0.768, network 0.756 / 0.758,
+  concatenated 0.812 / 0.811, stacked 0.823 / 0.818. The host loses a little (higher at 0.25 s in 1 of 10
+  assignments); both hybrids keep their lead over it.
