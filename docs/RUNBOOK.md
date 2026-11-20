@@ -832,7 +832,7 @@ Notes:
 
 ## 13. Results on the switch (2026-11-07, second session): the Section 11.4 reruns
 
-Run from PC1 with ad2ee2e (`hybrid_collector.py`, `batched_reader.py`,
+Run from PC1 with b29a4cb (`hybrid_collector.py`, `batched_reader.py`,
 `read_registers_with_index.py`). The P4 is unchanged (`basic_newconn_head`), and the stand-in
 captures are the ones from Section 12. The raw data is in the git-ignored run dir
 `perf/results/cadence_fix_20261107_080818/` (README with every number, logs `NNN_*.txt`, the
@@ -842,7 +842,7 @@ scripts in `scripts/`).
 
 - `test_collector_cadence` + `test_batched_reader`: 55 OK (5 skipped).
 - The full suite (104 tests) has one error that comes and goes (2 of 4 runs), in a file
-  ad2ee2e does not touch:
+  b29a4cb does not touch:
   - `test_collector_robustness.HostmonStopTests.test_a_hostmon_that_ignores_signals_is_killed_with_its_group`;
   - its `alive()` helper opens `/proc/<pid>/stat` after the child has been reaped and raises
     `FileNotFoundError`, which should count as "not alive".
@@ -976,7 +976,7 @@ with the stand-in, and at its original timing for the burst.
 
 ## 14. Results on the switch (2026-11-07, third session): the Section 13.4 reruns
 
-Run from PC1 with e8a3d2d and 45129e0. P4, captures and setup are as in Sections 12 and 13.
+Run from PC1 with e4a3972 and dcb5c4d. P4, captures and setup are as in Sections 12 and 13.
 The raw data is in the git-ignored run dir `perf/results/switch_v3_20261107_091147/` (README
 with every number, `cad_flood/cost_replay.txt`, the scripts in `scripts/`).
 
@@ -1055,7 +1055,7 @@ Why (`cost_replay.txt`, the cost model replayed over the run's timing records):
 
 ## 15. The 14.3 fixes, and the 0.7 budget on the switch (2026-11-07, fourth session)
 
-Changes, made on PC1 on top of 45129e0 (with this section, uncommitted when written):
+Changes, made on PC1 on top of dcb5c4d (with this section, uncommitted when written):
 
 - `ebpf_perf/build.sh`: `sed -n 1p` instead of `head -1` on the two version lines (14.1).
 - `test_batched_reader.py`:
@@ -1117,7 +1117,7 @@ Section 13.4).
 
 ## 16. The dataset's own captures on the switch (2026-11-07, fifth session)
 
-These are the replays of `live_test/captures/` (51cc9d7) with the Section 15 working tree
+These are the replays of `live_test/captures/` (34d899a) with the Section 15 working tree
 (budget 0.7), as its README describes. The raw data is in the git-ignored
 `perf/results/switch_v5_20261107_104051/` (README with every number, the scripts in
 `scripts/`).
@@ -1348,7 +1348,7 @@ answers to 19.3 decide it. Paths in `dataset-construction/` are in the dataset r
 1. Which window length and sample length did the trained model use? A cohort run's
    `window_seconds` and observation length would tell.
 2. Are each sample's raw eBPF events kept, or only its 0.5 s windows? This decides C.
-3. Does `analyze_p4_pcap_ablation.py` (after 0b64bef) already follow the switch's rules? Those
+3. Does `analyze_p4_pcap_ablation.py` (after ca797ae) already follow the switch's rules? Those
    are: IPv4 length, one symmetric bucket per CRC16 index with collisions merged, IPv4 TCP/UDP
    only, direction from the bucket's first packet. If it does, A's extractor is mostly done.
 4. What must the thesis show:
@@ -1870,7 +1870,7 @@ Consequences:
 |---|---|---|---|
 | 1 | bytes and lengths are Ethernet frame bytes | IPv4 `totalLen` | adds 14 per packet to the three byte deltas and 14 to `min_len`/`max_len` before the derived features (averages, ratios, bytes/s). Residual: Ethernet padding on received frames under 60 B, which the switch does not see: 1 frame in 40,003 (frames the guest *sent* are unpadded in its capture, so +14 is exact for them) |
 | 2 | durations in seconds, unbounded | low 32 bits of a ns clock, wrap 4.295 s | unwraps. The window of a bucket's first packet (its report) and of its last change are known to one window, so duration = ((last - first) mod 2^32) + k x 2^32 with k chosen nearest the window estimate; k is unique while the window is under 2.147 s. Written in seconds. A bucket not read for some windows (overload) widens the estimate; then the modular value is kept |
-| 3 | a flow never ends: idle for more than 3 windows it leaves the active set, and returns with all its state (first_ts, direction, min/max) at its next packet | a bucket the collector stops reading is invisible when its flow resumes: no second report | no idle clear during a run (`clear_idle_windows` 0). The buckets that left the active set stay on a dormant list and are read round-robin with the allowance left after the active set, so a resumed flow is seen in the window of its change. A cohort run has at most a few hundred flows (bulkdl 280, session_300 302: ~170 ms on the raw route), so all are read every window; bulk2000's 1,830 would be read in turns and a resumed flow found a few windows late, with its counts intact. Everything is cleared at the end of the run (exists since 45129e0) |
+| 3 | a flow never ends: idle for more than 3 windows it leaves the active set, and returns with all its state (first_ts, direction, min/max) at its next packet | a bucket the collector stops reading is invisible when its flow resumes: no second report | no idle clear during a run (`clear_idle_windows` 0). The buckets that left the active set stay on a dormant list and are read round-robin with the allowance left after the active set, so a resumed flow is seen in the window of its change. A cohort run has at most a few hundred flows (bulkdl 280, session_300 302: ~170 ms on the raw route), so all are read every window; bulk2000's 1,830 would be read in turns and a resumed flow found a few windows late, with its counts intact. Everything is cleared at the end of the run (exists since dcb5c4d) |
 | 4 | exact 5-tuple table | CRC-16 bucket; a second flow in a bucket is merged, and sends no report | nothing. 0 collisions in the 9 captures; in the cohort only the 15 DoS runs and one scanner collide (19.5.4) |
 | 5 | direction from the first (address, port) | ports only (`ingress.p4:244-281`) | nothing. Differs only for equal-port flows (53<->53, 123<->123): 0 in the 9 captures |
 | 6 | first fragments only, VLAN tags skipped | fragments counted with payload bytes as ports, no VLAN | nothing: 0 of either in the 9 captures, and the lab network has neither |

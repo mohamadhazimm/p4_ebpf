@@ -16,7 +16,7 @@ Three things are needed from PC1, in this order. Each takes a few minutes of swi
 ## 0. Before the runs
 
 ```sh
-git pull                                                     # f073926 or later
+git pull                                                     # 9f47130 or later
 python3 -m unittest discover -s thesis-hybrid-ebpf-p4/python/tests   # 139 OK, no SDE needed
 git clone -b live-validation https://github.com/mohamadhazimm/p4-ebpf-malware-detection ../p4-ebpf-malware-detection
 python3 -m venv --system-site-packages ../venv && ../venv/bin/pip install numpy==1.24.4 scikit-learn==1.3.2
@@ -152,9 +152,9 @@ needed.
 
 ## Results (PC1, 2026-11-08)
 
-Run at commit 9066592 against the switch's `basic_fix` build (bf_switchd pid 19555 in tmux `hz_sw`;
+Run at commit ea1888c against the switch's `basic_fix` build (bf_switchd pid 19555 in tmux `hz_sw`;
 `sw_switchd.sh safety` OK), `enp5s0` brought up for the runs and set down again afterwards. Step 0:
-139 tests OK (6 skipped); release clone `3e7cb5f` (live-validation). Every CSV, timing log, collector
+139 tests OK (6 skipped); release clone `fd01158` (live-validation). Every CSV, timing log, collector
 log, the hostmon logs, `rows.csv` and `score.txt` are in `perf/results/dataset_v1/` on PC1 (12 runs:
 bulk2000, bulk2000_r2, the nine programs, prologue). The first line of every run was the expected one,
 `[INFO] profile dataset: active_ttl_windows=3, byte_layer=frame, clear_budget_frac=0.5, clear_expired=0, clear_idle_windows=0, dormant_reads=1, duration_unit=s, forward_report_port=192, launcher=dataset, max_dst_reads=256, p4_snapshot=sync, read_budget_frac=0.7, reader=batched, reader_raw_wire=True, reader_sync_batched=True, window_sec=0.5, windows=40`
@@ -347,7 +347,7 @@ removed); `ssh admin@192.168.0.2` from PC1 now works for the next runs.
 State left: the switch runs `basic_fix` with 132 <-> 140 and the mirror to 192, registers cleared at
 the end of the last run, `enp5s0` down (it was down before; `ip link set enp5s0 up` before the next
 runs). PC1: no namespace or macvlan, the cgroup removed by the collector, `../p4-ebpf-malware-detection`
-at `3e7cb5f`, no `../venv`, 277 MB free on `/`.
+at `fd01158`, no `../venv`, 277 MB free on `/`.
 
 ## Results, part 2 (PC1, 2026-11-08): programs of the dataset's kind
 
@@ -493,9 +493,9 @@ State after this part: the services on PC2 stopped and their files removed; `enp
 files removed (`make_fixtures.py` regenerates them in seconds); scripts, manifest, per-run CSVs and logs,
 `rows_cli.csv` and `score_cli.txt` stay in `perf/results/dataset_v1/benign_cli/`.
 
-## Results, part 3 (PC1, 2026-11-11): the startup-free rows of 2f90549
+## Results, part 3 (PC1, 2026-11-11): the startup-free rows of dc6fd58
 
-**Why.** Commit 2f90549 added `live_test/prologuefree/features_05s_prologuefree.csv`: the 240 rows with
+**Why.** Commit dc6fd58 added `live_test/prologuefree/features_05s_prologuefree.csv`: the 240 rows with
 the 90 host columns recomputed without the launcher's 178 calls. PC1 trains the detectors on it and
 scores the 47 executions of part 2, collected again without PC1's own launcher startup.
 
@@ -641,7 +641,7 @@ on PC1 would give the dataset's start-up exactly.
 **Table V on PC1.** scikit-learn 1.8 changed how `StratifiedGroupKFold` shuffles the groups. With only
 that change applied to 1.7 the published Table V becomes 0.795 / 0.759 / 0.834 (PC1, 1.9.1: 0.796 /
 0.760 / 0.828), and stock 1.7 gives the paper's 0.784 / 0.756 / 0.823 exactly. The release now requires
-scikit-learn older than 1.8 (release `ce7d51c`).
+scikit-learn older than 1.8 (release `edfa950`).
 
 ### Failures, with their messages
 
@@ -972,8 +972,8 @@ setup --ports 132,140 --fwd 132:140,140:132 --mirror-sid 1`). From the repo on P
 
 ## Results, part 4 (PC1, 2026-11-15): 109 of the 110 captures through the Wedge
 
-**What ran.** p4_ebpf `eadb2ca`; release `live-validation` `3e7cb5f` (its `features/` is identical to `main`
-`ce7d51c`; `dataset/features.csv` `6d15da30...`). Per capture exactly the two commands above (`--profile dataset
+**What ran.** p4_ebpf `8d33cda`; release `live-validation` `fd01158` (its `features/` is identical to `main`
+`edfa950`; `dataset/features.csv` `6d15da30...`). Per capture exactly the two commands above (`--profile dataset
 --anchor-offset ANCHOR_OFFSET_S --align-window 4`, then `dataset_row.py --skip-windows 4`, with `--release
 ~/Desktop/hAZIM/p4-ebpf-malware-detection`: its default is `~/Desktop/p4-ebpf-malware-detection`), driven by
 `run_part4.py`. Order: the cohort in manifest order (Chaos last), then the extras, `expect_overload` 0 first and
@@ -1939,7 +1939,7 @@ with `--send-log`):
 
 ## Results, part 9 (PC1, 2026-11-17): basic_gtot_ba measured; the sweep build does not compile
 
-The user pulled `0476a0a` and asked to run part 9. Results in `perf/results/part9_20261117/` (git-ignored); archive
+The user pulled `589bd36` and asked to run part 9. Results in `perf/results/part9_20261117/` (git-ignored); archive
 `live_test/committee_replay/pc1_20261117_part9.tar.xz` (compile reports, latency runs, line-rate JSONs, scripts).
 - **Done:** 9A (latency and line rate of `basic_gtot_ba`) and 9B's control builds.
 - **Stopped at 9B:** the sweep build fails table placement, with and without `-DSWEEP_SHARED_INDEX=1`. 9C-9F need
@@ -1979,7 +1979,7 @@ malformed; `latency/`):
   dropped exactly the excess.
 - **Totals, 0 checks failed in 27 runs (13.1 billion packets):** pipe 1's `pkts_ab` = generated, pipe 0's = looped
   back, `pkts_ba` = `bytes_ba` = 0, the byte totals as the flow's `reg_bytes` (mod 2³²), no TCP flags.
-- **The switch's tool:** `sw_pktgen_run.py` there was replaced by `0476a0a`'s, which finds the split registers.
+- **The switch's tool:** `sw_pktgen_run.py` there was replaced by `589bd36`'s, which finds the split registers.
   The old copy is kept as `sw_pktgen_run.py.8ed5ffa`.
 
 **9B, compile** (bf-p4c 9.6.0 on the switch, `sw_compile.sh`; `builds/`, table `builds/resources.md`):
@@ -2606,7 +2606,7 @@ depend on them.
 
 ## Results, part 11 (PC1, 2026-11-19): the exact build with a block rule
 
-The user asked to run part 11 (28fde45), and during the run pulled 50ef77e (host rows as soon as the monitor prints
+The user asked to run part 11 (75abcd1), and during the run pulled eed7163 (host rows as soon as the monitor prints
 a window; 11F's updated steps), which is included below. The switch ran `basic_exact_block` from 11A on. Files:
 `perf/results/part11_20261119/` (git-ignored) and the archive `live_test/committee_replay/pc1_20261119_part11.tar.xz`
 (everything but the captures and send logs; the scripts in `src/`).
@@ -2615,10 +2615,10 @@ a window; 11F's updated steps), which is included below. The switch ran `basic_e
 - **Disk:** PC1 had 37 MB free at the start. Part 9's captures were compressed with xz in place (310 to 122 MB),
   and this run's captures after each step.
 - **Detectors:** the collector ran under the dataset construction's `.venv` (Python 3.11, NumPy 2.4.6, scikit-learn
-  1.9.1), as 50ef77e's 11F now says; `/usr/bin/python3` has no scikit-learn. The workloads still ran on
+  1.9.1), as eed7163's 11F now says; `/usr/bin/python3` has no scikit-learn. The workloads still ran on
   `/usr/bin/python3`. scikit-learn 1.9.1 shuffles `StratifiedGroupKFold` differently (part 3), so the stacked
   detector of 11F is a little different from the published one; the network detector (11D, 11E) has no inner folds.
-- **Unit tests:** under the `.venv` 297 OK, 8 skipped (296 of 50ef77e and one added here). Under `/usr/bin/python3`
+- **Unit tests:** under the `.venv` 297 OK, 8 skipped (296 of eed7163 and one added here). Under `/usr/bin/python3`
   the one known error of part 4 (the release's `switch_model.py` needs Python 3.9).
 - **PC2 cannot capture:** its `dumpcap` is `root:wireshark` 0754 and sudo asks for a password, so there is no
   capture on PC2.
@@ -2743,7 +2743,7 @@ part 9C, `compare_11b.py`):
     7 decisions do not depend on it.
 
 **11F. Live, with the host monitor and the socket tracer** (`11f/`, `src/run_11f*.sh`, `src/check_11f.py`):
-- **The monitor was rebuilt first** (50ef77e):
+- **The monitor was rebuilt first** (eed7163):
   - The build: `DEP=/usr CLANG=/usr/bin/clang BPFTOOL=... ebpf_perf/build.sh`, with bpftool v7.3.0 built from
     `libbpf-bootstrap/bpftool` in `/dev/shm` (PC1 has none).
   - `hostmon_agg.bpf.o` is byte-identical (f0944e7a...); only `hostmon_agg.c` and the binary changed.
@@ -2779,7 +2779,7 @@ part 9C, `compare_11b.py`):
 - **The flow block stopped nothing it was meant to.** Six of the seven open short connections, so each one ended
   before its entry was written, the next window. `interactive` keeps one echo session open, so its entry cut it:
   PC2 echoed 7 of its 90 commands, and the program ended with code 1.
-- **Verdict timing** (50ef77e's check, "within about 0.1 s"): each `score` record came a median 268-275 ms after its
+- **Verdict timing** (eed7163's check, "within about 0.1 s"): each `score` record came a median 268-275 ms after its
   window ended (maximum 284-309 ms), not 0.1 s.
   - The row was complete about 114 ms after the window's end. The switch's window is back at the collector after
     107 ms; the monitor's window is already there by then.
@@ -3143,7 +3143,7 @@ The user asked for everything part 13 needs from PC1, then the push. Only the ho
 lab workstation. Switch: `basic_exact_block_v2` throughout. Files: `perf/results/part13_20261120/` (git-ignored;
 scripts in `src/`) and the archive `live_test/committee_replay/pc1_20261120_part13.tar.xz`.
 
-**13D. The detectors and the collector take any window length** (3b3ab11 and this commit):
+**13D. The detectors and the collector take any window length** (2bdbad9 and this commit):
 - **`stream_verdicts.py`:**
   - the windows per run come from the table: 80 at 0.25 s;
   - it trains at the same times as at 0.5 s plus the first three windows: `[1, 2, 3, 4, 8, 12, 20, 32, 40, 60, 80]`
@@ -3156,7 +3156,7 @@ scripts in `src/`) and the archive `live_test/committee_replay/pc1_20261120_part
   - `load_scorer(window_sec=...)` refuses a table of another length.
 - **`hybrid_collector.py --block-train-table`:** by default the table follows `--window-sec`, and the start-up line
   names it ("network detector trained in 6.8 s on net_windows_0.25s.csv.gz (80 windows of 0.25 s)").
-- **Tests:** a collector option test, and the tests of 3b3ab11; the suite under the `.venv` is 318 OK, 8 skipped.
+- **Tests:** a collector option test, and the tests of 2bdbad9; the suite under the `.venv` is 318 OK, 8 skipped.
 
 **13E. The 74 live benign runs at 0.25 s** (`live_benign/`):
 - 12C's 74 cases, with `--window-sec 0.25 --windows 80`.
@@ -3249,7 +3249,7 @@ The training table at 0.25 s is complete, with the host half from the 240 runs' 
 
 ## Results, part 13C (PC1, 2026-11-20): the host half checked, every detector at 0.25 s
 
-The user pulled 86743ce (part 13B) and asked to check it. This section has the check, and then the rest of 13C that
+The user pulled 08b84f7 (part 13B) and asked to check it. This section has the check, and then the rest of 13C that
 needed the host half. Files: `perf/results/part13_20261120/` (`evaluation_full/`, `live_stacked/`, scripts in `src/`)
 and the archive `live_test/committee_replay/pc1_20261120_part13c.tar.xz`.
 
@@ -3502,7 +3502,7 @@ per window, now in its own thread.
 
 ## Results, parts 13C/13K checked and 12B rerun (lab workstation, 2026-11-20)
 
-The user pulled 89ffa35 and asked to check it, then to rerun here what the check found. Everything is offline; the
+The user pulled 4ce984d and asked to check it, then to rerun here what the check found. Everything is offline; the
 archive `live_test/committee_replay/ws_20261120_check13_rerun12b.tar.xz` has the scripts (`src/`) and their outputs.
 
 **13C and 13K hold** (`src/check_13ck.py`, from the raw files of the part 13, 13C and 13K archives):

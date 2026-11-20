@@ -197,9 +197,9 @@ so these times say nothing about the switch; the switch commands are in
 
 ## 2026-11-07: read cadence profiles, read budget, report-only aggregates, hostmon_agg
 
-Commits 4980a04 (`--profile switch|model`, `--read-budget-frac` with the learned cost model,
+Commits 1c565b8 (`--profile switch|model`, `--read-budget-frac` with the learned cost model,
 the `rep_*` and `net_overload`/`net_buckets_*`/`net_read_overrun` columns, `--hostmon-cgroup`
-with `ebpf_perf/build/hostmon_agg`) and 0b64bef (`derive_p4_features`'s `byte_layer` and
+with `ebpf_perf/build/hostmon_agg`) and ca797ae (`derive_p4_features`'s `byte_layer` and
 `rate_window`), checked with RUNBOOK sections 11.1 and 11.3 on the real components of this VM,
 benign traffic only (section 11.2 needs the switch). Evidence: `live_test/results/cadence_20261107/`
 (`runA`/`runB`/`runC` logs, CSVs and timing files; `run1*` are the attempts with the profile as
@@ -208,9 +208,9 @@ committed) and `live_test/results/ka_rawwire_20261107.json`.
 | Check | Result |
 | --- | --- |
 | `tests.test_collector_cadence` / all of `thesis-hybrid-ebpf-p4/python/tests` | 17/17 / 93/93 |
-| `tests/test_pcap_window_alignment.py` + `tests/validation` (venv: scikit-learn 1.3.2, NumPy 1.24.4) | the pull fixes 2 tests (`test_rate_window_convention_is_explicit`, `test_d10_offline_byte_unit_matches_p4`); the other 12 failures and 37 errors are the same at 9c109d1 (the 37 import `ReportCollector` from the lab machine's `listen_cpu_reports` layout; the failures are the suite's known-defect tests) |
+| `tests/test_pcap_window_alignment.py` + `tests/validation` (venv: scikit-learn 1.3.2, NumPy 1.24.4) | the pull fixes 2 tests (`test_rate_window_convention_is_explicit`, `test_d10_offline_byte_unit_matches_p4`); the other 12 failures and 37 errors are the same at 75fb8cd (the 37 import `ReportCollector` from the lab machine's `listen_cpu_reports` layout; the failures are the suite's known-defect tests) |
 | `p4_known_answer.py --reader batched --raw-wire` | 19/19 (in 696 s) |
-| `DEP=/usr ./ebpf_perf/build.sh` | `hostmon` and `hostmon_agg` built; the last step, `test_agg_equiv.c`, does not compile against this repo's `hostmon.c` (it expects file-scope health counters; the same since 9a36b2b) |
+| `DEP=/usr ./ebpf_perf/build.sh` | `hostmon` and `hostmon_agg` built; the last step, `test_agg_equiv.c`, does not compile against this repo's `hostmon.c` (it expects file-scope health counters; the same since 69b9865) |
 | 11.1 command run (`model_cadence`, mixed workload, 4 x 60 s) | 70 CPU reports = sum of `rep_new_flows`, 0 index mismatches; active 19/70/70/70, all read; `net_overload` 0 in every row |
 | 11.1 overload run (`model_overload`, `benign_mix.pcap`, budget 0.5) | 84 reports = sum of `rep_new_flows` = the capture's 84 flows; window 0 reads 17 of 17 (`net_overload` 0); windows 1-6 read 0 of 30-57 active buckets (`net_overload` 1, 280 skipped in all); learned cost 98.9 s fixed + 2.13 s per bucket |
 | 11.3 host side (`host_agg`, `hostmon_agg` on `/sys/fs/cgroup/hazim_collect`, 2 x 120 s) | `HOSTMON_READY`; `HOSTMON_HEALTH` lost/capacity/late/failed 0/0/0/0; `host_window_start_sec` = `net_window_start_sec` in both rows; window 0: 71 processes, 81,349 syscalls, 259 execs, 85 connects, 70 reports; the cgroup removed afterwards; reads 95 s and 52 s, no overrun |
@@ -235,7 +235,7 @@ flow buckets are read), 52-232 s in all, so `net_read_overrun` is 1 in every 60 
    instead of `live_test/data/`; PCAP mode without `--int-iface veth0 --ext-iface veth2` (the
    collector's defaults are the model's `veth1`/`veth3`).
 3. **Not changed:** `derive_p4_features` gives `byte_layer` and `rate_window` defaults
-   (`ipv4`, `recorded`) although 0b64bef's message says they must be selected explicitly. A
+   (`ipv4`, `recorded`) although ca797ae's message says they must be selected explicitly. A
    caller that passes neither now gets IPv4 totalLen bytes (the data plane's convention, which
    `analyze_run.py` expects) instead of the earlier `len(packet)`, and recorded window
    durations (equal to the nominal ones for `analyze_run.py`, which passes nominal edges).

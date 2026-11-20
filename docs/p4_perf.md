@@ -510,7 +510,7 @@ The paper's build has no `reg_newconn_dst`: it keeps the 14 per-flow registers o
 Section 1.2. Sections 3.2 and 4.1 measured the working tree with the counter, so both were
 repeated on the build without it. The tools, parameters and switch setup were unchanged;
 only the program differed.
-- **Sources:** `git archive a0bcf95^` (commit `c7a5a35`), byte-identical to the fixed build
+- **Sources:** `git archive 7954397^` (commit `deb1d91`), byte-identical to the fixed build
   of Section 5.1. Of the 8 `.p4` files, only `ingress.p4` differs from HEAD, by the
   counter, its hash and its update. It declares 14 registers, none of them `reg_newconn_dst`.
 - **Compile** (bf-p4c 9.6.0, fresh builds, no warnings):
