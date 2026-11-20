@@ -192,7 +192,7 @@ the real components of this VM, benign traffic only:
 
 The model's bf_switchd serves one register entry in milliseconds and one sync in seconds,
 so these times say nothing about the switch; the switch commands are in
-[`RUNBOOK.md`](../RUNBOOK.md). The run's windows are late by 55-268 s for the same reason
+[`RUNBOOK.md`](../docs/RUNBOOK.md). The run's windows are late by 55-268 s for the same reason
 (sync reads, 60 s windows), which is why only the per-bucket read model matches per window.
 
 ## 2026-11-07: read cadence profiles, read budget, report-only aggregates, hostmon_agg
