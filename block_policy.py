@@ -32,6 +32,7 @@ Only the Python standard library is needed here; the scoring function is passed 
 import json
 import os
 import time
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import sockjoin
@@ -40,7 +41,7 @@ FLOOD_FLOWS_PER_HALF_SECOND = 500
 # the entries the table holds: perf/variants/exact_block's 1,024 (-DBLOCK_ENTRIES) less one with the per-entry direct
 # counter (the default): on the Wedge the 1,024th add fails with RESOURCE_EXHAUSTED (PC1.md part 11b)
 BLOCK_ENTRIES = 1023
-SCORE_WINDOWS = 40          # the detectors were trained on prefixes of up to 40 windows (stream_verdicts.PREFIXES)
+SCORE_WINDOWS = 40          # a run's windows at 0.5 s; a scorer of another table says its own (score.windows)
 SCOPES = ("host", "flows")  # what an alarm blocks: everything from the host, or the program's flows
 
 Entry = Dict[str, Any]
@@ -154,6 +155,8 @@ class Blocker:
         if scope not in SCOPES:
             raise ValueError("block scope %r: one of %s" % (scope, ", ".join(SCOPES)))
         self.request_fn, self.score, self.threshold = request, score, threshold
+        # the detector was trained on prefixes of up to one run's windows: 40 at 0.5 s, 80 at 0.25 s (PC1.md part 13)
+        self.score_windows = int(getattr(score, "windows", None) or SCORE_WINDOWS)
         self.scope = scope
         self.blocked_addresses: Set[str] = set()
         self.port_blocked = False
@@ -287,7 +290,7 @@ class Blocker:
             self._record({"event": "skipped", "window": window, "why": "before the run's first window"})
             return
         self.rows.append(row)
-        rows = self.rows[-SCORE_WINDOWS:]
+        rows = self.rows[-self.score_windows:]
         t0 = self.clock.time()
         p = float(self.score(rows))
         rec = {"event": "score", "window": window, "probability": round(p, 4), "windows_scored": len(rows),
@@ -358,14 +361,38 @@ def row_scorer(host_signals: Sequence[str], net_signals: Sequence[str],
         wh = np.asarray([[float(r.get(s, 0) or 0) for s in host_signals] for r in rows])
         wn = np.asarray([[float(r.get(s, 0) or 0) for s in net_signals] for r in rows])
         return score(wh, wn)
+    for name in ("windows", "window_sec", "prefixes"):
+        if hasattr(score, name):
+            setattr(f, name, getattr(score, name))
     return f
+
+
+def default_table(window_sec: float, detector: str, base: Optional[str] = None) -> str:
+    """The window table a detector trains on at window_sec (PC1.md part 13): the dataset's at 0.5 s; otherwise
+    dataset_windows_<w>s.csv.gz (both halves), or for the network detector its network half net_windows_<w>s.csv.gz
+    until the host half is there."""
+    here = Path(base) if base else Path(__file__).resolve().parent / "live_test" / "streaming"
+    if abs(window_sec - 0.5) < 1e-9:
+        return str(here / "dataset_windows.csv.gz")
+    tag = "%gs" % window_sec
+    full, net = here / ("dataset_windows_%s.csv.gz" % tag), here / ("net_windows_%s.csv.gz" % tag)
+    if full.exists():
+        return str(full)
+    if detector == "network" and net.exists():
+        return str(net)
+    raise FileNotFoundError("no training table for windows of %s: %s (the host half comes from "
+                            "live_test/streaming/host_windows.py on the lab workstation)%s"
+                            % (tag, full.name, "" if detector == "network" else
+                               "; the network detector can use %s" % net.name))
 
 
 def load_scorer(detector: str, hold_out: Sequence[str] = (), release: Optional[str] = None,
                 windows_path: Optional[str] = None,
-                extra_windows: Sequence[str] = ()) -> Callable[[List[Dict[str, Any]]], float]:
+                extra_windows: Sequence[str] = (),
+                window_sec: Optional[float] = None) -> Callable[[List[Dict[str, Any]]], float]:
     """The detector of stream_verdicts.py, trained now (about 1 s for network, 15 s for stacked; 6 and 45 s on
-    PC1), on the dataset's window table and any extra_windows tables (live runs, PC1.md part 12)."""
+    PC1), on the dataset's window table and any extra_windows tables (live runs, PC1.md part 12). window_sec: the
+    collector's window; the table defaults to default_table()'s, and one of another window length is refused."""
     import sys
     from pathlib import Path
     here = Path(__file__).resolve().parent / "live_test" / "streaming"
@@ -373,10 +400,15 @@ def load_scorer(detector: str, hold_out: Sequence[str] = (), release: Optional[s
         sys.path.insert(0, str(here))
     import stream_verdicts
     release = release or str(here.parents[2] / "p4-ebpf-malware-detection")
-    windows_path = windows_path or str(here / "dataset_windows.csv.gz")
+    windows_path = windows_path or default_table(0.5 if window_sec is None else window_sec, detector, str(here))
     if not os.path.isdir(os.path.join(release, "evaluation")):
         raise FileNotFoundError(f"the release's evaluation/ (for the detectors' forests) not found under {release}: "
                                 "give --block-release")
     host_sig, net_sig, score = stream_verdicts.train(release, windows_path, detector, list(hold_out),
                                                      list(extra_windows))
-    return row_scorer(host_sig, net_sig, score)
+    if window_sec is not None and abs(score.window_sec - window_sec) > 1e-9:
+        raise ValueError("%s has windows of %g s, the collector's are %g s: a detector scores only windows of the "
+                         "length it was trained on" % (windows_path, score.window_sec, window_sec))
+    f = row_scorer(host_sig, net_sig, score)
+    f.table = windows_path
+    return f

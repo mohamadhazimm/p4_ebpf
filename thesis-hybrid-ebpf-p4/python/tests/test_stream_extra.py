@@ -12,6 +12,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "live_test" / "streaming"))
+sys.path.insert(0, str(REPO))
 try:
     import numpy as np
     import sklearn  # noqa: F401
@@ -23,13 +24,13 @@ HEADER = ["execution_id", "label", "category", "cv_group", "split", "window",
           "host_a", "host_b", "net_a", "net_b"]
 
 
-def write_table(path, runs, header=HEADER):
-    """runs: (execution_id, label, group, level) -> 40 windows of signals around level."""
+def write_table(path, runs, header=HEADER, windows=40):
+    """runs: (execution_id, label, group, level) -> windows of signals around level."""
     with gzip.open(path, "wt", newline="") as f:
         w = csv.writer(f)
         w.writerow(header)
         for eid, label, group, level in runs:
-            for k in range(40):
+            for k in range(windows):
                 vals = [level + (k % 3), level * 2 + (k % 5), level * 3 + (k % 4), level + (k % 2)]
                 w.writerow([eid, label, "x", group, "train", k] + vals[:len(header) - 6])
 
@@ -46,8 +47,11 @@ class StreamExtraTest(unittest.TestCase):
         self.release = str(d / "release")
         self.base = str(d / "base.csv.gz")
         self.extra = str(d / "extra.csv.gz")
-        write_table(self.base, [("m%d" % i, 1, "gm%d" % (i % 3), 50) for i in range(6)] +
-                    [("b%d" % i, 0, "gb%d" % (i % 3), 1) for i in range(6)])
+        self.runs = [("m%d" % i, 1, "gm%d" % (i % 3), 50) for i in range(6)] + \
+            [("b%d" % i, 0, "gb%d" % (i % 3), 1) for i in range(6)]
+        write_table(self.base, self.runs)
+        self.t80 = str(d / "t80.csv.gz")
+        write_table(self.t80, self.runs, windows=80)
         write_table(self.extra, [("live:x%d" % i, 0, "live::x", 40) for i in range(3)] +
                     [("live:y%d" % i, 0, "live::y", 45) for i in range(3)])
         sys.modules.pop("common", None)
@@ -100,6 +104,49 @@ class StreamExtraTest(unittest.TestCase):
                     batch = score.batch(self.sv.summarize(W[i:i + 1, :, host], k),
                                         self.sv.summarize(W[i:i + 1, :, net], k))
                     self.assertAlmostEqual(one, float(batch[0]), places=12, msg=(det, i, k))
+
+    def test_a_table_of_80_windows_trains_on_the_same_times(self):
+        _, _, score = self.sv.train(self.release, self.t80, "stacked")
+        self.assertEqual((score.windows, score.window_sec), (80, 0.25))
+        self.assertEqual(score.prefixes, [1, 2, 3, 4, 8, 12, 20, 32, 40, 60, 80])
+        _, _, score40 = self.sv.train(self.release, self.base, "network")
+        self.assertEqual((score40.windows, score40.window_sec, score40.prefixes), (40, 0.5, self.sv.PREFIXES))
+
+    def test_tables_of_two_window_lengths_are_not_mixed(self):
+        with self.assertRaises(SystemExit):
+            self.sv.train(self.release, self.base, "network", extra_paths=[self.t80])
+        short = str(Path(self.dir.name) / "short.csv.gz")
+        write_table(short, self.runs, windows=80)
+        with gzip.open(short, "rt") as f:
+            rows = f.readlines()
+        with gzip.open(short, "wt") as f:
+            f.writelines(rows[:-1])                      # the last run without its last window
+        with self.assertRaises(SystemExit):
+            self.sv.load_windows(short)
+
+    def test_the_network_half_alone_trains_only_the_network_detector(self):
+        net = str(Path(self.dir.name) / "net.csv.gz")
+        write_table(net, self.runs, header=HEADER[:6] + ["net_a", "net_b"], windows=80)
+        host, net_signals, score = self.sv.train(self.release, net, "network")
+        self.assertEqual((host, net_signals, score.windows), ([], ["net_a", "net_b"], 80))
+        for det in ("host", "stacked"):
+            with self.assertRaises(SystemExit):
+                self.sv.train(self.release, net, det)
+        # live runs with all the signals train the network half's detector on its own signals
+        seen = self.spy()
+        live80 = str(Path(self.dir.name) / "live80.csv.gz")
+        write_table(live80, [("live:x%d" % i, 0, "live::x", 40) for i in range(3)], windows=80)
+        self.sv.train(self.release, net, "network", extra_paths=[live80])
+        self.assertEqual(seen["runs"], 15)
+
+    def test_the_block_scorer_refuses_another_window_length(self):
+        import block_policy
+        with self.assertRaises(ValueError):
+            block_policy.load_scorer("network", release=self.release, windows_path=self.base, window_sec=0.25)
+        f = block_policy.load_scorer("network", release=self.release, windows_path=self.t80, window_sec=0.25)
+        self.assertEqual((f.windows, f.window_sec, f.table), (80, 0.25, self.t80))
+        rows = [{"host_a": 1, "host_b": 2, "net_a": 50, "net_b": 1}] * 3
+        self.assertGreaterEqual(f(rows), 0.0)
 
 
 if __name__ == "__main__":

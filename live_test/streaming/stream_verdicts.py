@@ -11,6 +11,11 @@ windows (live_test/streaming/dataset_windows.csv.gz: the 240 runs' 0.5-s window 
 each new window k of the collector's CSV the run so far is summarized like a dataset row (mean, max, sum,
 population std and active windows of the first k windows) and scored.
 
+Another window length (PC1.md part 13): --train a table of the same layout with 20 s / L windows of L seconds per
+run, e.g. live_test/streaming/dataset_windows_0.25s.csv.gz (80 windows) or, for the network detector alone, its
+network half net_windows_0.25s.csv.gz. The prefixes are then the same times (0.5, 1, 2, 3, 5, 8, 10, 15 and 20 s)
+plus the first three windows, as in part 12B; --windows defaults to the table's.
+
 --follow waits for the collector to write the windows (a replay or a live run in progress) and stops after
 --windows windows or --idle seconds without a new one; without it the finished CSV is scored window by window.
 --skip-windows K skips the collector windows before the run's first (a replay anchored on window K).
@@ -36,12 +41,23 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedGroupKFold
 
 HERE = Path(__file__).resolve().parent
-PREFIXES = [1, 2, 4, 6, 10, 16, 20, 30, 40]
+PREFIXES = [1, 2, 4, 6, 10, 16, 20, 30, 40]     # the dataset's 40 windows of 0.5 s: 0.5 s ... 20 s
+PREFIX_SECONDS = [0.5, 1, 2, 3, 5, 8, 10, 15, 20]
+RUN_S = 20.0
 INNER_SEED = 7
 
 
+def prefixes(windows):
+    """The observation prefixes the detectors train on, in windows of a 20 s run: PREFIXES for 40 windows (0.5 s);
+    for another length the same times plus the first three windows (PC1.md parts 12B and 13)."""
+    if windows == 40:
+        return list(PREFIXES)
+    window_s = RUN_S / windows
+    return sorted({k for k in [1, 2, 3] + [int(round(t / window_s)) for t in PREFIX_SECONDS] if 1 <= k <= windows})
+
+
 def load_windows(path):
-    """Per-run arrays (n, 40, signals) from the dataset's window table, with labels and groups."""
+    """Per-run arrays (n, windows, signals) from a window table (the dataset's: 40), with labels and groups."""
     with gzip.open(path, "rt", newline="") as f:
         reader = csv.reader(f)
         header = next(reader)
@@ -52,10 +68,14 @@ def load_windows(path):
     runs, order = {}, []
     for r in rows:
         if r[0] not in runs:
-            runs[r[0]] = (int(r[1]), r[3], [None] * 40)
+            runs[r[0]] = (int(r[1]), r[3], {})
             order.append(r[0])
         runs[r[0]][2][int(r[5])] = [float(x) for x in r[6:]]
-    W = np.asarray([runs[e][2] for e in order])
+    n = 1 + max(max(v[2]) for v in runs.values())
+    short = [e for e in order if sorted(runs[e][2]) != list(range(n))]
+    if short:
+        sys.exit("%s: runs without all %d windows: %s" % (path, n, ", ".join(short[:3])))
+    W = np.asarray([[runs[e][2][k] for k in range(n)] for e in order])
     y = np.asarray([runs[e][0] for e in order])
     g = np.asarray([runs[e][1] for e in order])
     return signals, W, y, g
@@ -76,7 +96,13 @@ def train(release, windows_path, detector, hold_out=(), extra_paths=()):
     for path in extra_paths:
         s2, W2, y2, g2 = load_windows(path)
         if s2 != signals:
-            sys.exit("%s: its signals differ from the training table's" % path)
+            # a table with more signals (the live runs' 47 next to the network half's 29, PC1.md part 13): those
+            # of the training table, in its order
+            if not set(signals) <= set(s2):
+                sys.exit("%s: its signals differ from the training table's" % path)
+            W2 = W2[:, :, [s2.index(s) for s in signals]]
+        if W2.shape[1] != W.shape[1]:
+            sys.exit("%s: %d windows per run, the training table %d" % (path, W2.shape[1], W.shape[1]))
         W, y, g = np.concatenate([W, W2]), np.concatenate([y, y2]), np.concatenate([g, g2])
     keep = ~np.isin(g, list(hold_out))
     if hold_out:
@@ -88,13 +114,17 @@ def train(release, windows_path, detector, hold_out=(), extra_paths=()):
 
 
 def train_arrays(common, signals, W, y, g, detector):
-    """train() on arrays: runs W (n, 40, signals), labels y, groups g; common is the release's evaluation/common.py.
-    Returns the host and network signal names and score(wh, wn) -> probability."""
+    """train() on arrays: runs W (n, windows, signals), labels y, groups g; common is the release's
+    evaluation/common.py. Returns the host and network signal names and score(wh, wn) -> probability, with
+    score.windows, score.window_sec and score.prefixes (the table's run, and the prefixes trained on)."""
     host = [i for i, s in enumerate(signals) if s.startswith("host_")]
     net = [i for i, s in enumerate(signals) if s.startswith("net_")]
-    Xh = np.vstack([summarize(W[:, :, host], k) for k in PREFIXES])
-    Xn = np.vstack([summarize(W[:, :, net], k) for k in PREFIXES])
-    yy, gg = np.tile(y, len(PREFIXES)), np.tile(g, len(PREFIXES))
+    if detector != "network" and not host:
+        sys.exit("the %s detector needs host signals, and this window table has none (the network half only)" % detector)
+    ks = prefixes(W.shape[1])
+    Xh = np.vstack([summarize(W[:, :, host], k) for k in ks])
+    Xn = np.vstack([summarize(W[:, :, net], k) for k in ks])
+    yy, gg = np.tile(y, len(ks)), np.tile(g, len(ks))
     fitted = {}
     if detector in ("host", "stacked"):
         fitted["host"] = common.random_forest().fit(Xh, yy)
@@ -131,6 +161,7 @@ def train_arrays(common, signals, W, y, g, detector):
         ph, pn = fitted["host"].predict_proba(Xh)[:, 1], fitted["network"].predict_proba(Xn)[:, 1]
         return fitted["stacker"].predict_proba(np.column_stack([ph, pn]))[:, 1]
     score.batch = score_batch
+    score.windows, score.window_sec, score.prefixes = W.shape[1], RUN_S / W.shape[1], ks
     return [signals[i] for i in host], [signals[i] for i in net], score
 
 
@@ -159,7 +190,7 @@ def main():
     ap.add_argument("--detector", choices=["network", "host", "concat", "stacked"], default="network")
     ap.add_argument("--threshold", type=float, default=0.5)
     ap.add_argument("--skip-windows", type=int, default=0)
-    ap.add_argument("--windows", type=int, default=40)
+    ap.add_argument("--windows", type=int, help="windows to score (default: the training table's, 40 at 0.5 s)")
     ap.add_argument("--run-id")
     ap.add_argument("--follow", action="store_true")
     ap.add_argument("--poll", type=float, default=0.05)
@@ -172,9 +203,11 @@ def main():
     args = ap.parse_args()
     t_train = time.monotonic()
     host_sig, net_sig, score = train(args.release, args.train, args.detector, args.hold_out_group, args.train_extra)
-    print("[stream] %s detector trained on %d prefixes of the dataset runs%s in %.1f s" % (
-        args.detector, len(PREFIXES), (" without " + ", ".join(args.hold_out_group)) if args.hold_out_group else "",
-        time.monotonic() - t_train), flush=True)
+    print("[stream] %s detector trained on %d prefixes of the dataset runs (%d windows of %g s)%s in %.1f s" % (
+        args.detector, len(score.prefixes), score.windows, score.window_sec,
+        (" without " + ", ".join(args.hold_out_group)) if args.hold_out_group else "", time.monotonic() - t_train),
+        flush=True)
+    args.windows = args.windows or score.windows
     log = open(args.log, "a") if args.log else None
     done, alarm, last_new = 0, None, time.monotonic()
     t0 = None

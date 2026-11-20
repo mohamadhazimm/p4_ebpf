@@ -443,6 +443,38 @@ class PolicyTest(unittest.TestCase):
         self.assertEqual([e["event"] for e in blk.events][:2], ["skipped", "skipped"])
         self.assertEqual(reader.adds()[0]["entries"], [{"src": "10.0.0.10"}])
 
+    def test_a_detector_of_80_windows_scores_up_to_80(self):
+        # PC1.md part 13: at 0.25 s a run is 80 windows, and the detector says so (score.windows)
+        scored = []
+
+        def score(rows):
+            scored.append(len(rows))
+            return 0.0
+        score.windows = 80
+        reader = FakeReader()
+        for fn, want in ((score, 80), (lambda rows: score(rows), 40)):       # a plain function: 40, as at 0.5 s
+            blk = block_policy.Blocker(reader.request, fn, echo=False, tail=None, host_addresses=["10.0.0.10"],
+                                       log_path=os.path.join(self.dir.name, "block.jsonl"))
+            self.addCleanup(blk.close)
+            del scored[:]
+            for w in range(90):
+                blk.on_row(w, {"net_window_id": w})
+            self.assertEqual((max(scored), scored[-1]), (want, want))
+
+    def test_the_training_table_follows_the_window(self):
+        d = Path(self.dir.name)
+        self.assertEqual(block_policy.default_table(0.5, "stacked", str(d)), str(d / "dataset_windows.csv.gz"))
+        with self.assertRaises(FileNotFoundError):
+            block_policy.default_table(0.25, "network", str(d))
+        (d / "net_windows_0.25s.csv.gz").write_bytes(b"")
+        self.assertEqual(block_policy.default_table(0.25, "network", str(d)), str(d / "net_windows_0.25s.csv.gz"))
+        with self.assertRaises(FileNotFoundError) as cm:
+            block_policy.default_table(0.25, "stacked", str(d))
+        self.assertIn("host_windows.py", str(cm.exception))
+        (d / "dataset_windows_0.25s.csv.gz").write_bytes(b"")
+        for det in ("network", "stacked"):
+            self.assertEqual(block_policy.default_table(0.25, det, str(d)), str(d / "dataset_windows_0.25s.csv.gz"))
+
     def test_a_forced_alarm_and_a_failing_reader(self):
         reader = FakeReader(fail=True)
         self.append(flow_line(PROGRAM, "egress", "tcp", "10.0.0.10", 40000, "203.0.113.5", 443))
