@@ -3362,12 +3362,19 @@ network,host,concat,stacked`):
     per window).
   - **What it costs:** no window is lost and an alarm at window 0 is not delayed, but an alarm later in a run is: by
     about 1.1 s at 10 s into the run.
+  - **Worse, found in 13K: the switch's windows stretched too.**
+    - With CPU markers the same loop sends the markers that end the switch's windows, so they fell late as well: a
+      median 0.83 s, and up to 1.9 s by window 79.
+    - The switch's windows were 270 ms long (median), not 250 ms. So each row's network half drifted away from its
+      host half, whose windows the monitor times itself.
+    - Not affected: the floods' alarms at window 0, the 0.5 s runs (markers on time), 13E's live benign runs (at
+      most 7.7 ms late), and 13G (two windows of one run were 75 and 38 ms late).
+    - 13K fixes it and runs the 0.25 s tests again.
   - **Where it keeps up:** at 0.5 s, and for the network detector at 0.25 s, the loop waits for each window. The
     request leaves 4 ms after the window's end, and the score lands a steady 270 ms (stacked at 0.5 s) or 200 ms
     (network at 0.25 s) after it.
-  - **The fix:** request window k+1 while window k is being scored, with a scoring thread or a reader that streams
-    the windows. A window then costs the longer of the two (about 160 ms). Not done here: it changes the collector's
-    main loop.
+  - **The fix:** fetch window k+1 while window k is being scored. Done in 13K: the window clock runs in its own thread,
+    the switch's reader reads each window itself, and the detector scores in a process of its own.
 
 **Changed here:**
 - **`live_test/streaming/host_windows.py`:**
@@ -3378,8 +3385,8 @@ network,host,concat,stacked`):
 - **PC1.md 13B:** `--root ../vbox-runs/...`.
 
 **Next:**
-- Overlap the collector's request for the next window with the scoring (13J). Then run 13J's 0.25 s runs again, to
-  check that the delay stays flat.
+- Overlap the collector's request for the next window with the scoring (13J), then run 13J's 0.25 s runs again:
+  done in 13K.
 - 0.1 s windows still need a faster reader on the switch (12B).
 
 **State after:**
@@ -3387,3 +3394,97 @@ network,host,concat,stacked`):
   entries, and the other 18 had none) and `enp5s0` down.
 - PC2 is as found: `servers_log.py` stopped and `/tmp/hz_srv` removed; its log is `pc2/servers_13c.log`.
 - `/dev/shm` is clean.
+
+## Results, part 13K (PC1, 2026-11-20): the window clock apart from the work on each window
+
+The user: "yes do the fix and rerun the 0.25 s tests" (13J's proposal).
+- Files: `perf/results/part13_20261120/live_overlap/`. The final runs are `st_0.25s` and `net_0.25s`; the
+  intermediate versions are `thread_*` and `nowarm_*`.
+- Scripts in `src/`: `compare_versions.py`, `gil_probe.py`, `first_score_probe.py`, `summarize_stacked.py`.
+- The archive is `live_test/committee_replay/pc1_20261120_part13k.tar.xz`.
+
+**13K. The fix** (`hybrid_collector.py`, `block_policy.py`):
+- **What 13J showed:** with CPU markers the serial loop sent the markers late too, and the switch's windows
+  stretched (13J, corrected).
+- **`collect_windows_exact(overlap=True)`, the collector's default:**
+  - One thread keeps the window clock. It sleeps to each boundary and sends the CPU marker, and does nothing else.
+  - The switch's reader reads each window itself as soon as its marker passes. This is `follow`, until now used
+    only with in-band markers and the timer.
+  - A second thread fetches each window and does the rest: the features, the timing record, the wait for the host
+    window, the row, the score and any block.
+  - The window thread asks for a window only after its marker. So a fetch never waits for a marker queued behind it,
+    and a block it writes never waits for a read.
+  - An error in the window thread stops the run and is raised in the collector.
+- **`WindowReaderProcess.request`** takes one request at a time, because the two threads share the reader's one
+  pipe.
+- **The detector scores in a process of its own** (`block_policy.ScorerProcess`, `load_scorer(process=True)`; the
+  collector's default with `--block-on-alarm`).
+  - **With the scorer in a thread** (`thread_*`), the markers were still a median 45 ms late, and up to 184 ms. The
+    forests' scoring held the interpreter lock while the clock's thread woke, for up to a whole score. One late
+    marker then cascaded: the switch read that window late, and the fetch held the pipe past the next boundary.
+  - **A probe without the switch** (`src/gil_probe.py`): a thread that wakes every 250 ms is at most 0.2 ms late
+    alone, 21 ms late with the scorer in another thread, and 0.3 ms late with the scorer in another process.
+  - **The process** trains in a new interpreter, and scores one window as a warm-up. Its first score through the pipe
+    took 317 ms, against 152 ms after (`src/first_score_probe.py`; in one process 164 ms, then 151 ms).
+  - **Without the warm-up** (`nowarm_*`), the floods' alarms came 347-502 ms after window 0's end (211-375 ms with
+    it), and 1-7 points fewer of their packets were dropped.
+- **`--windows-serial`** gives the old loop, with the detector in the collector's process.
+- **Tests:**
+  - **`test_exact_windows.py`** (5 new):
+    - the overlapped loop gives the serial loop's windows with all three kinds of markers;
+    - with 80 ms of work on each 50 ms window, its markers stay within 30 ms of their boundaries (serially they fall
+      over 0.15 s behind);
+    - an error in the window thread stops the run, and so does a window that never ends;
+    - the reader gives each thread the reply to its own request (the old reader mixes them up).
+  - **`test_stream_extra.py`** (1 new): the scorer process gives the same probabilities and refuses the same tables.
+  - The suite under the `.venv` is 325 OK, 8 skipped.
+
+**13L. The 0.25 s live tests again:**
+- **Cases:** 13J's 12 cases (the stacked detector, recalibrated) and 13G's 3 floods (the network detector), on the
+  final collector, on the same switch and in the same session as 13J.
+
+| | Stacked, serial (13J) | Stacked, overlapped (13K) | Network, serial (13G) | Network, overlapped (13K) |
+|---|---|---|---|---|
+| Markers late (median / max) | 831 / 1,876 ms | 0.15 / 6.4 ms | 0.2 / 97 ms | 0.2 / 1.1 ms |
+| Switch windows (median / max) | 270 / 334 ms | 250.0 / 256 ms | 250.0 / 325 ms | 250.0 / 251 ms |
+| A score after its window's end (median / max) | 1,099 / 2,145 ms | 299 / 387 ms | 197 / 347 ms | 226 / 247 ms |
+| Benign workloads alarmed | 0 of 9 | 0 of 9 | | |
+| SYN flood: alarm after window 0's end; dropped | 268 ms; 91.0% | 375 ms; 88.6% | 322 ms; 90.1% | 211 ms; 92.0% |
+| UDP flood | 319 ms; 78.3% | 296 ms; 80.8% | 213 ms; 84.6% | 220 ms; 83.4% |
+| port scan | 324 ms; 88.0% | 301 ms; 89.1% | 208 ms; 90.1% | 237 ms; 89.9% |
+
+- **The window clock is fixed:**
+  - every marker within 6.4 ms of its boundary;
+  - the switch's windows 250.0 ms long at the median, and at most 256 ms;
+  - no window lost.
+- **The scores keep up.** Each lands a steady 297-302 ms (median per run) after its window's end with the stacked
+  detector, and 226 ms with the network detector, from window 0 to window 79. Serially, the stacked detector's delay
+  had grown to 2.1 s.
+  - **Why 300 ms:** the window reaches the collector 125-134 ms after its end (the switch's reader reads it, with
+    41-44 ms of register reads), and the stacked score takes a median 165-169 ms.
+- **The same verdicts:**
+  - no alarm in the 9 benign workloads; `files` came closest, at p 0.426 (0.344 in 13J);
+  - the 6 floods all alarmed at window 0.
+- **The floods:** within 2.5 points of the serial runs either way.
+  - The blocks were written in 3.3-6.8 ms.
+  - The stacked SYN flood's alarm came at 375 ms: its first score took 240 ms as the flood started, against 160-170
+    ms in the other two.
+- **What the fix buys:**
+  - An alarm later in a run is no longer up to 2 s late.
+  - Each row's network and host windows stay aligned.
+  - The floods alarm at window 0, so they were already fast serially.
+
+**Next:** 0.1 s windows still need a faster reader on the switch (12B). The switch's reader still takes about 100 ms
+per window, now in its own thread.
+
+**State after:**
+- The switch is on `basic_exact_block_v2` (pid 31757), with the block table empty (every alarmed run cleared its
+  entry) and `enp5s0` down.
+- PC2 is as found: `servers_log.py` stopped and `/tmp/hz_srv` removed; its log is `pc2/servers_13k.log`.
+- `/dev/shm` is clean.
+- **PC1's disk**, cleaned during the runs (53 MB free when the user asked):
+  - removed Codex's cache, apt's two package indexes and the Python caches;
+  - parts 9, 11 and 12's run directories are now in `perf/results/runs_20261117-19.tar.xz` (70 MB, with a README;
+    their `src/` stay in place);
+  - 380 MB free.
+  - The journal (404 MB) is the user's to trim: `sudo journalctl --vacuum-size=100M`.

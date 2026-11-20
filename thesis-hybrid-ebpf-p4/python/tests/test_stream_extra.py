@@ -148,6 +148,30 @@ class StreamExtraTest(unittest.TestCase):
         rows = [{"host_a": 1, "host_b": 2, "net_a": 50, "net_b": 1}] * 3
         self.assertGreaterEqual(f(rows), 0.0)
 
+    def test_the_scorer_in_its_own_process_scores_the_same(self):
+        # block_policy.ScorerProcess (PC1.md part 13K): trained in a new interpreter, the same forests, the same
+        # probabilities; a refused table is refused from there too
+        import block_policy
+        rows = [{"host_a": 1 + k % 3, "host_b": 2 + k % 2, "net_a": 50 - 2 * k, "net_b": 1} for k in range(20)]
+        for det in ("network", "stacked"):
+            with self.subTest(detector=det):
+                here = block_policy.load_scorer(det, release=self.release, windows_path=self.t80, window_sec=0.25)
+                there = block_policy.load_scorer(det, release=self.release, windows_path=self.t80, window_sec=0.25,
+                                                 process=True)
+                try:
+                    self.assertIsInstance(there, block_policy.ScorerProcess)
+                    self.assertEqual((there.windows, there.window_sec, there.prefixes, there.table),
+                                     (here.windows, here.window_sec, here.prefixes, here.table))
+                    for k in (1, 7, 20):
+                        self.assertEqual(there(rows[:k]), here(rows[:k]))
+                finally:
+                    there.close()
+                with self.assertRaises(RuntimeError):
+                    there(rows)                                     # closed
+        with self.assertRaises(ValueError):
+            block_policy.load_scorer("network", release=self.release, windows_path=self.base, window_sec=0.25,
+                                     process=True)
+
 
 if __name__ == "__main__":
     unittest.main()

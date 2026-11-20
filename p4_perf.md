@@ -1035,10 +1035,15 @@ and no flow should go unread under a flood. **Where the remaining errors came fr
       workloads.
       - The switch dropped 78.3-91.0% of the flood packets at 0.25 s, against 67.2-84.5% at 0.5 s; 33-42% fewer
         reached the target.
-    - **But the stacked detector's scoring falls behind at 0.25 s.** The collector requests a window only after scoring
-      the last one: about 102 ms for the request plus 160 ms for the score is about 270 ms per 250 ms window.
-      - The delay grows by about 20 ms per window, to 2 s by the end of a 20 s run. No window is lost.
-      - Overlapping the request with the scoring would fix it.
+    - **The stacked detector's scoring kept up only after a fix** (part 13K).
+      - **Before the fix,** the collector fetched a window only after scoring the last one: about 102 ms plus 160 ms
+        per 250 ms window. The same loop also sent the markers that end the switch's windows.
+      - **So** the delay grew to 2 s by the end of a 20 s run, and the switch's windows stretched to 270 ms.
+      - **Now** the window clock has its own thread, the switch reads each window itself, and the detector scores in a
+        process of its own.
+      - **With the fix,** the markers come within 6.4 ms of their boundaries and the windows are 250 ms. Each score
+        lands a steady 300 ms after its window (226 ms for the network detector).
+      - The verdicts are the same, and the floods' drops are within 2.5 points of the serial runs.
 - **Live attacks through the whole loop** (part 12D/E): `hping3` floods from the monitored host.
   - **Detection:** a SYN flood, a UDP flood and a port scan were each alarmed at window 0, with the original and with
     the recalibrated detector. The alarm came 274-381 ms after the window's end and the block 2.9-3.7 ms later.

@@ -979,20 +979,25 @@ class WindowReaderProcess(BatchedReaderProcess):
                          remote_sde_install=remote_sde_install, start_timeout=start_timeout, echo=echo)
         self.cpu_iface = cpu_iface
         self.remote_name = "window_reader"
+        # collect_windows_exact(overlap=True): the clock's thread sends the markers while the window thread reads
+        # and blocks; one request and its reply at a time
+        self._lock = threading.Lock()
 
     def _args(self) -> List[str]:
         return ["--serve", "--grpc-addr", self.grpc_addr, "--client-id", str(self.client_id),
                 "--p4-name", self.p4_name, "--cpu-iface", self.cpu_iface]
 
     def request(self, req: Dict[str, Any], timeout: Optional[float] = None) -> Dict[str, Any]:
-        """One command; the reply with this host's clock around it (collector_t_sent / collector_t_reply)."""
-        if self._proc is None or self._proc.poll() is not None:
-            self.start()
-        assert self._proc is not None and self._proc.stdin is not None
-        t_sent = time.time()
-        self._proc.stdin.write(json.dumps(req) + "\n")
-        self._proc.stdin.flush()
-        reply = json.loads(self._get_line(timeout))
+        """One command; the reply with this host's clock around it (collector_t_sent / collector_t_reply). Safe
+        from several threads: one request and its reply at a time."""
+        with self._lock:
+            if self._proc is None or self._proc.poll() is not None:
+                self.start()
+            assert self._proc is not None and self._proc.stdin is not None
+            t_sent = time.time()
+            self._proc.stdin.write(json.dumps(req) + "\n")
+            self._proc.stdin.flush()
+            reply = json.loads(self._get_line(timeout))
         reply["collector_t_sent"], reply["collector_t_reply"] = t_sent, time.time()
         return reply
 
@@ -2340,6 +2345,7 @@ def collect_windows_exact(
     duration_unit: str = "s",
     timing_path: Optional[str] = None,
     clock: Any = None,
+    overlap: bool = False,
 ) -> List[Dict[str, object]]:
     """The windows of perf/variants/exact (--switch-program exact). Collector window w is the switch's
     epoch w + 1. markers "cpu": the reader sends the window markers from the switch's CPU port, epoch 1 at
@@ -2354,6 +2360,15 @@ def collect_windows_exact(
     it ends, so a collector slowed down by its host (a flood replay on PC1's two CPUs) cannot read a window
     after the window after the next has started in its bank. No CPU report, no bucket and no read budget:
     every window is complete whatever the traffic.
+
+    overlap (the collector's default; PC1.md part 13K): the clock and the work on a window run apart. This
+    thread keeps the boundaries (the CPU markers, the stop); a second thread reads each window and calls
+    on_window, and the reader follows the switch's clock with CPU markers too. A window's work (the host
+    window's wait, the row, the detector's score, a block) may then take longer than a window without moving
+    the next marker. Serially, a window that took 270 ms at 0.25 s (a 102 ms read and the stacked detector's
+    160 ms score) sent every later marker late and stretched the switch's windows (part 13J). The window
+    thread asks for window w only after its marker, so its read never waits for a marker queued behind it,
+    and a block it writes never waits for a read. An exception in it stops the run and is raised here.
 
     max_windows: exactly that many windows, then stop_fn() (as collect_windows_live). Otherwise windows
     continue until the scenario has ended and drain_seconds have passed. reader.request(dict) -> dict
@@ -2373,43 +2388,77 @@ def collect_windows_exact(
         return r
 
     first_mark = None
-    if markers == "cpu":
-        first_mark = mark(1)
-    else:
-        r = reader.request({"cmd": "follow"})
-        if "error" in r:
-            raise P4ReadError(f"window reader follow: {r['error']}")
+    try:
+        if markers == "cpu":
+            first_mark = mark(1)
+        if markers != "cpu" or overlap:
+            # with CPU markers after the first one: the reader's clock is at epoch 1, the first window
+            r = reader.request({"cmd": "follow"})
+            if "error" in r:
+                raise P4ReadError(f"window reader follow: {r['error']}")
+    except BaseException:
+        if timing is not None:
+            timing.close()
+        raise
+
+    def process(w: int, boundary: float, marked: Optional[Dict[str, Any]]) -> None:
+        """Window w: its line from the reader, its features and timing record, then on_window."""
+        line = reader.request({"cmd": "read", "epoch": w + 1, "timeout": read_timeout})
+        if "error" in line:
+            hint = (" (no tick: is the program built with -DTIMER_LOCAL_PORT=68?)"
+                    if markers == "timer" and w == 0 else "")
+            raise P4ReadError(f"window {w}: {line['error']}{hint}")
+        feats = wf.add(line)
+        win: Dict[str, object] = {
+            "net_window_id": w, "net_window_start_sec": w * window_sec,
+            "net_window_end_sec": (w + 1) * window_sec, "net_window_duration_sec": window_sec,
+            "indexes": [], "report_count": 0, "index_mismatches": 0, "cleared_indexes": [],
+            "report_aggregates": dict(REPORT_ZERO), "exact_features": exact_summary(feats, duration_unit),
+        }
+        windows.append(win)
+        if timing is not None:
+            rec = {k: v for k, v in line.items() if k != "regs"}
+            rec.update(window=w, t_window_end=boundary, marked=marked)
+            if w == 0 and first_mark is not None:
+                rec["marked_first"] = first_mark
+            timing.write(json.dumps(rec) + "\n")
+            timing.flush()
+        if on_window is not None:
+            on_window(win)
+
+    work: "queue.Queue[Any]" = queue.Queue()      # (w, boundary, marked) per window, then None
+    failed: List[BaseException] = []
+
+    def worker() -> None:
+        while True:
+            item = work.get()
+            if item is None:
+                return
+            if failed:
+                continue                  # after a failure the rest is only drained
+            try:
+                process(*item)
+            except BaseException as error:  # raised again in the clock's thread
+                failed.append(error)
+
+    thread = threading.Thread(target=worker, name="exact-windows", daemon=True) if overlap else None
+    if thread is not None:
+        thread.start()
     w = 0
     ended_at: Optional[float] = None
     try:
-        while True:
+        while not failed:
             boundary = global_t0 + (w + 1) * window_sec
             delay = boundary - clk.time()
             if delay > 0:
                 clk.sleep(delay)
+            if failed:
+                break
             marked = mark(w + 2) if markers == "cpu" else None
-            line = reader.request({"cmd": "read", "epoch": w + 1, "timeout": read_timeout})
-            if "error" in line:
-                hint = (" (no tick: is the program built with -DTIMER_LOCAL_PORT=68?)"
-                        if markers == "timer" and w == 0 else "")
-                raise P4ReadError(f"window {w}: {line['error']}{hint}")
-            feats = wf.add(line)
-            win: Dict[str, object] = {
-                "net_window_id": w, "net_window_start_sec": w * window_sec,
-                "net_window_end_sec": (w + 1) * window_sec, "net_window_duration_sec": window_sec,
-                "indexes": [], "report_count": 0, "index_mismatches": 0, "cleared_indexes": [],
-                "report_aggregates": dict(REPORT_ZERO), "exact_features": exact_summary(feats, duration_unit),
-            }
-            windows.append(win)
-            if timing is not None:
-                rec = {k: v for k, v in line.items() if k != "regs"}
-                rec.update(window=w, t_window_end=boundary, marked=marked)
-                if w == 0 and first_mark is not None:
-                    rec["marked_first"] = first_mark
-                timing.write(json.dumps(rec) + "\n")
-                timing.flush()
-            if on_window is not None:
-                on_window(win)
+            if thread is not None:
+                work.put((w, boundary, marked))
+            else:
+                process(w, boundary, marked)
             w += 1
             if max_windows:
                 if w >= max_windows:
@@ -2421,8 +2470,13 @@ def collect_windows_exact(
                 if clk.time() - ended_at >= drain_seconds:
                     break
     finally:
+        if thread is not None:
+            work.put(None)
+            thread.join()
         if timing is not None:
             timing.close()
+    if failed:
+        raise failed[0]
     return windows
 
 
@@ -3318,6 +3372,12 @@ def build_arg_parser(profile: Optional[str] = None) -> argparse.ArgumentParser:
     ap.add_argument("--window-reader", default=DEFAULT_WINDOW_READER)
     ap.add_argument("--exact-read-timeout", type=float, default=5.0,
                     help="exact: how long a window's read waits for the window to end on the switch")
+    ap.add_argument("--windows-serial", action="store_true",
+                    help="exact: mark, read and score each window in turn, as before PC1.md part 13K. By default the "
+                         "window boundaries (the CPU markers) keep their own thread, the switch's reader reads each "
+                         "window as it ends, and --block-on-alarm's detector scores in a process of its own, so that "
+                         "a window's score and block may take longer than a window without moving the next marker "
+                         "(serially, the stacked detector at 0.25 s stretched the switch's windows, part 13J)")
     ap.add_argument("--grpc-addr", default=DEFAULT_GRPC_ADDR,
                     help="BF Runtime gRPC server for --reader batched; with --switch-ssh the reader runs on the "
                          "switch, so this is the address as seen from there")
@@ -3666,10 +3726,13 @@ def main() -> None:
                             else "stacked" if args.hostmon_cgroup else "network")
                 t_train = time.monotonic()
                 try:
+                    # in a process of its own unless --windows-serial: its scoring must not hold this process's
+                    # interpreter lock while the clock's thread sends a window marker (PC1.md part 13K)
                     block_score = block_policy.load_scorer(detector, args.block_hold_out_group, args.block_release,
                                                            windows_path=args.block_train_table,
                                                            extra_windows=args.block_train_extra,
-                                                           window_sec=args.window_sec)
+                                                           window_sec=args.window_sec,
+                                                           process=not args.windows_serial)
                 except (FileNotFoundError, ValueError) as e:
                     raise P4ReadError(f"--block-on-alarm: {e}")
                 print(f"[INFO] block rules: {detector} detector trained in {time.monotonic() - t_train:.1f} s"
@@ -3848,14 +3911,17 @@ def main() -> None:
                       f", host on more than {flood:g} active flows per window, log {block_log}")
         if exact:
             print(f"[INFO] exact build: window markers {args.window_markers}, {args.byte_layer} bytes, durations in "
-                  f"{args.duration_unit}" + (f", exactly {args.windows} windows" if args.windows else ""))
+                  f"{args.duration_unit}" + (f", exactly {args.windows} windows" if args.windows else "")
+                  + (", each window marked, read and scored in turn" if args.windows_serial
+                     else ", windows read and scored apart from the clock"))
             collect_windows_exact(
                 window_reader, workload_proc, args.window_sec, global_t0, markers=args.window_markers,
                 on_window=on_window, max_windows=args.windows, stop_fn=stop_fn if args.windows else None,
                 drain_seconds=args.drain_seconds if args.mode == "pcap" else 0.0,
                 read_timeout=args.exact_read_timeout,
                 header=ETHERNET_HEADER_BYTES if args.byte_layer == "frame" else 0,
-                duration_unit=args.duration_unit, timing_path=args.reader_timing_file)
+                duration_unit=args.duration_unit, timing_path=args.reader_timing_file,
+                overlap=not args.windows_serial)
             if blocker is not None:
                 blocker.finish()
             window_reader.stop()
@@ -4046,6 +4112,8 @@ def main() -> None:
                 print(f"[WARN] block rules: could not list or delete the entries: {error}")
         if blocker is not None:
             blocker.close()
+        if block_score is not None and hasattr(block_score, "close"):
+            block_score.close()
         if window_reader is not None:
             window_reader.stop()
 

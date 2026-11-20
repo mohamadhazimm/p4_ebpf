@@ -4,11 +4,13 @@ the features of the dataset's model (features/switch_model.py, copied below for 
 hybrid_collector.py's exact loop, with the markers from the CPU port or in band. Also the window markers' order
 (live_test/replay_absolute.py), the reader's register layout and its lost / unclocked checks, and
 replay_capture.py's exact self-check."""
+import json
 import random
 import socket
 import struct
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -279,13 +281,54 @@ class FakeWindowReader:
         return {"error": "unexpected %r" % req}
 
 
+class FollowingReader(FakeWindowReader):
+    """FakeWindowReader with window_reader.py's "follow": from that request on, each window is read the moment the
+    clock passes it (the switch's follower thread), and "read" waits for that line. The markers' times are kept
+    (this host's clock). Safe from the collector's two threads."""
+
+    def __init__(self, model, clock=None):
+        super().__init__(model, clock=clock)
+        self.following, self.lines, self.cond, self.mark_times = None, {}, threading.Condition(), []
+        self._set_epoch = model.marker
+        model.marker = self._marker            # the tests' feeds move the clock through it too
+
+    def _marker(self, epoch):
+        with self.cond:
+            self._set_epoch(epoch)
+            if self.following is not None:
+                while self.following < self.model.epoch:
+                    self.lines[self.following] = self.model.read(self.following)
+                    self.following += 1
+                self.cond.notify_all()
+
+    def request(self, req, timeout=None):
+        if req["cmd"] == "mark":
+            self.mark_times.append((req["epoch"], time.time()))
+        if req["cmd"] == "follow":
+            self.requests.append(req)
+            with self.cond:
+                self.following = self.model.epoch
+            return {"following_from": self.following}
+        if req["cmd"] == "read" and self.following is not None:
+            self.requests.append(req)
+            deadline = time.time() + req.get("timeout", 5.0)
+            with self.cond:
+                while req["epoch"] not in self.lines:
+                    left = deadline - time.time()
+                    if left <= 0:
+                        return {"epoch": req["epoch"], "error": "window %d did not end" % req["epoch"]}
+                    self.cond.wait(left)
+                return self.lines.pop(req["epoch"])
+        return super().request(req, timeout)
+
+
 class DoneProc:
     def poll(self):
         return 0
 
 
 class CollectorExactTest(unittest.TestCase):
-    def run_collector(self, markers):
+    def run_collector(self, markers, overlap=False):
         packets = make_traffic(3)
         ref = reference_windows([p[:9] for p in packets], 40)
         t0 = 1_792_932_220.0                           # make_traffic's windows start at t0 = 1792932220 s
@@ -317,13 +360,14 @@ class CollectorExactTest(unittest.TestCase):
                 ticks_until(now)
 
         clock = FakeClock(t0 - 1.0 if markers == "timer" else t0, feed)
-        reader = FakeWindowReader(model, clock=clock)
+        reader = (FollowingReader if overlap else FakeWindowReader)(model, clock=clock)
         if markers == "timer":
             hc.start_window_timer(reader, t0, 0.5, clock=clock)
             self.assertEqual(reader.timer_at, t0 - 0.5)        # one window before window 0: tick 1 at its start
         rows = []
         hc.collect_windows_exact(reader, DoneProc(), 0.5, t0, markers=markers,
-                                 on_window=lambda w: rows.append(w["exact_features"]), max_windows=40, clock=clock)
+                                 on_window=lambda w: rows.append(w["exact_features"]), max_windows=40, clock=clock,
+                                 overlap=overlap)
         self.assertEqual(len(rows), 40)
         for w, (r, g) in enumerate(zip(ref, rows)):
             for f in FEATURES:
@@ -356,6 +400,107 @@ class CollectorExactTest(unittest.TestCase):
         with self.assertRaises(hc.P4ReadError):
             hc.collect_windows_exact(reader, DoneProc(), 0.5, 0.0, markers="inband", max_windows=3,
                                      clock=FakeClock(0.0, lambda now: None))
+
+    def test_overlapped_windows_are_the_serial_ones(self):
+        # the window thread gets what the switch's follower read as each window ended: the model's windows again
+        for markers in ("cpu", "inband", "timer"):
+            with self.subTest(markers=markers):
+                reader = self.run_collector(markers, overlap=True)
+                kinds = [(r["cmd"], r.get("epoch")) for r in reader.requests]
+                self.assertEqual([e for c, e in kinds if c == "read"], list(range(1, 41)))
+                if markers == "cpu":
+                    self.assertEqual(kinds[:2], [("mark", 1), ("follow", None)])    # following from window 0
+                    self.assertEqual([e for c, e in kinds if c == "mark"], list(range(1, 42)))
+                    for e in range(1, 41):         # a window is asked for only after the marker that ends it
+                        self.assertLess(kinds.index(("mark", e + 1)), kinds.index(("read", e)))
+
+    def test_a_slow_window_does_not_move_the_next_marker(self):
+        # this host's clock, windows of 50 ms and 80 ms of work on each (the stacked detector at 0.25 s, scaled):
+        # overlapped, every marker within 30 ms of its boundary; serially, each window pushes the next 30 ms later
+        def run(overlap):
+            reader = FollowingReader(ExactModel())
+            done = []
+
+            def work(win):
+                time.sleep(0.08)
+                done.append(win["net_window_id"])
+
+            t0 = time.time() + 0.05
+            hc.collect_windows_exact(reader, DoneProc(), 0.05, t0, markers="cpu", on_window=work, max_windows=10,
+                                     overlap=overlap)
+            # the marker for epoch e (e >= 2) ends window e - 2, at t0 + (e - 1) windows
+            late = [t - (t0 + (e - 1) * 0.05) for e, t in reader.mark_times if e >= 2]
+            return done, late
+
+        done, late = run(True)
+        self.assertEqual(done, list(range(10)))
+        self.assertLess(max(late), 0.03, late)
+        done, late = run(False)
+        self.assertEqual(done, list(range(10)))
+        self.assertGreater(max(late), 0.15, late)
+
+    def test_an_error_in_the_window_thread_stops_the_run(self):
+        reader = FollowingReader(ExactModel())
+        seen = []
+
+        def work(win):
+            seen.append(win["net_window_id"])
+            if win["net_window_id"] == 3:
+                raise RuntimeError("the score failed")
+
+        with self.assertRaises(RuntimeError):
+            hc.collect_windows_exact(reader, DoneProc(), 0.02, time.time() + 0.02, markers="cpu", on_window=work,
+                                     max_windows=50, overlap=True)
+        self.assertEqual(seen, [0, 1, 2, 3])                       # nothing after the failure
+        self.assertLess(len(reader.mark_times), 20)                # and the clock stopped too
+
+    def test_a_window_that_does_not_end_stops_the_overlapped_run(self):
+        reader = FollowingReader(ExactModel())
+        with self.assertRaises(hc.P4ReadError):
+            hc.collect_windows_exact(reader, DoneProc(), 0.5, 0.0, markers="inband", max_windows=3,
+                                     read_timeout=0.2, clock=FakeClock(0.0, lambda now: None), overlap=True)
+
+    def test_the_reader_takes_one_request_at_a_time(self):
+        # the clock's thread (markers) and the window thread (reads, blocks) share window_reader.py's one pipe:
+        # each must get the reply to its own request
+        class Pipe:
+            def __init__(self):
+                self.sent = []
+
+            def write(self, line):
+                self.sent.append(json.loads(line))
+
+            def flush(self):
+                pass
+
+        class Proc:
+            stdin = Pipe()
+
+            def poll(self):
+                return None
+
+        r = hc.WindowReaderProcess(echo=False)
+        r._proc = Proc()
+
+        def get_line(timeout):
+            time.sleep(0.002)                       # the reader answers the last request it was sent
+            return json.dumps({"echo": r._proc.stdin.sent[-1]})
+
+        r._get_line = get_line
+        wrong = []
+
+        def client(tag):
+            for k in range(40):
+                req = {"cmd": "epoch", "tag": tag, "k": k}
+                if r.request(req)["echo"] != req:
+                    wrong.append((tag, k))
+
+        threads = [threading.Thread(target=client, args=(tag,)) for tag in ("clock", "window")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(wrong, [])
 
     def test_exact_summary_keeps_the_collector_columns(self):
         feats = dict.fromkeys(FEATURES, 1)

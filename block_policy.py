@@ -364,6 +364,7 @@ def row_scorer(host_signals: Sequence[str], net_signals: Sequence[str],
     for name in ("windows", "window_sec", "prefixes"):
         if hasattr(score, name):
             setattr(f, name, getattr(score, name))
+    f.host_signals, f.net_signals, f.arrays = list(host_signals), list(net_signals), score
     return f
 
 
@@ -389,10 +390,14 @@ def default_table(window_sec: float, detector: str, base: Optional[str] = None) 
 def load_scorer(detector: str, hold_out: Sequence[str] = (), release: Optional[str] = None,
                 windows_path: Optional[str] = None,
                 extra_windows: Sequence[str] = (),
-                window_sec: Optional[float] = None) -> Callable[[List[Dict[str, Any]]], float]:
+                window_sec: Optional[float] = None,
+                process: bool = False) -> Callable[[List[Dict[str, Any]]], float]:
     """The detector of stream_verdicts.py, trained now (about 1 s for network, 15 s for stacked; 6 and 45 s on
     PC1), on the dataset's window table and any extra_windows tables (live runs, PC1.md part 12). window_sec: the
-    collector's window; the table defaults to default_table()'s, and one of another window length is refused."""
+    collector's window; the table defaults to default_table()'s, and one of another window length is refused.
+    process: trained and scoring in a process of its own (ScorerProcess, PC1.md part 13K)."""
+    if process:
+        return ScorerProcess(detector, hold_out, release, windows_path, extra_windows, window_sec)
     import sys
     from pathlib import Path
     here = Path(__file__).resolve().parent / "live_test" / "streaming"
@@ -412,3 +417,94 @@ def load_scorer(detector: str, hold_out: Sequence[str] = (), release: Optional[s
     f = row_scorer(host_sig, net_sig, score)
     f.table = windows_path
     return f
+
+
+def _serve_scores(conn: Any, args: Tuple[Any, ...]) -> None:
+    """ScorerProcess's process: train, say what was trained, then one probability per (wh, wn) received."""
+    try:
+        f = load_scorer(*args)
+    except BaseException as error:  # refused tables (ValueError, FileNotFoundError) included: raised in the caller
+        conn.send(("error", error))
+        return
+    conn.send(("ready", {"windows": getattr(f, "windows", None), "window_sec": getattr(f, "window_sec", None),
+                         "prefixes": getattr(f, "prefixes", None), "table": f.table,
+                         "host_signals": f.host_signals, "net_signals": f.net_signals}))
+    while True:
+        try:
+            item = conn.recv()
+        except EOFError:
+            return
+        if item is None:
+            return
+        try:
+            conn.send(("p", float(f.arrays(*item))))
+        except Exception as error:
+            conn.send(("error", error))
+
+
+class ScorerProcess:
+    """load_scorer()'s detector, trained and scoring in a process of its own (PC1.md part 13K).
+
+    In a thread of the collector, the forests' scoring (160 ms a window for the stacked detector) kept the
+    interpreter lock from the thread that sends the window markers, for up to the whole score. Here the collector's
+    threads only wait on a pipe. It is callable on rows like load_scorer()'s function, with the same windows,
+    window_sec, prefixes and table; close() ends the process (a daemon: it also ends with the collector). The process
+    is a new interpreter ("spawn"), which imports the caller's main script: a script that makes one needs the
+    `if __name__ == "__main__":` guard (hybrid_collector.py has it)."""
+
+    def __init__(self, detector: str, hold_out: Sequence[str] = (), release: Optional[str] = None,
+                 windows_path: Optional[str] = None, extra_windows: Sequence[str] = (),
+                 window_sec: Optional[float] = None) -> None:
+        import multiprocessing
+        import threading
+        ctx = multiprocessing.get_context("spawn")        # a new interpreter: none of the collector's threads or locks
+        self._conn, child = ctx.Pipe()
+        self._proc: Any = ctx.Process(target=_serve_scores, name="detector", daemon=True,
+                                      args=(child, (detector, tuple(hold_out), release, windows_path,
+                                                    tuple(extra_windows), window_sec)))
+        self._proc.start()
+        child.close()
+        self._lock = threading.Lock()
+        try:
+            kind, info = self._conn.recv()
+        except EOFError:
+            self.close()
+            raise RuntimeError("the detector's process ended before it was trained")
+        if kind == "error":
+            self.close()
+            raise info
+        self.windows, self.window_sec, self.prefixes = info["windows"], info["window_sec"], info["prefixes"]
+        self.table, self.host_signals, self.net_signals = info["table"], info["host_signals"], info["net_signals"]
+        # the first score through the pipe costs about 165 ms more than the next ones (PC1: 317 ms, then 152 ms;
+        # in one process 164 ms, then 151 ms): pay it now, not at the run's first window
+        self([{}])
+
+    def __call__(self, rows: List[Dict[str, Any]]) -> float:
+        import numpy as np
+        wh = np.asarray([[float(r.get(s, 0) or 0) for s in self.host_signals] for r in rows])
+        wn = np.asarray([[float(r.get(s, 0) or 0) for s in self.net_signals] for r in rows])
+        with self._lock:
+            if self._proc is None:
+                raise RuntimeError("the detector's process is closed")
+            self._conn.send((wh, wn))
+            try:
+                kind, value = self._conn.recv()
+            except EOFError:
+                raise RuntimeError("the detector's process ended")
+        if kind == "error":
+            raise value
+        return value
+
+    def close(self) -> None:
+        proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        try:
+            self._conn.send(None)
+        except (OSError, ValueError):
+            pass
+        proc.join(timeout=5)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=5)
+        self._conn.close()
